@@ -23,7 +23,7 @@ fi
 
 if ! curl -sf http://127.0.0.1:5174 > /dev/null 2>&1; then
   echo "启动前端 5174"
-  nohup npm run dev --prefix frontend > /tmp/ybcase-frontend.log 2>&1 &
+  nohup npm run dev --prefix frontend -- --host 0.0.0.0 > /tmp/ybcase-frontend.log 2>&1 &
 fi
 
 echo "就绪：打开转发端口 5174 即为登录页（admin/admin123，演示环境）"
