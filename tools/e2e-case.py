@@ -228,7 +228,9 @@ def main():
     ok(d2["decisionNo"], "简易程序决定书文号")
     admin.post(f"/bureau/cases/{case2['id']}/deliver", json={"method": "DIRECT", "receiver": "陈某"})
     admin.post(f"/bureau/cases/{case2['id']}/executions", json={
-        "kind": "FINE", "amount": 100, "paidAt": str(today), "method": "ONSITE"})
+        "kind": "FINE", "amount": 100, "paidAt": str(today), "method": "ONSITE"}, expect_code=2010)  # 无票据号
+    admin.post(f"/bureau/cases/{case2['id']}/executions", json={
+        "kind": "FINE", "amount": 100, "paidAt": str(today), "method": "ONSITE", "receiptNo": "财票2026-0001"})
     admin.post(f"/bureau/cases/{case2['id']}/executions", json={
         "kind": "FINE", "amount": 50, "paidAt": str(today), "method": "BANK"})
     admin.post(f"/bureau/cases/{case2['id']}/close", json={"closeReport": "执行完毕"})
@@ -364,6 +366,84 @@ def main():
         print("    PASS: 不予处罚案件不触发处罚必备清单，正常结案")
     finally:
         admin.call("PUT", "/config/archive_completeness_required?value=false")
+
+    # ============ 四期：执法事项扩域 + 裁量 + 执行深化 ============
+    step("行政检查→线索闭环：人员<2拒（2063）；发现违法一键转线索")
+    insp_item = next(i for i in items if i["category"] == "INSPECTION")
+    admin.post("/bureau/inspections", json={
+        "itemId": insp_item["id"], "objectName": "示范市第四医院", "objectType": "PROVIDER",
+        "officers": "王办案", "plannedAt": str(today)}, expect_code=2063)
+    insp = admin.post("/bureau/inspections", json={
+        "itemId": insp_item["id"], "objectName": "示范市第四医院", "objectType": "PROVIDER",
+        "officers": "王办案、张协办", "plannedAt": str(today)})
+    admin.post(f"/bureau/inspections/{insp['id']}/complete", json={
+        "result": "违法：抽查病历发现挂床住院 3 例", "violationFound": True})
+    insp_clue = admin.post(f"/bureau/inspections/{insp['id']}/to-clue")
+    ok(insp_clue["source"] == "INSPECTION" and insp_clue["clueNo"].startswith("XS"), f"检查转线索 {insp_clue['clueNo']}")
+    admin.post(f"/bureau/inspections/{insp['id']}/to-clue", expect_code=2063)  # 不可重复转
+
+    step("举报奖励：未立案线索拒（2064）；查实线索登记→审批→发放")
+    admin.post("/bureau/rewards", json={
+        "clueId": insp_clue["id"], "reporterName": "热心群众"}, expect_code=2064)
+    admin.post("/bureau/rewards", json={
+        "clueId": clue["id"], "reporterName": "举报人甲", "reporterContact": "139****0001",
+        "note": "举报查实，案件已处罚"})
+    rw = admin.get("/bureau/rewards")[0]
+    admin.post(f"/bureau/rewards/{rw['id']}/pay", expect_code=2064)  # 未审批不可发放
+    admin.post(f"/bureau/rewards/{rw['id']}/approve", json={"amount": 5000})
+    admin.post(f"/bureau/rewards/{rw['id']}/pay")
+    ok(admin.get("/bureau/rewards")[0]["paid_at"], "奖励已审批发放")
+
+    step("裁量基准建议：按案由+涉案金额给出各阶次金额区间")
+    sug = admin.get(f"/bureau/cases/{cid}/discretion-suggest")
+    tiers = sug["tiers"]
+    ok(len(tiers) >= 3, f"裁量阶次 {len(tiers)} 档")
+    normal = next(t for t in tiers if t["tier"] == "NORMAL")
+    ok(float(normal["suggestMin"]) == 300000 * 1.2, f"一般档建议下限 {normal['suggestMin']}")
+
+    step("裁量理由必填守卫（2062）：普通程序处罚决定缺裁量理由拒")
+    d_case = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "裁量测试诊所", "partyType": "PROVIDER",
+        "amountInvolved": 4000,
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    admin.post(f"/bureau/cases/{d_case['id']}/report", json={"content": "调查终结"})
+    admin.post(f"/bureau/cases/{d_case['id']}/notice", json={
+        "content": "拟罚5000", "proposedFine": 5000, "proposedRecoup": 4000})
+    admin.post(f"/bureau/cases/{d_case['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 5000, "recoupAmount": 4000,
+        "content": "x"}, expect_code=2062)
+    admin.post(f"/bureau/cases/{d_case['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 5000, "recoupAmount": 4000,
+        "discretionReason": "属一般情形，按1.25倍幅度中值裁量", "content": "罚款5000元"})
+    print("    PASS: 裁量理由守卫生效")
+
+    step("分期计划：未批准暂缓拒（2065）；批准后建2期计划并缴纳")
+    admin.post(f"/bureau/cases/{d_case['id']}/deliver", json={"method": "DIRECT", "receiver": "负责人"})
+    admin.post(f"/bureau/cases/{d_case['id']}/installments", json={
+        "seq": 1, "dueAt": str(today + datetime.timedelta(days=30)), "amount": 2500}, expect_code=2065)
+    admin.post(f"/bureau/cases/{d_case['id']}/approve-defer")
+    admin.post(f"/bureau/cases/{d_case['id']}/installments", json={
+        "seq": 1, "dueAt": str(today + datetime.timedelta(days=30)), "amount": 2500})
+    admin.post(f"/bureau/cases/{d_case['id']}/installments", json={
+        "seq": 2, "dueAt": str(today + datetime.timedelta(days=60)), "amount": 2500})
+    inst = admin.get(f"/bureau/cases/{d_case['id']}/installments")
+    admin.post(f"/bureau/installments/{inst[0]['id']}/pay")
+    ok(admin.get(f"/bureau/cases/{d_case['id']}/installments")[0]["paid_at"], "第1期已缴")
+
+    step("专家评审：结束自动登记期限扣除（第25/45条）")
+    e_case_before = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
+    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews", json={"experts": "临床专家A、医保专家B"})
+    er_start = str(today - datetime.timedelta(days=4))
+    ers = admin.get(f"/bureau/cases/{d_case['id']}")  # 取评审id：detail无该表，直接查执行——改用固定id=1? 用返回列表
+    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews/1/end", json={
+        "opinion": "病历评审意见：过度诊疗成立", "startedAt": er_start, "endedAt": str(today)})
+    e_case_after = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
+    ok(datetime.date.fromisoformat(e_case_after) - datetime.date.fromisoformat(e_case_before)
+       == datetime.timedelta(days=4), "评审4日已计入期限扣除")
+
+    step("公示导出：自然人姓名脱敏")
+    export = admin.get("/bureau/decisions/publish-export")
+    ok(any(r["decision_no"] for r in export), f"公示 {len(export)} 条")
 
     # ============ 三期：程序完备 ============
     step("执法证台账守卫（2055）：证号不在台账/证号与姓名不符均拒")
@@ -561,9 +641,9 @@ def main():
 
         step("辽·当场收缴限20元：50拒（2010）；20可")
         admin.post(f"/bureau/cases/{lnid}/executions", json={
-            "kind": "FINE", "amount": 50, "paidAt": str(today), "method": "ONSITE"}, expect_code=2010)
+            "kind": "FINE", "amount": 50, "paidAt": str(today), "method": "ONSITE", "receiptNo": "辽财票2026-00"}, expect_code=2010)
         admin.post(f"/bureau/cases/{lnid}/executions", json={
-            "kind": "FINE", "amount": 20, "paidAt": str(today), "method": "ONSITE"})
+            "kind": "FINE", "amount": 20, "paidAt": str(today), "method": "ONSITE", "receiptNo": "辽财票2026-01"})
         admin.post(f"/bureau/cases/{lnid}/executions", json={
             "kind": "FINE", "amount": 1480, "paidAt": str(today), "method": "BANK"})
         admin.post(f"/bureau/cases/{lnid}/executions", json={

@@ -30,6 +30,16 @@
         </el-card>
       </el-col>
       <el-col :span="8">
+        <el-card class="mb">
+          <h4>处罚决定公示（脱敏导出）
+            <el-button size="small" style="float: right" @click="onExport">导出CSV</el-button>
+          </h4>
+          <el-table :data="published" size="small" border max-height="260">
+            <el-table-column prop="party_name" label="当事人" width="130" show-overflow-tooltip />
+            <el-table-column prop="decision_no" label="决定书文号" show-overflow-tooltip />
+            <el-table-column prop="fine_amount" label="罚款" width="90" align="right" />
+          </el-table>
+        </el-card>
         <el-card>
           <h4>高频案由 TOP10</h4>
           <el-table :data="d.byCause" size="small" border>
@@ -57,7 +67,19 @@ import client from '../../api/client'
 import { CASE_STATUS, PARTY_TYPE } from './labels'
 
 const d = ref<any>({})
+const published = ref<any[]>([])
 const loading = ref(false)
+
+function onExport() {
+  const header = '当事人,案由,决定书文号,罚款,追回基金,决定日期,公开日期'
+  const lines = published.value.map((r) =>
+    [r.party_name, r.cause, r.decision_no, r.fine_amount, r.recoup_amount, r.decided_at, r.published_at].join(','))
+  const blob = new Blob(['﻿' + [header, ...lines].join('\n')], { type: 'text/csv;charset=utf-8' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = '处罚决定公示.csv'
+  a.click()
+}
 
 const cards = computed(() => [
   { label: '线索总数', value: d.value.clueTotal ?? 0, color: '#16417c' },
@@ -73,6 +95,7 @@ onMounted(async () => {
   try {
     const resp = await client.get('/bureau/stats/overview')
     d.value = resp.data.data
+    published.value = (await client.get('/bureau/decisions/publish-export')).data.data
   } finally {
     loading.value = false
   }

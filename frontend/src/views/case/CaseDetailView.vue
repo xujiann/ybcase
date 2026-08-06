@@ -287,6 +287,18 @@
             <el-table-column prop="receiver" label="受送达人" width="140" />
             <el-table-column prop="note" label="备注" />
           </el-table>
+          <h4>分期计划（第54条）　<el-button size="small" @click="onAddInstallment" :disabled="!c.deferApproved">添加分期</el-button></h4>
+          <el-table :data="installments" border size="small" class="mb">
+            <el-table-column prop="seq" label="期数" width="70" />
+            <el-table-column prop="due_at" label="到期日" width="120" />
+            <el-table-column prop="amount" label="金额" width="120" align="right" />
+            <el-table-column label="缴纳" width="150">
+              <template #default="{ row }">
+                <span v-if="row.paid_at">已缴 {{ row.paid_at }}</span>
+                <el-button v-else size="small" text type="primary" @click="onPayInstallment(row)">登记缴纳</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
           <h4>执行（第52-56条）　<span class="hint">暂缓/分期：{{ c.deferApproved ? '已批准' : '未申请' }}；法院强执：{{ c.courtEnforceApplied ? '已申请' : '未申请' }}</span></h4>
           <el-table :data="detail.executions" border size="small">
             <el-table-column label="类型" width="110">
@@ -442,6 +454,7 @@
           <el-select v-model="decisionForm.decisionType" style="width: 100%">
             <el-option v-for="(v, k) in DECISION_TYPE" :key="k" :label="v" :value="k" />
           </el-select>
+          <el-button size="small" text type="primary" @click="onDiscretionSuggest" style="margin-top: 4px">查看裁量基准建议</el-button>
         </el-form-item>
         <template v-if="decisionForm.decisionType === 'PUNISH'">
           <el-form-item label="罚款金额"><el-input-number v-model="decisionForm.fineAmount" :min="0" :precision="2" style="width: 200px" /></el-form-item>
@@ -498,6 +511,7 @@
             <el-option v-for="(v, k) in EXEC_METHOD" :key="k" :label="v" :value="k" />
           </el-select>
         </el-form-item>
+        <el-form-item label="票据号"><el-input v-model="executionForm.receiptNo" placeholder="当场收缴必须登记财政统一票据号" /></el-form-item>
         <el-form-item label="备注"><el-input v-model="executionForm.note" /></el-form-item>
       </el-form>
       <p class="hint">当场收缴限 100 元以下；退回基金退原财政专户，罚款/没收上缴国库；加处罚款每日 3% 且不超过罚款本金。</p>
@@ -582,6 +596,7 @@ const dlg = reactive<Record<string, boolean>>({
 const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: new Date().toISOString().slice(0, 10), scheduledAt: '', host: '', hostDept: '', recorder: '' })
 const attachments = ref<any[]>([])
 const timeline = ref<any[]>([])
+const installments = ref<any[]>([])
 const catalog = ref<any>({})
 const fileInput = ref<HTMLInputElement>()
 
@@ -595,7 +610,7 @@ const statementForm = reactive<any>({ statement: '', statementReview: '', hearin
 const meetingForm = reactive({ heldAt: today, attendees: '', record: '', conclusion: '' })
 const decisionForm = reactive({ decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
 const deliveryForm = reactive({ method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null as string | null })
-const executionForm = reactive({ kind: 'FINE', amount: 0, paidAt: today, method: 'BANK', note: '' })
+const executionForm = reactive({ kind: 'FINE', amount: 0, paidAt: today, method: 'BANK', note: '', receiptNo: '' })
 const reportContent = ref('')
 const docView = ref<any>({})
 
@@ -606,6 +621,7 @@ async function load() {
     detail.value = resp.data.data
     attachments.value = (await client.get(`/bureau/cases/${id}/attachments`)).data.data
     timeline.value = (await client.get(`/bureau/cases/${id}/timeline`)).data.data
+    installments.value = (await client.get(`/bureau/cases/${id}/installments`)).data.data
   } finally {
     loading.value = false
   }
@@ -864,6 +880,29 @@ async function onReplyAssist(row: any) {
   await client.post(`/bureau/cases/${id}/assists/${row.id}/reply`,
     { result: value, refused, refuseReason: refused ? value : null })
   ElMessage.success('已办结')
+  load()
+}
+
+async function onDiscretionSuggest() {
+  const resp = await client.get(`/bureau/cases/${id}/discretion-suggest`)
+  const d = resp.data.data
+  const lines = (d.tiers as any[]).map((t) =>
+    `【${t.tier === 'LIGHT' ? '从轻' : t.tier === 'HEAVY' ? '从重' : '一般'}】${t.condition_desc}：${t.multiplier_min}-${t.multiplier_max}倍 → 建议 ${t.suggestMin}-${t.suggestMax} 元（${t.note}）`)
+  ElMessageBox.alert(lines.join('\n\n') || '该案由暂无裁量基准，请按上位法幅度裁量', `裁量基准建议（涉案金额 ${d.amountInvolved} 元）`, { customStyle: { whiteSpace: 'pre-wrap' } as any })
+}
+
+async function onAddInstallment() {
+  const { value: seq } = await ElMessageBox.prompt('期数', '添加分期', { inputPattern: /^\d+$/, inputErrorMessage: '数字' })
+  const { value: dueAt } = await ElMessageBox.prompt('到期日（YYYY-MM-DD）', '添加分期', { inputPattern: /^\d{4}-\d{2}-\d{2}$/, inputErrorMessage: '日期格式' })
+  const { value: amount } = await ElMessageBox.prompt('金额', '添加分期', { inputPattern: /^\d+(\.\d{1,2})?$/, inputErrorMessage: '金额' })
+  await client.post(`/bureau/cases/${id}/installments`, { seq: Number(seq), dueAt, amount: Number(amount) })
+  ElMessage.success('已添加')
+  load()
+}
+
+async function onPayInstallment(row: any) {
+  await client.post(`/bureau/installments/${row.id}/pay`)
+  ElMessage.success('已登记缴纳')
   load()
 }
 

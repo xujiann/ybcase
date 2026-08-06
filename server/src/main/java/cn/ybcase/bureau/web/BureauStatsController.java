@@ -77,6 +77,11 @@ public class BureauStatsController {
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.hold_expire_at
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.register_hold = true and ev.hold_expire_at < current_date order by ev.hold_expire_at"""));
+        // 分期缴纳到期未缴（第54条）
+        m.put("installmentOverdue", jdbc.queryForList("""
+                select i.id, i.case_id, cf.case_no, i.seq, i.due_at, i.amount
+                from case_installment i join case_file cf on cf.id = i.case_id
+                where i.paid_at is null and i.due_at < current_date order by i.due_at"""));
         // 听证意见超期（辽50条：听证结束2日内提出意见）
         m.put("hearingOpinionOverdue", jdbc.queryForList("""
                 select h.id, h.case_id, cf.case_no, h.held_at

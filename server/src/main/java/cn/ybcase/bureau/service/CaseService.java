@@ -477,6 +477,10 @@ public class CaseService {
                 if (fine.compareTo(meetingThreshold) >= 0 && !hasMeeting)
                     throw new BizException(2047, "较大数额罚款（≥" + meetingThreshold + "元）应当经负责人集体讨论决定，请先录入讨论记录（辽54条/局令44条）");
             }
+            // 辽44条：裁量性处罚决定应说明裁量考虑因素（参数开关）
+            if ("PUNISH".equals(req.decisionType()) && config.bool("discretion_reason_required", true)
+                    && (req.discretionReason() == null || req.discretionReason().isBlank()))
+                throw new BizException(2062, "处罚决定须说明裁量理由/考虑因素（辽44条），可先查看裁量基准建议");
             // 第45条：办案期限（含批准延长），扣除期间不计入
             LocalDate effectiveDeadline = c.getDeadlineAt().plusDays(totalExclusionDays(caseId));
             if (LocalDate.now().isAfter(effectiveDeadline))
@@ -539,7 +543,8 @@ public class CaseService {
 
     // ---------- 执行（第52-55条） ----------
 
-    public record ExecutionReq(String kind, BigDecimal amount, LocalDate paidAt, String method, String note) {}
+    public record ExecutionReq(String kind, BigDecimal amount, LocalDate paidAt, String method, String note,
+                               String receiptNo) {}
 
     @Transactional
     public void addExecution(Long caseId, ExecutionReq req) {
@@ -562,9 +567,12 @@ public class CaseService {
             if (paidLateFee.add(amount).compareTo(d.getFineAmount()) > 0)
                 throw new BizException(2012, "加处罚款累计不得超出罚款数额（第55条）");
         }
-        jdbc.update("insert into case_execution (case_id, kind, amount, paid_at, method, note) values (?,?,?,?,?,?)",
+        // 第52条：当场收缴必须出具财政部门统一制发的专用票据
+        if ("ONSITE".equals(req.method()) && (req.receiptNo() == null || req.receiptNo().isBlank()))
+            throw new BizException(2010, "当场收缴必须出具财政统一票据并登记票据号（第52条）");
+        jdbc.update("insert into case_execution (case_id, kind, amount, paid_at, method, note, receipt_no) values (?,?,?,?,?,?,?)",
                 caseId, req.kind(), amount, req.paidAt() != null ? req.paidAt() : LocalDate.now(),
-                req.method(), req.note());
+                req.method(), req.note(), req.receiptNo());
     }
 
     /** 加处罚款测算（第55条：每日按罚款数额3%加处，不超出罚款数额；缴款期限=送达后15日） */
