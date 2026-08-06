@@ -546,6 +546,46 @@ def main():
     admin.post(f"/bureau/transfers/{trs[0]['id']}/confirm")
     print("    PASS: 移送接收确认")
 
+    # ============ 五期：协同与上线 ============
+    step("智能监控线索批量导入（source=MONITOR）")
+    imp = admin.post("/bureau/clues/import", json=[
+        {"suspectName": "某连锁药店A", "suspectType": "PROVIDER", "content": "监控疑点：夜间集中刷卡"},
+        {"suspectName": "某连锁药店B", "suspectType": "PROVIDER", "content": "监控疑点：单卡日购药超量"},
+        {"suspectName": "参保人郑某", "suspectType": "INDIVIDUAL", "content": "监控疑点：跨机构重复开药"},
+    ])
+    ok(imp["imported"] == 3 and len(imp["clueNos"]) == 3, f"导入 {imp['imported']} 条")
+
+    step("统计上报：年度月报+合计口径")
+    rep = admin.get("/bureau/stats/report", params={"year": today.year})
+    ok(len(rep["monthly"]) == 12, "12 个月份行")
+    this_month = next(m for m in rep["monthly"] if m["month"] == today.month)
+    ok(this_month["filed"] >= 5, f"本月立案 {this_month['filed']}")
+    ok(float(rep["totals"]["reward_paid"]) >= 5000, f"举报奖励发放 {rep['totals']['reward_paid']}")
+
+    step("委托执法档案（第8条）：必填校验（2068）+登记")
+    admin.post("/bureau/delegates", json={"name": "x"}, expect_code=2068)
+    admin.post("/bureau/delegates", json={
+        "name": "某会计师事务所", "agreementNo": "示医保委〔2026〕1号",
+        "scope": "协助开展定点医药机构财务专项检查（行政强制措施权不委托）",
+        "startAt": str(today), "endAt": str(today + datetime.timedelta(days=365)),
+        "publishedAt": str(today)})
+    ok(len(admin.get("/bureau/delegates")) >= 1, "委托档案已登记")
+
+    step("集体讨论签字确认（局令44条）：名单必填（2069）+确认")
+    mt = admin.get(f"/bureau/cases/{cid}")["meetings"][0]
+    admin.post(f"/bureau/cases/{cid}/meetings/{mt['id']}/sign", json={}, expect_code=2069)
+    admin.post(f"/bureau/cases/{cid}/meetings/{mt['id']}/sign",
+               json={"signNames": "局长、分管副局长、基金监督处长、法规处长"})
+    ok(admin.get(f"/bureau/cases/{cid}")["meetings"][0]["sign_confirmed"] is True, "签字确认入卷")
+
+    step("重大处罚政府备案督办：未备案案件出现在预警列表")
+    sup5 = admin.get("/bureau/stats/supervision")
+    ok("govRecordMissing" in sup5, "备案预警项存在")
+
+    step("审计留痕（局令第4/35条+等保）：写操作已入 sys_audit_log")
+    logs = admin.get("/audit/logs")
+    ok(len(logs) >= 50 and any("/api/bureau/" in l["path"] for l in logs), f"审计日志 {len(logs)} 条（近200）")
+
     # ============ 辽宁参数组：切换省域参数后整链路复验（辽医保发〔2020〕5号） ============
     liaoning_params = {
         "clue_verify_day_unit": "NATURAL",

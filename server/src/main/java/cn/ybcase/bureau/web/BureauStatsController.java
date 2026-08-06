@@ -77,6 +77,14 @@ public class BureauStatsController {
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.hold_expire_at
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.register_hold = true and ev.hold_expire_at < current_date order by ev.hold_expire_at"""));
+        // 重大处罚决定未报政府备案（辽54条：较大数额罚款按单位档阈值近似）
+        m.put("govRecordMissing", jdbc.queryForList("""
+                select d.case_id, cf.case_no, cf.name, d.fine_amount, d.decided_at
+                from case_decision d join case_file cf on cf.id = d.case_id
+                where d.decision_type = 'PUNISH' and d.gov_record_no is null
+                  and d.fine_amount >= coalesce((select cfg_value::numeric from sys_config
+                                                 where cfg_key = 'meeting_required_fine_org'), 100000)
+                order by d.decided_at"""));
         // 分期缴纳到期未缴（第54条）
         m.put("installmentOverdue", jdbc.queryForList("""
                 select i.id, i.case_id, cf.case_no, i.seq, i.due_at, i.amount

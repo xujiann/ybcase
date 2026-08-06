@@ -250,8 +250,14 @@
           <h4>集体讨论（第44条）</h4>
           <el-table :data="detail.meetings" border size="small">
             <el-table-column prop="held_at" label="日期" width="105" />
-            <el-table-column prop="attendees" label="参加人员" width="200" show-overflow-tooltip />
+            <el-table-column prop="attendees" label="参加人员" width="180" show-overflow-tooltip />
             <el-table-column prop="conclusion" label="结论" show-overflow-tooltip />
+            <el-table-column label="签字确认" width="170">
+              <template #default="{ row }">
+                <span v-if="row.sign_confirmed">已确认：{{ row.sign_names }}</span>
+                <el-button v-else size="small" text type="primary" @click="onSignMeeting(row)">签字确认</el-button>
+              </template>
+            </el-table-column>
           </el-table>
         </el-tab-pane>
 
@@ -880,6 +886,13 @@ async function onReplyAssist(row: any) {
   await client.post(`/bureau/cases/${id}/assists/${row.id}/reply`,
     { result: value, refused, refuseReason: refused ? value : null })
   ElMessage.success('已办结')
+  load()
+}
+
+async function onSignMeeting(row: any) {
+  const { value } = await ElMessageBox.prompt('确认签字的参加人员名单（局令44条：讨论记录经参加人员确认签字存入案卷）', '签字确认', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/meetings/${row.id}/sign`, { signNames: value })
+  ElMessage.success('已确认')
   load()
 }
 

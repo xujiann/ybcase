@@ -1,0 +1,11 @@
+# 试点/生产 profile：全部敏感配置走环境变量（--spring.profiles.active=pilot）
+spring:
+  datasource:
+    url: ${YBCASE_DB_URL:jdbc:postgresql://127.0.0.1:5432/ybcase}
+    username: ${YBCASE_DB_USER:hip}
+    password: ${YBCASE_DB_PASSWORD}
+
+ybcase:
+  security:
+    jwt-secret: ${YBCASE_JWT_SECRET}
+    jwt-expiry-hours: ${YBCASE_JWT_EXPIRY_HOURS:12}

@@ -49,6 +49,18 @@
         </el-card>
       </el-col>
       <el-col :span="8">
+        <el-card class="mb">
+          <h4>统计上报（{{ reportYear }} 年月报）
+            <el-button size="small" style="float: right" @click="onReportExport">导出CSV</el-button>
+          </h4>
+          <el-table :data="report.monthly" size="small" border max-height="300">
+            <el-table-column prop="month" label="月" width="55" />
+            <el-table-column prop="filed" label="立案" width="60" align="right" />
+            <el-table-column prop="closed" label="结案" width="60" align="right" />
+            <el-table-column prop="fine_decided" label="决定罚款" align="right" />
+            <el-table-column prop="collected" label="收缴" align="right" />
+          </el-table>
+        </el-card>
         <el-card>
           <h4>近12个月立案趋势</h4>
           <el-table :data="d.monthlyFiled" size="small" border>
@@ -68,7 +80,23 @@ import { CASE_STATUS, PARTY_TYPE } from './labels'
 
 const d = ref<any>({})
 const published = ref<any[]>([])
+const report = ref<any>({ monthly: [] })
+const reportYear = new Date().getFullYear()
 const loading = ref(false)
+
+function onReportExport() {
+  const t = report.value.totals || {}
+  const header = '月份,立案数,结案数,决定罚款,决定追回,实际收缴'
+  const lines = (report.value.monthly as any[]).map((r) =>
+    [r.month, r.filed, r.closed, r.fine_decided, r.recoup_decided, r.collected].join(','))
+  lines.push(`合计,${t.filed_total},${t.closed_total},,,`)
+  lines.push(`线索${t.clue_total}件；听证${t.hearing_total}次；移送${t.transfer_total}件；检查${t.inspection_total}次；举报奖励发放${t.reward_paid}元`)
+  const blob = new Blob(['﻿' + [header, ...lines].join('\n')], { type: 'text/csv;charset=utf-8' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `医保执法统计上报-${reportYear}.csv`
+  a.click()
+}
 
 function onExport() {
   const header = '当事人,案由,决定书文号,罚款,追回基金,决定日期,公开日期'
@@ -96,6 +124,7 @@ onMounted(async () => {
     const resp = await client.get('/bureau/stats/overview')
     d.value = resp.data.data
     published.value = (await client.get('/bureau/decisions/publish-export')).data.data
+    report.value = (await client.get('/bureau/stats/report', { params: { year: reportYear } })).data.data
   } finally {
     loading.value = false
   }

@@ -6,6 +6,7 @@
         <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 130px; margin-right: 8px" @change="load">
           <el-option v-for="(v, k) in CLUE_STATUS" :key="k" :label="v" :value="k" />
         </el-select>
+        <el-button @click="onImport">监控疑点导入</el-button>
         <el-button type="primary" @click="createVisible = true">登记线索</el-button>
       </div>
     </div>
@@ -128,6 +129,16 @@ async function onReject(row: any) {
   const { value } = await ElMessageBox.prompt('核查结果（不予立案理由）', '不予立案', { inputPattern: /\S+/, inputErrorMessage: '必填' })
   await client.post(`/bureau/clues/${row.id}/reject`, { verifyResult: value })
   ElMessage.success('已办结')
+  load()
+}
+
+async function onImport() {
+  const { value } = await ElMessageBox.prompt(
+    '粘贴智能监控疑点 JSON 数组：[{"suspectName":"…","suspectType":"PROVIDER","content":"…"}]',
+    '批量导入线索', { inputType: 'textarea', inputPattern: /^\s*\[/, inputErrorMessage: '须为 JSON 数组' })
+  const rows = JSON.parse(value)
+  const resp = await client.post('/bureau/clues/import', rows)
+  ElMessage.success(`已导入 ${resp.data.data.imported} 条线索`)
   load()
 }
 

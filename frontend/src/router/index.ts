@@ -18,6 +18,7 @@ const router = createRouter({
         { path: 'case/transfers', component: () => import('../views/case/TransfersView.vue') },
         { path: 'case/inspections', component: () => import('../views/case/InspectionsView.vue') },
         { path: 'case/rewards', component: () => import('../views/case/RewardsView.vue') },
+        { path: 'case/delegates', component: () => import('../views/case/DelegatesView.vue') },
         { path: 'system/enforcers', component: () => import('../views/system/EnforcersView.vue') },
         { path: 'system/holidays', component: () => import('../views/system/HolidaysView.vue') },
         { path: 'case/supervise', component: () => import('../views/case/SupervisionView.vue') },
