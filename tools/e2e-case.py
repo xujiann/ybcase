@@ -365,6 +365,107 @@ def main():
     finally:
         admin.call("PUT", "/config/archive_completeness_required?value=false")
 
+    # ============ 三期：程序完备 ============
+    step("执法证台账守卫（2055）：证号不在台账/证号与姓名不符均拒")
+    admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "证照测试医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "无证人员", "certNo": "NOCERT"}]},
+        expect_code=2055)
+    admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "证照测试医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "冒名者", "certNo": "YB002"}]},
+        expect_code=2055)
+    print("    PASS: 执法证校验生效")
+
+    step("当事人申请回避须记录批准人（2061）")
+    h_case = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "听证流程医院", "partyType": "PROVIDER",
+        "enforceItemId": item1["id"], "summary": "分解收费", "amountInvolved": 240000,
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                      {"name": "张协办", "certNo": "YB002"}, {"name": "李替补", "certNo": "YB003"}]})
+    hid = h_case["id"]
+    officers = admin.get(f"/bureau/cases/{hid}")["officers"]
+    admin.post(f"/bureau/cases/{hid}/officers/{officers[2]['id']}/avoid",
+               json={"reason": "与当事人有利害关系", "applicant": "PARTY"}, expect_code=2061)
+    admin.post(f"/bureau/cases/{hid}/officers/{officers[2]['id']}/avoid",
+               json={"reason": "与当事人有利害关系", "applicant": "PARTY", "decidedBy": "赵局长"})
+    print("    PASS: 当事人申请回避经批准")
+
+    step("听证子流程：距通知<7日拒（2057）；主持人为办案人员拒（2056）")
+    admin.post(f"/bureau/cases/{hid}/report", json={"content": "调查终结：分解项目收费"})
+    admin.post(f"/bureau/cases/{hid}/notice", json={
+        "content": "拟罚款12万元", "proposedFine": 120000, "proposedRecoup": 60000})
+    admin.post(f"/bureau/cases/{hid}/statement", json={"hearingRequested": True})
+    admin.post(f"/bureau/cases/{hid}/hearings", json={
+        "noticeSentAt": str(today), "scheduledAt": str(today + datetime.timedelta(days=3)),
+        "host": "李法制"}, expect_code=2057)
+    admin.post(f"/bureau/cases/{hid}/hearings", json={
+        "noticeSentAt": str(today), "scheduledAt": str(today + datetime.timedelta(days=8)),
+        "host": "王办案"}, expect_code=2056)
+    admin.post(f"/bureau/cases/{hid}/hearings", json={
+        "announcedAt": str(today), "noticeSentAt": str(today),
+        "scheduledAt": str(today + datetime.timedelta(days=8)),
+        "host": "李法制", "hostDept": "政策法规处", "recorder": "书记员小周"})
+    print("    PASS: 听证已安排")
+
+    step("听证举行→笔录→2日内听证意见")
+    hr = admin.get(f"/bureau/cases/{hid}")["hearings"][0]
+    admin.post(f"/bureau/cases/{hid}/hearings/{hr['id']}/hold", json={"record": "听证笔录：双方陈述质证完毕"})
+    admin.post(f"/bureau/cases/{hid}/hearings/{hr['id']}/opinion", json={"opinion": "建议维持拟处罚意见"})
+    hr2 = admin.get(f"/bureau/cases/{hid}")["hearings"][0]
+    ok(hr2["status"] == "OPINION_DONE" and hr2["opinion_at"], "听证意见已出")
+
+    step("听证案件决定（经审核+集体讨论）→ 电子送达须确认书（2054）")
+    rev = admin.post(f"/bureau/cases/{hid}/reviews", json={"requiredReason": "经过听证程序"})
+    admin.post(f"/bureau/cases/reviews/{rev['id']}",
+               json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "程序合法"})
+    admin.post(f"/bureau/cases/{hid}/meetings", json={
+        "heldAt": str(today), "attendees": "局领导班子", "record": "讨论一致", "conclusion": "同意处罚"})
+    admin.post(f"/bureau/cases/{hid}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 120000, "recoupAmount": 60000,
+        "discretionReason": "listed", "content": "罚款12万元"})
+    admin.post(f"/bureau/cases/{hid}/deliver",
+               json={"method": "ELECTRONIC", "receiver": "法人"}, expect_code=2054)
+    admin.post(f"/bureau/cases/{hid}/e-delivery-consent")
+    delivered_h = admin.post(f"/bureau/cases/{hid}/deliver", json={
+        "method": "ELECTRONIC", "receiver": "法人", "note": "已签电子送达确认书"})
+    ok(delivered_h["status"] == "DELIVERED", "签确认书后电子送达成功（国家局令59条口径）")
+
+    step("协查台账：拒绝无理由拒（2060）；复函办结")
+    admin.post(f"/bureau/cases/{hid}/assists", json={
+        "direction": "OUT", "org": "邻市医保局", "content": "调取异地就医结算明细"})
+    asst = admin.get(f"/bureau/cases/{hid}")["assists"][0]
+    ok(asst["due_at"] == str(today + datetime.timedelta(days=15)), "协查期限15日")
+    admin.post(f"/bureau/cases/{hid}/assists/{asst['id']}/reply",
+               json={"result": "x", "refused": True}, expect_code=2060)
+    admin.post(f"/bureau/cases/{hid}/assists/{asst['id']}/reply",
+               json={"result": "已复函：明细共120条", "refused": False})
+    print("    PASS: 协查闭环")
+
+    step("简易程序备案（第51条）：非简易案件拒（2058）；简易案件备案成功")
+    admin.post(f"/bureau/cases/{hid}/summary-record", expect_code=2058)
+    s_case = admin.post("/bureau/cases", json={
+        "causeId": cause31["id"], "procedureType": "SUMMARY",
+        "partyName": "参保人吴某", "partyType": "INDIVIDUAL",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    admin.post(f"/bureau/cases/{s_case['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 100, "content": "当场处罚"})
+    sr = admin.post(f"/bureau/cases/{s_case['id']}/summary-record")
+    ok(sr["summaryRecordAt"] == str(today), "简易备案完成")
+
+    step("移送台账：线索整体移送后状态 TRANSFERRED + 接收确认")
+    t_clue = admin.post("/bureau/clues", json={
+        "source": "COMPLAINT", "content": "举报某药店无证经营（属市场监管职权）",
+        "suspectName": "某大药房", "suspectType": "PROVIDER", "receivedAt": str(today)})
+    admin.post("/bureau/transfers", json={
+        "clueId": t_clue["id"], "direction": "OUT", "targetOrg": "市市场监督管理局",
+        "kind": "ADMIN", "reason": "无证经营不属医保部门管辖（第12条）"})
+    moved = admin.get("/bureau/clues", params={"status": "TRANSFERRED"})
+    ok(any(x["id"] == t_clue["id"] for x in moved), "线索已移送")
+    trs = admin.get("/bureau/transfers")
+    admin.post(f"/bureau/transfers/{trs[0]['id']}/confirm")
+    print("    PASS: 移送接收确认")
+
     # ============ 辽宁参数组：切换省域参数后整链路复验（辽医保发〔2020〕5号） ============
     liaoning_params = {
         "clue_verify_day_unit": "NATURAL",

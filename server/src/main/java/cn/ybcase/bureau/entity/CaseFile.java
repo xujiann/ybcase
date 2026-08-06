@@ -114,6 +114,13 @@ public class CaseFile {
     /** 关联执法事项（2024年版清单） */
     private Long enforceItemId;
 
+    /** 简易程序备案日期（第51条：决定后7个工作日内备案） */
+    private LocalDate summaryRecordAt;
+
+    /** 当事人已签电子送达确认书（第59条） */
+    @Column(nullable = false)
+    private Boolean eDeliveryConsent = false;
+
     /** 违法行为终了日（第6条追责时效起算点） */
     private LocalDate violationEndDate;
 

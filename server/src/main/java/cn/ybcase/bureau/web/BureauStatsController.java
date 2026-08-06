@@ -77,6 +77,21 @@ public class BureauStatsController {
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.hold_expire_at
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.register_hold = true and ev.hold_expire_at < current_date order by ev.hold_expire_at"""));
+        // 听证意见超期（辽50条：听证结束2日内提出意见）
+        m.put("hearingOpinionOverdue", jdbc.queryForList("""
+                select h.id, h.case_id, cf.case_no, h.held_at
+                from case_hearing h join case_file cf on cf.id = h.case_id
+                where h.status = 'HELD' and h.held_at + 2 < current_date order by h.held_at"""));
+        // 简易程序备案超期（第51条：决定后7个工作日，按9自然日近似预警）
+        m.put("summaryRecordOverdue", jdbc.queryForList("""
+                select id, case_no, name, decided_at from case_file
+                where procedure_type = 'SUMMARY' and decided_at is not null and summary_record_at is null
+                  and decided_at + 9 < current_date order by decided_at"""));
+        // 协查超期（第34条：15日内完成）
+        m.put("assistOverdue", jdbc.queryForList("""
+                select a.id, a.case_id, cf.case_no, a.org, a.due_at
+                from case_assist a join case_file cf on cf.id = a.case_id
+                where a.replied_at is null and a.due_at < current_date order by a.due_at"""));
         // 责令改正逾期未报告（限期跟踪）
         m.put("correctOverdue", jdbc.queryForList("""
                 select d.id, d.case_id, cf.case_no, d.title, d.due_at

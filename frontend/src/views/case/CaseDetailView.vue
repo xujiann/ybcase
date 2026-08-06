@@ -51,6 +51,8 @@
         </template>
         <template v-if="c.status === 'DECIDED'">
           <el-button type="primary" @click="dlg.deliver = true">登记送达</el-button>
+          <el-button v-if="c.procedureType === 'SUMMARY' && !c.summaryRecordAt" @click="onSummaryRecord">简易程序备案</el-button>
+          <el-button v-if="!c.eDeliveryConsent" @click="onEConsent">电子送达确认书</el-button>
           <el-button @click="dlg.execution = true">登记执行</el-button>
           <el-button @click="onCloseCase">结案</el-button>
         </template>
@@ -211,6 +213,39 @@
             </el-table-column>
             <el-table-column prop="statement" label="陈述申辩" show-overflow-tooltip />
             <el-table-column prop="statementReview" label="复核意见" show-overflow-tooltip />
+          </el-table>
+          <h4>听证（辽46-50条）　<el-button size="small" @click="dlg.hearing = true" :disabled="!['NOTIFIED','REPORTED'].includes(c.status)">安排听证</el-button></h4>
+          <el-table :data="detail.hearings" border size="small" class="mb">
+            <el-table-column prop="notice_sent_at" label="通知送达" width="105" />
+            <el-table-column prop="scheduled_at" label="举行日期" width="105" />
+            <el-table-column prop="host" label="主持人" width="100" />
+            <el-table-column label="状态" width="230">
+              <template #default="{ row }">
+                <template v-if="row.status === 'SCHEDULED'">
+                  待举行 <el-button size="small" text type="primary" @click="onHoldHearing(row)">举行并记录笔录</el-button>
+                </template>
+                <template v-else-if="row.status === 'HELD'">
+                  已举行{{ row.held_at }} <el-button size="small" text type="primary" @click="onHearingOpinion(row)">出具听证意见</el-button>
+                </template>
+                <span v-else>已出意见（{{ row.opinion_at }}）</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="opinion" label="听证意见" show-overflow-tooltip />
+          </el-table>
+          <h4>协查台账（第34条，15日）　<el-button size="small" @click="onAddAssist" :disabled="['CLOSED','TERMINATED'].includes(c.status)">发出协查函</el-button></h4>
+          <el-table :data="detail.assists" border size="small" class="mb">
+            <el-table-column label="方向" width="70">
+              <template #default="{ row }">{{ row.direction === 'OUT' ? '发出' : '受托' }}</template>
+            </el-table-column>
+            <el-table-column prop="org" label="协查机关" width="160" show-overflow-tooltip />
+            <el-table-column prop="content" label="事项" show-overflow-tooltip />
+            <el-table-column prop="due_at" label="期限" width="105" />
+            <el-table-column label="办理" width="170">
+              <template #default="{ row }">
+                <span v-if="row.replied_at">{{ row.refused ? '已拒绝' : '已复函' }} {{ row.replied_at }}</span>
+                <el-button v-else size="small" text type="primary" @click="onReplyAssist(row)">复函/拒绝</el-button>
+              </template>
+            </el-table-column>
           </el-table>
           <h4>集体讨论（第44条）</h4>
           <el-table :data="detail.meetings" border size="small">
@@ -480,6 +515,27 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="dlg.hearing" title="安排听证（须在通知送达后≥7日举行；主持人不得为本案办案人员）" width="520px">
+      <el-form :model="hearingForm" label-width="110px">
+        <el-form-item label="公告日期">
+          <el-date-picker v-model="hearingForm.announcedAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" placeholder="公开听证公告（涉密除外）" />
+        </el-form-item>
+        <el-form-item label="通知送达日">
+          <el-date-picker v-model="hearingForm.noticeSentAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+        </el-form-item>
+        <el-form-item label="举行日期">
+          <el-date-picker v-model="hearingForm.scheduledAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+        </el-form-item>
+        <el-form-item label="主持人"><el-input v-model="hearingForm.host" /></el-form-item>
+        <el-form-item label="主持人部门"><el-input v-model="hearingForm.hostDept" placeholder="须与办案机构不同部门" /></el-form-item>
+        <el-form-item label="记录员"><el-input v-model="hearingForm.recorder" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dlg.hearing = false">取消</el-button>
+        <el-button type="primary" @click="onScheduleHearing">安排</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="dlg.catalog" title="案卷目录（一案一卷，第57条）" width="640px">
       <el-alert v-if="catalog.missing?.length" type="warning" :closable="false" class="mb"
                 :title="`必备文书缺失：${catalog.missing.map((m: string) => DOC_TYPE[m] || m).join('、')}`" />
@@ -521,8 +577,9 @@ const cause = computed<any>(() => detail.value.cause || {})
 const dlg = reactive<Record<string, boolean>>({
   officer: false, evidence: false, document: false, exclusion: false, report: false,
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
-  execution: false, doc: false, catalog: false,
+  execution: false, doc: false, catalog: false, hearing: false,
 })
+const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: today, scheduledAt: '', host: '', hostDept: '', recorder: '' })
 const attachments = ref<any[]>([])
 const timeline = ref<any[]>([])
 const catalog = ref<any>({})
@@ -765,6 +822,60 @@ async function onApproveDefer() {
 async function onCourtEnforce() {
   await client.post(`/bureau/cases/${id}/court-enforce`)
   ElMessage.success('已登记申请法院强制执行')
+  load()
+}
+
+async function onScheduleHearing() {
+  if (!hearingForm.scheduledAt || !hearingForm.host) {
+    ElMessage.warning('举行日期与主持人必填')
+    return
+  }
+  await client.post(`/bureau/cases/${id}/hearings`, hearingForm)
+  ElMessage.success('已安排听证')
+  dlg.hearing = false
+  load()
+}
+
+async function onHoldHearing(row: any) {
+  const { value } = await ElMessageBox.prompt('听证笔录（当场阅读并签字确认，辽50条）', '举行听证', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/hearings/${row.id}/hold`, { record: value })
+  ElMessage.success('听证已举行')
+  load()
+}
+
+async function onHearingOpinion(row: any) {
+  const { value } = await ElMessageBox.prompt('听证意见（结束2日内提出，报负责人）', '听证意见', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/hearings/${row.id}/opinion`, { opinion: value })
+  ElMessage.success('已出具听证意见')
+  load()
+}
+
+async function onAddAssist() {
+  const { value: org } = await ElMessageBox.prompt('协查机关', '发出协查函', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  const { value: content } = await ElMessageBox.prompt('协查事项', '发出协查函', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/assists`, { direction: 'OUT', org, content })
+  ElMessage.success('已登记（15日内应复函）')
+  load()
+}
+
+async function onReplyAssist(row: any) {
+  const { value } = await ElMessageBox.prompt('复函结果（拒绝协助请以"拒绝："开头并说明理由）', '协查办理', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  const refused = value.startsWith('拒绝')
+  await client.post(`/bureau/cases/${id}/assists/${row.id}/reply`,
+    { result: value, refused, refuseReason: refused ? value : null })
+  ElMessage.success('已办结')
+  load()
+}
+
+async function onSummaryRecord() {
+  await client.post(`/bureau/cases/${id}/summary-record`)
+  ElMessage.success('已备案（第51条）')
+  load()
+}
+
+async function onEConsent() {
+  await client.post(`/bureau/cases/${id}/e-delivery-consent`)
+  ElMessage.success('已登记电子送达确认书')
   load()
 }
 

@@ -45,7 +45,8 @@ public class CaseController {
     @PostMapping("/{id}/officers/{officerId}/avoid")
     public R<Void> avoidOfficer(@PathVariable Long id, @PathVariable Long officerId,
                                 @RequestBody Map<String, String> body) {
-        caseService.avoidOfficer(id, officerId, body.get("reason"));
+        caseService.avoidOfficer(id, officerId, body.get("reason"),
+                body.get("applicant"), body.get("decidedBy"));
         return R.ok();
     }
 

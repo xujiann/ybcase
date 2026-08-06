@@ -35,6 +35,7 @@ public class CaseService {
     private final JdbcTemplate jdbc;
     private final BureauConfig config;
     private final DocumentService documentService;
+    private final ProcedureService procedureService;
 
     // ---------- 立案 ----------
 
@@ -89,6 +90,7 @@ public class CaseService {
         caseRepository.save(c);
 
         for (OfficerReq o : req.officers()) {
+            procedureService.validateEnforcer(o.name(), o.certNo());  // 第16条：执法资格台账校验
             jdbc.update("insert into case_officer (case_id, name, cert_no, duty) values (?,?,?,?)",
                     c.getId(), o.name(), o.certNo(), o.duty() == null ? "MEMBER" : o.duty());
         }
@@ -101,21 +103,26 @@ public class CaseService {
     @Transactional
     public void addOfficer(Long caseId, OfficerReq req) {
         requireActive(get(caseId));
+        procedureService.validateEnforcer(req.name(), req.certNo());
         jdbc.update("insert into case_officer (case_id, name, cert_no, duty) values (?,?,?,?)",
                 caseId, req.name(), req.certNo(), req.duty() == null ? "MEMBER" : req.duty());
     }
 
-    /** 回避（第5条）：回避后在册执法人员仍不得少于两人 */
+    /** 回避（第5条）：主动回避或当事人申请，分级批准；回避后在册执法人员仍不得少于两人 */
     @Transactional
-    public void avoidOfficer(Long caseId, Long officerId, String reason) {
+    public void avoidOfficer(Long caseId, Long officerId, String reason, String applicant, String decidedBy) {
         requireActive(get(caseId));
         Integer active = jdbc.queryForObject(
                 "select count(*) from case_officer where case_id = ? and avoided = false and id <> ?",
                 Integer.class, caseId, officerId);
         if (active == null || active < 2)
             throw new BizException(2002, "回避后执法人员将少于两人，请先补充办案人员（第16条）");
-        jdbc.update("update case_officer set avoided = true, avoid_reason = ? where id = ? and case_id = ?",
-                reason, officerId, caseId);
+        if ("PARTY".equals(applicant) && (decidedBy == null || decidedBy.isBlank()))
+            throw new BizException(2061, "当事人申请回避须经负责人审查决定并记录批准人（第5条）");
+        jdbc.update("""
+                update case_officer set avoided = true, avoid_reason = ?, avoid_applicant = ?, avoid_decided_by = ?
+                where id = ? and case_id = ?""",
+                reason, applicant == null ? "SELF" : applicant, decidedBy, officerId, caseId);
     }
 
     // ---------- 证据 ----------
@@ -514,6 +521,9 @@ public class CaseService {
         // 辽61条：行政处罚决定书不得电子送达（国家局令59条允许但须签确认书——参数开关）
         if ("ELECTRONIC".equals(req.method()) && !config.bool("delivery_electronic_decision_allowed", true))
             throw new BizException(2049, "当前规则下处罚决定书不得电子送达（辽61条），请改用直接/邮寄/留置/公告送达");
+        // 第59条：电子送达以当事人同意并签订确认书为前提
+        if ("ELECTRONIC".equals(req.method()) && !Boolean.TRUE.equals(c.getEDeliveryConsent()))
+            throw new BizException(2054, "当事人未签订电子送达确认书，不得电子送达（第59条）");
         // 辽58条：送达回证签收日期为送达日期
         LocalDate deliveredAt = req.receiptSignedAt() != null ? req.receiptSignedAt()
                 : (req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now());
@@ -676,6 +686,8 @@ public class CaseService {
                 Map.entry("notices", noticeRepository.findByCaseIdOrderByIdDesc(id)),
                 Map.entry("meetings", jdbc.queryForList("select * from case_meeting where case_id = ? order by id", id)),
                 Map.entry("decision", decisionRepository.findByCaseId(id).map(Object.class::cast).orElse(Map.of())),
+                Map.entry("hearings", jdbc.queryForList("select * from case_hearing where case_id = ? order by id", id)),
+                Map.entry("assists", jdbc.queryForList("select * from case_assist where case_id = ? order by id", id)),
                 Map.entry("deliveries", jdbc.queryForList("select * from case_delivery where case_id = ? order by id", id)),
                 Map.entry("executions", jdbc.queryForList("select * from case_execution where case_id = ? order by id", id)),
                 Map.entry("effectiveDeadline", c.getDeadlineAt().plusDays(totalExclusionDays(id))));
