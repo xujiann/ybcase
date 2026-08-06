@@ -34,6 +34,7 @@ public class CaseService {
     private final ClueService clueService;
     private final JdbcTemplate jdbc;
     private final BureauConfig config;
+    private final DocumentService documentService;
 
     // ---------- 立案 ----------
 
@@ -43,7 +44,8 @@ public class CaseService {
                                 String partyName, String partyType, String partyCreditNo,
                                 String partyAddress, String partyLegalRep, String partyContact,
                                 String summary, BigDecimal amountInvolved,
-                                List<OfficerReq> officers, String clueVerifyResult) {}
+                                List<OfficerReq> officers, String clueVerifyResult,
+                                Long enforceItemId, LocalDate violationEndDate, Boolean healthHarm) {}
 
     @Transactional
     public CaseFile create(CaseCreateReq req, String username) {
@@ -56,6 +58,16 @@ public class CaseService {
 
         CaseFile c = new CaseFile();
         LocalDate today = LocalDate.now();
+        // 第6条：追责时效——违法行为终了起2年（涉生命健康且有危害后果5年）未被发现不再处罚
+        if (req.violationEndDate() != null) {
+            int years = Boolean.TRUE.equals(req.healthHarm())
+                    ? config.intVal("liability_years_health", 5) : config.intVal("liability_years", 2);
+            if (req.violationEndDate().plusYears(years).isBefore(today))
+                throw new BizException(2051, "违法行为终了已超过" + years + "年追责时效，不再给予行政处罚（第6条）；如有中断事由请核实终了日期");
+            c.setViolationEndDate(req.violationEndDate());
+            c.setHealthHarm(Boolean.TRUE.equals(req.healthHarm()));
+        }
+        c.setEnforceItemId(req.enforceItemId());
         String prefix = cfg("case_no_prefix", "医保案") + "〔" + today.getYear() + "〕";
         c.setCaseNo(prefix + (caseRepository.countByCaseNoStartingWith(prefix) + 1) + "号");
         // 调查阶段案件名称：违法主体+涉嫌+案由+案
@@ -183,18 +195,18 @@ public class CaseService {
     // ---------- 文书 ----------
 
     public record DocumentReq(String docType, String title, String content, LocalDate madeAt,
-                              String maker, Boolean signed, String note) {}
+                              String maker, Boolean signed, String note, LocalDate dueAt) {}
 
     @Transactional
     public void addDocument(Long caseId, DocumentReq req) {
         CaseFile c = get(caseId);
         if ("CLOSED".equals(c.getStatus())) throw new BizException(2031, "案件已结案归档，不可新增文书");
         jdbc.update("""
-                insert into case_document (case_id, doc_type, title, content, made_at, maker, signed, note)
-                values (?,?,?,?,?,?,?,?)""",
+                insert into case_document (case_id, doc_type, title, content, made_at, maker, signed, note, due_at)
+                values (?,?,?,?,?,?,?,?,?)""",
                 caseId, req.docType(), req.title(), req.content(),
                 req.madeAt() != null ? req.madeAt() : LocalDate.now(),
-                req.maker(), Boolean.TRUE.equals(req.signed()), req.note());
+                req.maker(), Boolean.TRUE.equals(req.signed()), req.note(), req.dueAt());
     }
 
     // ---------- 期限扣除（第45条） ----------
@@ -283,7 +295,7 @@ public class CaseService {
         if (reportContent == null || reportContent.isBlank())
             throw new BizException(2004, "调查终结报告须包含当事人情况/案件来源/事实证据/性质/处理意见（第36条）");
         addDocument(caseId, new DocumentReq("FINAL_REPORT", c.getCaseNo() + " 案件调查终结报告",
-                reportContent, LocalDate.now(), maker, false, null));
+                reportContent, LocalDate.now(), maker, false, null, null));
         c.setStatus("REPORTED");
         c.setReportedAt(LocalDate.now());
         return caseRepository.save(c);
@@ -628,7 +640,13 @@ public class CaseService {
         if (closeReport == null || closeReport.isBlank())
             throw new BizException(2011, "须填写行政处罚结案报告并经负责人批准（第56条）");
         addDocument(caseId, new DocumentReq("CLOSE_REPORT", c.getCaseNo() + " 结案报告",
-                closeReport, LocalDate.now(), maker, false, null));
+                closeReport, LocalDate.now(), maker, false, null, null));
+        // 第57条：一案一卷、文书齐全（参数开启时强制校验必备文书）
+        if (config.bool("archive_completeness_required", false)) {
+            List<String> missing = documentService.missingRequiredDocs(caseId);
+            if (!missing.isEmpty())
+                throw new BizException(2052, "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）");
+        }
 
         c.setStatus("CLOSED");
         c.setClosedAt(LocalDate.now());

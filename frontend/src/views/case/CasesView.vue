@@ -44,6 +44,17 @@
                        :label="`${c.itemNo}. ${c.category}——${c.description}`" :value="c.id" />
           </el-select>
         </el-form-item>
+        <el-form-item label="执法事项">
+          <el-select v-model="form.enforceItemId" style="width: 100%" clearable placeholder="关联执法事项（文书自动带出法律依据）">
+            <el-option v-for="it in enforceItems.filter((x) => x.category === 'PENALTY')" :key="it.id"
+                       :label="`${it.seq_no}. ${it.name}`" :value="it.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="行为终了日">
+          <el-date-picker v-model="form.violationEndDate" type="date" value-format="YYYY-MM-DD" style="width: 200px"
+                          placeholder="追责时效起算（第6条）" />
+          <el-checkbox v-model="form.healthHarm" style="margin-left: 12px">涉生命健康且有危害后果（时效5年）</el-checkbox>
+        </el-form-item>
         <el-form-item label="程序类型">
           <el-radio-group v-model="form.procedureType">
             <el-radio value="NORMAL">普通程序</el-radio>
@@ -114,8 +125,10 @@ const form = reactive<any>({
   clueId: null, causeId: null, procedureType: 'NORMAL',
   partyName: '', partyType: 'PROVIDER', partyCreditNo: '', partyAddress: '',
   partyLegalRep: '', partyContact: '', summary: '', amountInvolved: 0,
+  enforceItemId: null, violationEndDate: null, healthHarm: false,
   officers: emptyOfficers(),
 })
+const enforceItems = ref<any[]>([])
 
 async function load() {
   loading.value = true
@@ -150,6 +163,7 @@ async function onCreate() {
 onMounted(async () => {
   const resp = await client.get('/bureau/causes')
   causes.value = resp.data.data
+  enforceItems.value = (await client.get('/bureau/enforce-items')).data.data
   // 从线索页跳转：预填当事人并直接打开立案表单
   if (route.query.clueId) {
     form.clueId = Number(route.query.clueId)

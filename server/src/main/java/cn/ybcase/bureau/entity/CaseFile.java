@@ -111,6 +111,16 @@ public class CaseFile {
     @Column(nullable = false)
     private Boolean courtEnforceApplied = false;
 
+    /** 关联执法事项（2024年版清单） */
+    private Long enforceItemId;
+
+    /** 违法行为终了日（第6条追责时效起算点） */
+    private LocalDate violationEndDate;
+
+    /** 涉及公民生命健康且有危害后果（时效延长至5年） */
+    @Column(nullable = false)
+    private Boolean healthHarm = false;
+
     @Column(length = 64)
     private String createdBy;
 

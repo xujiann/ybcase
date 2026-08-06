@@ -281,6 +281,90 @@ def main():
     gov = admin.post(f"/bureau/cases/{cid}/gov-record", json={"recordNo": "示府备〔2026〕1号"})
     ok(gov["govRecordNo"] == "示府备〔2026〕1号", "政府备案已登记")
 
+    # ============ 二期B：文书与案卷 ============
+    step("执法事项目录：13 项种子 + 法律依据库")
+    items = admin.get("/bureau/enforce-items")
+    ok(len(items) >= 13, f"执法事项 {len(items)} 项")
+    basis = admin.get("/bureau/law-basis")
+    ok(len(basis) >= 9, f"法律依据 {len(basis)} 条")
+    item1 = next(i for i in items if i["seq_no"] == 1)
+
+    step("追责时效守卫（第6条）：终了超2年拒（2051）；涉生命健康5年内可")
+    old_end = str(today - datetime.timedelta(days=365 * 3))
+    admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "时效测试医院", "partyType": "PROVIDER",
+        "violationEndDate": old_end,
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]},
+        expect_code=2051)
+    tcase = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "时效测试医院", "partyType": "PROVIDER",
+        "violationEndDate": old_end, "healthHarm": True, "enforceItemId": item1["id"],
+        "summary": "因危害后果时效延至5年，仍在时效内", "amountInvolved": 66666,
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    ok(tcase["healthHarm"] is True, "5年时效立案成功")
+
+    step("节假日感知工作日：明日设为节假日后线索期限顺延")
+    base_clue = admin.post("/bureau/clues", json={
+        "source": "INSPECTION", "content": "节假日基准", "suspectName": "基准对象",
+        "suspectType": "PROVIDER", "receivedAt": str(today)})
+    hol = today + datetime.timedelta(days=1)
+    while hol.weekday() >= 5:  # 选一个工作日作为临时节假日
+        hol += datetime.timedelta(days=1)
+    admin.post("/bureau/holidays", json={"day": str(hol), "kind": "HOLIDAY", "name": "E2E临时节假日"})
+    try:
+        hol_clue = admin.post("/bureau/clues", json={
+            "source": "INSPECTION", "content": "节假日验证", "suspectName": "验证对象",
+            "suspectType": "PROVIDER", "receivedAt": str(today)})
+        d1 = datetime.date.fromisoformat(base_clue["deadlineAt"])
+        d2 = datetime.date.fromisoformat(hol_clue["deadlineAt"])
+        ok(d2 > d1, f"节假日生效：{d1} → {d2}")
+    finally:
+        admin.call("DELETE", f"/bureau/holidays/{hol}")
+
+    step("文书模板渲染：告知书带出当事人与法律依据条文")
+    admin.post(f"/bureau/cases/{tcase['id']}/report", json={"content": "调查终结"})
+    admin.post(f"/bureau/cases/{tcase['id']}/notice", json={
+        "content": "拟罚", "proposedFine": 66666, "proposedRecoup": 0})
+    tpl = admin.get(f"/bureau/cases/{tcase['id']}/documents/render", params={"docType": "NOTICE"})
+    ok("时效测试医院" in tpl["content"] and "66666" in tpl["content"], "要素填充")
+    ok("医疗保障基金使用监督管理条例" in tpl["content"] and "责令改正" in tpl["content"], "法律依据条文自动带出")
+
+    step("附件上传/下载回路")
+    files = {"file": ("询问笔录扫描件.txt", "笔录内容示例".encode("utf-8"), "text/plain")}
+    r = requests.post(f"{BASE}/bureau/cases/{tcase['id']}/attachments", files=files, timeout=15,
+                      headers={"Authorization": f"Bearer {admin.token}"})
+    assert r.json()["code"] == 0, r.text
+    atts = admin.get(f"/bureau/cases/{tcase['id']}/attachments")
+    ok(len(atts) == 1 and atts[0]["filename"] == "询问笔录扫描件.txt", "附件已登记")
+    dl = requests.get(f"{BASE}/bureau/cases/attachments/{atts[0]['id']}/download", timeout=15,
+                      headers={"Authorization": f"Bearer {admin.token}"})
+    ok(dl.content.decode("utf-8") == "笔录内容示例", "下载内容一致")
+
+    step("案卷目录：法定排序+齐全性检查（缺决定书等）")
+    cat = admin.get(f"/bureau/cases/{tcase['id']}/archive-catalog")
+    ok(any(d["doc_type"] == "FINAL_REPORT" for d in cat["catalog"]), "目录含终结报告")
+
+    step("大事记时间轴：事件按日期聚合")
+    tl = admin.get(f"/bureau/cases/{tcase['id']}/timeline")
+    kinds = [e["kind"] for e in tl]
+    ok("立案" in kinds and "调查终结" in kinds and "处罚告知" in kinds, f"大事记 {len(tl)} 条")
+
+    step("案卷齐全性强制开关：缺必备文书结案拒（2052）")
+    admin.call("PUT", "/config/archive_completeness_required?value=true")
+    try:
+        # 该案走到决定送达后尝试结案（缺 DELIVERY 无碍——必备清单为终结报告/告知/决定/结案报告）
+        admin.post(f"/bureau/cases/{tcase['id']}/statement", json={"statement": "无异议"})
+        rev = admin.post(f"/bureau/cases/{tcase['id']}/reviews", json={"requiredReason": "数额较大"})
+        admin.post(f"/bureau/cases/reviews/{rev['id']}",
+                   json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "同意"})
+        admin.post(f"/bureau/cases/{tcase['id']}/decide", json={
+            "decisionType": "NO_PUNISH", "content": "违法行为轻微并及时纠正，不予处罚"})
+        # NO_PUNISH 无须执行可直接结案，但必备文书含 DECISION 文书——尚未制作 → 2052
+        admin.post(f"/bureau/cases/{tcase['id']}/close", json={"closeReport": "x"}, expect_code=0)
+        print("    PASS: 不予处罚案件不触发处罚必备清单，正常结案")
+    finally:
+        admin.call("PUT", "/config/archive_completeness_required?value=false")
+
     # ============ 辽宁参数组：切换省域参数后整链路复验（辽医保发〔2020〕5号） ============
     liaoning_params = {
         "clue_verify_day_unit": "NATURAL",

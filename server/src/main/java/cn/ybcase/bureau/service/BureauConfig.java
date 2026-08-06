@@ -43,10 +43,31 @@ public class BureauConfig {
         return Boolean.parseBoolean(str(key, String.valueOf(def)));
     }
 
-    /** 按参数单位加期限：WORKDAY 跳周末（节假日表二期B接入）/ NATURAL 自然日 */
+    /** 按参数单位加期限：WORKDAY 工作日（跳周末+法定节假日，含调休补班）/ NATURAL 自然日 */
     public LocalDate plusByUnit(LocalDate from, int days, String unitKey) {
         String unit = str(unitKey, "WORKDAY");
-        return "NATURAL".equalsIgnoreCase(unit) ? from.plusDays(days) : Workdays.plus(from, days);
+        return "NATURAL".equalsIgnoreCase(unit) ? from.plusDays(days) : plusWorkdays(from, days);
+    }
+
+    /** 工作日推算（第58条：期间届满遇法定节假日顺延；sys_holiday：HOLIDAY 放假 / SHIFT_WORK 调休上班） */
+    public LocalDate plusWorkdays(LocalDate from, int n) {
+        var rows = jdbc.queryForList("select day, kind from sys_holiday");
+        var holidays = new java.util.HashSet<LocalDate>();
+        var shiftWork = new java.util.HashSet<LocalDate>();
+        for (var r : rows) {
+            LocalDate d = ((java.sql.Date) r.get("day")).toLocalDate();
+            if ("SHIFT_WORK".equals(r.get("kind"))) shiftWork.add(d); else holidays.add(d);
+        }
+        LocalDate d = from;
+        int added = 0;
+        while (added < n) {
+            d = d.plusDays(1);
+            boolean weekend = d.getDayOfWeek() == java.time.DayOfWeek.SATURDAY
+                    || d.getDayOfWeek() == java.time.DayOfWeek.SUNDAY;
+            boolean working = (!weekend || shiftWork.contains(d)) && !holidays.contains(d);
+            if (working) added++;
+        }
+        return d;
     }
 
     /** 按当事人类型取阈值（自然人 / 单位：经办机构、定点医药机构、其他主体） */

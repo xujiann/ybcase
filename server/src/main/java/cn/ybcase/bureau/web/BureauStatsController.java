@@ -77,6 +77,12 @@ public class BureauStatsController {
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.hold_expire_at
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.register_hold = true and ev.hold_expire_at < current_date order by ev.hold_expire_at"""));
+        // 责令改正逾期未报告（限期跟踪）
+        m.put("correctOverdue", jdbc.queryForList("""
+                select d.id, d.case_id, cf.case_no, d.title, d.due_at
+                from case_document d join case_file cf on cf.id = d.case_id
+                where d.doc_type = 'ORDER_CORRECT' and d.due_at is not null and d.due_at < current_date
+                  and cf.status not in ('CLOSED','TERMINATED') order by d.due_at"""));
         // 处罚决定公开超期（辽56条：作出决定7日内公开，参数化）
         m.put("publishOverdue", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name, d.decided_at

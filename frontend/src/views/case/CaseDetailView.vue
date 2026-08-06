@@ -123,6 +123,8 @@
 
         <el-tab-pane :label="`文书(${detail.documents?.length || 0})`">
           <el-button size="small" class="mb" @click="dlg.document = true" :disabled="c.status === 'CLOSED'">制作文书</el-button>
+          <el-button size="small" class="mb" type="primary" @click="onRenderTpl" :disabled="c.status === 'CLOSED'">模板生成</el-button>
+          <el-button size="small" class="mb" @click="onCatalog">案卷目录</el-button>
           <el-table :data="detail.documents" border size="small">
             <el-table-column label="类型" width="130">
               <template #default="{ row }">{{ DOC_TYPE[row.doc_type] || row.doc_type }}</template>
@@ -139,6 +141,36 @@
               </template>
             </el-table-column>
           </el-table>
+        </el-tab-pane>
+
+        <el-tab-pane :label="`附件(${attachments.length})`">
+          <div class="mb">
+            <input ref="fileInput" type="file" style="display: none" @change="onUpload" />
+            <el-button size="small" type="primary" @click="(fileInput as any)?.click()">上传附件</el-button>
+            <span class="hint" style="margin-left: 8px">笔录扫描件、影像证据等，单文件 ≤10MB</span>
+          </div>
+          <el-table :data="attachments" border size="small">
+            <el-table-column prop="filename" label="文件名" show-overflow-tooltip />
+            <el-table-column label="大小" width="100">
+              <template #default="{ row }">{{ (row.size_bytes / 1024).toFixed(1) }} KB</template>
+            </el-table-column>
+            <el-table-column prop="uploaded_by" label="上传人" width="100" />
+            <el-table-column label="下载" width="80">
+              <template #default="{ row }">
+                <a :href="`/api/bureau/cases/attachments/${row.id}/download`" target="_blank">
+                  <el-button size="small" text type="primary">下载</el-button>
+                </a>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+
+        <el-tab-pane label="大事记">
+          <el-timeline style="padding: 8px 12px">
+            <el-timeline-item v-for="(ev, i) in timeline" :key="i" :timestamp="ev.date" placement="top">
+              <b>{{ ev.kind }}</b>　<span class="hint">{{ ev.detail }}</span>
+            </el-timeline-item>
+          </el-timeline>
         </el-tab-pane>
 
         <el-tab-pane :label="`期限扣除(${detail.exclusions?.length || 0})`">
@@ -442,7 +474,25 @@
 
     <el-dialog v-model="dlg.doc" :title="docView.title" width="640px">
       <p class="hint">{{ DOC_TYPE[docView.doc_type] }}　{{ docView.made_at }}　制作人：{{ docView.maker || '-' }}</p>
-      <pre class="doc-content">{{ docView.content }}</pre>
+      <pre class="doc-content" id="doc-print-area">{{ docView.content }}</pre>
+      <template #footer>
+        <el-button type="primary" @click="printDoc">打印</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="dlg.catalog" title="案卷目录（一案一卷，第57条）" width="640px">
+      <el-alert v-if="catalog.missing?.length" type="warning" :closable="false" class="mb"
+                :title="`必备文书缺失：${catalog.missing.map((m: string) => DOC_TYPE[m] || m).join('、')}`" />
+      <el-alert v-else type="success" :closable="false" class="mb" title="必备文书齐全" />
+      <p class="hint">案卷号：{{ catalog.archiveNo || '（结案时生成）' }}</p>
+      <el-table :data="catalog.catalog" border size="small">
+        <el-table-column prop="seq" label="序号" width="70" />
+        <el-table-column label="文书类型" width="140">
+          <template #default="{ row }">{{ DOC_TYPE[row.doc_type] || row.doc_type }}</template>
+        </el-table-column>
+        <el-table-column prop="title" label="标题" show-overflow-tooltip />
+        <el-table-column prop="made_at" label="日期" width="110" />
+      </el-table>
     </el-dialog>
   </div>
 </template>
@@ -471,8 +521,12 @@ const cause = computed<any>(() => detail.value.cause || {})
 const dlg = reactive<Record<string, boolean>>({
   officer: false, evidence: false, document: false, exclusion: false, report: false,
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
-  execution: false, doc: false,
+  execution: false, doc: false, catalog: false,
 })
+const attachments = ref<any[]>([])
+const timeline = ref<any[]>([])
+const catalog = ref<any>({})
+const fileInput = ref<HTMLInputElement>()
 
 const today = new Date().toISOString().slice(0, 10)
 const officerForm = reactive({ name: '', certNo: '', duty: 'MEMBER' })
@@ -493,9 +547,47 @@ async function load() {
   try {
     const resp = await client.get(`/bureau/cases/${id}`)
     detail.value = resp.data.data
+    attachments.value = (await client.get(`/bureau/cases/${id}/attachments`)).data.data
+    timeline.value = (await client.get(`/bureau/cases/${id}/timeline`)).data.data
   } finally {
     loading.value = false
   }
+}
+
+async function onRenderTpl() {
+  const { value: docType } = await ElMessageBox.prompt(
+    '文书类型：NOTICE 告知书 / DECISION 决定书 / FINAL_REPORT 终结报告 / ORDER_CORRECT 责令改正 / CLOSE_REPORT 结案报告 / ASSIST_LETTER 协查函',
+    '模板生成', { inputValue: 'NOTICE', inputPattern: /^(NOTICE|DECISION|FINAL_REPORT|ORDER_CORRECT|CLOSE_REPORT|ASSIST_LETTER)$/, inputErrorMessage: '类型无效' })
+  const resp = await client.get(`/bureau/cases/${id}/documents/render`, { params: { docType } })
+  const d = resp.data.data
+  documentForm.docType = d.docType
+  documentForm.title = d.title
+  documentForm.content = d.content
+  dlg.document = true
+}
+
+async function onCatalog() {
+  catalog.value = (await client.get(`/bureau/cases/${id}/archive-catalog`)).data.data
+  dlg.catalog = true
+}
+
+async function onUpload(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  const fd = new FormData()
+  fd.append('file', file)
+  await client.post(`/bureau/cases/${id}/attachments`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+  ElMessage.success('已上传')
+  ;(e.target as HTMLInputElement).value = ''
+  load()
+}
+
+function printDoc() {
+  const w = window.open('', '_blank')
+  if (!w) return
+  w.document.write(`<html><head><title>${docView.value.title}</title><style>body{font-family:SimSun,serif;padding:40px;line-height:1.9}h2{text-align:center}pre{white-space:pre-wrap;font-family:inherit;font-size:15px}</style></head><body><h2>${docView.value.title}</h2><pre>${docView.value.content}</pre></body></html>`)
+  w.document.close()
+  w.print()
 }
 
 /** 通用子表提交：POST /bureau/cases/{id}/{path} 后关弹窗刷新 */

@@ -17,6 +17,7 @@ import java.util.Map;
 public class CaseController {
 
     private final CaseService caseService;
+    private final cn.ybcase.bureau.service.DocumentService documentService;
     private final CaseFileRepository caseRepository;
 
     @GetMapping
@@ -85,6 +86,24 @@ public class CaseController {
     @GetMapping("/{id}/documents/{docId}")
     public R<Map<String, Object>> document(@PathVariable Long id, @PathVariable Long docId) {
         return R.ok(caseService.documentDetail(id, docId));
+    }
+
+    /** 文书模板渲染（要素自动填充，含执法事项法律依据带出） */
+    @GetMapping("/{id}/documents/render")
+    public R<Map<String, String>> renderDocument(@PathVariable Long id, @RequestParam String docType) {
+        return R.ok(documentService.render(id, docType));
+    }
+
+    /** 案卷目录（一案一卷排序+齐全性检查，第57条） */
+    @GetMapping("/{id}/archive-catalog")
+    public R<Map<String, Object>> archiveCatalog(@PathVariable Long id) {
+        return R.ok(documentService.archiveCatalog(id));
+    }
+
+    /** 案件大事记（全过程记录时间轴，第4/35条） */
+    @GetMapping("/{id}/timeline")
+    public R<List<Map<String, Object>>> timeline(@PathVariable Long id) {
+        return R.ok(documentService.timeline(id));
     }
 
     @PostMapping("/{id}/exclusions")
