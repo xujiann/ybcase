@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: 后端构建与测试（mvn test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: 构建与测试
+        run: mvn -B --no-transfer-progress test
+
+  frontend:
+    name: 前端构建（vue-tsc + vite）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装依赖并构建
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+  e2e:
+    name: 端到端回归（26 步全流程）
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ybcase
+          POSTGRES_USER: hip
+          POSTGRES_PASSWORD: hip123456
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hip -d ybcase"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: 构建后端
+        run: mvn -B --no-transfer-progress -DskipTests package
+
+      - name: 启动后端并等待就绪（Flyway 建表 + 初始化器种子账号）
+        run: |
+          nohup java -jar server/target/ybcase-server-*.jar > server.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8090/actuator/health && break
+            sleep 2
+          done
+          curl -sf http://localhost:8090/actuator/health || { tail -50 server.log; exit 1; }
+
+      - name: 运行 E2E 回归
+        run: python3 tools/e2e-case.py
