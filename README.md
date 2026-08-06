@@ -15,6 +15,10 @@
 | `frontend/` | Vue 3 + Element Plus（dev 端口 5174，代理 /api → 8090） |
 | `tools/e2e-case.py` | 26 步端到端回归（需后端运行） |
 
+## 云端预览（GitHub Codespaces）
+
+仓库页面 **Code → Codespaces → Create codespace on main**，等待初始化（首次约 5-8 分钟：自动建库、构建后端、装前端依赖并拉起前后端），然后打开"端口"面板中 **5174** 的转发地址即是登录页（演示账号 admin/admin123）。机型建议 4 核；数据存在 Codespace 内，删除即清。
+
 ## 运行
 
 ```bash

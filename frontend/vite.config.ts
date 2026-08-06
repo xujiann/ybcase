@@ -26,6 +26,8 @@ export default defineConfig({
   server: {
     // autoPort：预览环境经 PORT 注入端口，本地手工启动回落 5174
     port: Number(process.env.PORT) || 5174,
+    // GitHub Codespaces 转发域（Vite 6 默认拦截非本机 Host）
+    allowedHosts: ['.app.github.dev'],
     proxy: {
       '/api': {
         target: 'http://localhost:8090',
