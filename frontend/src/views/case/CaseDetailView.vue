@@ -579,7 +579,7 @@ const dlg = reactive<Record<string, boolean>>({
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
   execution: false, doc: false, catalog: false, hearing: false,
 })
-const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: today, scheduledAt: '', host: '', hostDept: '', recorder: '' })
+const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: new Date().toISOString().slice(0, 10), scheduledAt: '', host: '', hostDept: '', recorder: '' })
 const attachments = ref<any[]>([])
 const timeline = ref<any[]>([])
 const catalog = ref<any>({})
