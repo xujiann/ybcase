@@ -3,7 +3,7 @@
 set -uo pipefail
 
 sudo service postgresql start || true
-for i in $(seq 1 30); do sudo -u postgres pg_isready -q && break; sleep 1; done
+for i in $(seq 1 30); do pg_isready -q && break; sleep 1; done
 
 if ! curl -sf http://127.0.0.1:8090/actuator/health > /dev/null 2>&1; then
   JAR=$(ls server/target/ybcase-server-*.jar 2>/dev/null | head -1)
