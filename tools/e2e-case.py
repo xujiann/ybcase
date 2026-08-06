@@ -31,9 +31,18 @@ def ok(cond, msg):
 
 class Api:
     def __init__(self, username):
-        r = requests.post(f"{BASE}/auth/login",
-                          json={"username": username, "password": "admin123"}, timeout=10)
-        self.token = r.json()["data"]["token"]
+        # 健康检查通过 ≠ 初始化器已建好默认账号（ApplicationRunner 晚于 Web 就绪）——登录重试消除时序 flake
+        import time
+        last = None
+        for _ in range(30):
+            r = requests.post(f"{BASE}/auth/login",
+                              json={"username": username, "password": "admin123"}, timeout=10)
+            last = r.json()
+            if last.get("code") == 0:
+                self.token = last["data"]["token"]
+                return
+            time.sleep(1)
+        raise AssertionError(f"登录失败（{username}）: {last}")
 
     def call(self, method, path, expect_code=0, **kwargs):
         r = requests.request(method, f"{BASE}{path}", timeout=15,
