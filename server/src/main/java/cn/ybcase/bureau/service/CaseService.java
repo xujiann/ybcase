@@ -36,6 +36,8 @@ public class CaseService {
     private final BureauConfig config;
     private final DocumentService documentService;
     private final ProcedureService procedureService;
+    private final BizSeqService seqService;
+    private final ExecutionService executionService;
 
     // ---------- 立案 ----------
 
@@ -69,8 +71,8 @@ public class CaseService {
             c.setHealthHarm(Boolean.TRUE.equals(req.healthHarm()));
         }
         c.setEnforceItemId(req.enforceItemId());
-        String prefix = cfg("case_no_prefix", "医保案") + "〔" + today.getYear() + "〕";
-        c.setCaseNo(prefix + (caseRepository.countByCaseNoStartingWith(prefix) + 1) + "号");
+        c.setCaseNo(cfg("case_no_prefix", "医保案") + "〔" + today.getYear() + "〕"
+                + seqService.next("CASE", today.getYear()) + "号");
         // 调查阶段案件名称：违法主体+涉嫌+案由+案
         c.setName(req.partyName() + "涉嫌" + cause.getCategory() + "案");
         c.setClueId(req.clueId());
@@ -123,80 +125,6 @@ public class CaseService {
                 update case_officer set avoided = true, avoid_reason = ?, avoid_applicant = ?, avoid_decided_by = ?
                 where id = ? and case_id = ?""",
                 reason, applicant == null ? "SELF" : applicant, decidedBy, officerId, caseId);
-    }
-
-    // ---------- 证据 ----------
-
-    public record EvidenceReq(String type, String name, String source, LocalDate obtainedAt,
-                              String keeper, String note, Boolean registerHold, Boolean sealed) {}
-
-    /** 证据种类：国家局令 8 类 + 辽23条第九类"法律法规规章规定可以作为证据的其他材料" */
-    private static final List<String> EVIDENCE_TYPES = List.of(
-            "DOCUMENT", "PHYSICAL", "AV", "EDATA", "TESTIMONY", "STATEMENT", "EXPERT", "RECORD", "OTHER_MATERIAL");
-
-    @Transactional
-    public void addEvidence(Long caseId, EvidenceReq req) {
-        requireActive(get(caseId));
-        if (!EVIDENCE_TYPES.contains(req.type()))
-            throw new BizException(2027, "证据种类须为法定八类之一（第19条）");
-        LocalDate obtained = req.obtainedAt() != null ? req.obtainedAt() : LocalDate.now();
-        boolean hold = Boolean.TRUE.equals(req.registerHold());
-        boolean sealed = Boolean.TRUE.equals(req.sealed());
-        jdbc.update("""
-                insert into case_evidence (case_id, type, name, source, obtained_at, keeper, note,
-                    register_hold, hold_expire_at, sealed, seal_expire_at)
-                values (?,?,?,?,?,?,?,?,?,?,?)""",
-                caseId, req.type(), req.name(), req.source(), obtained, req.keeper(), req.note(),
-                // 第26条：7个工作日内作出处理决定（辽33条为7自然日，参数化）
-                hold, hold ? config.plusByUnit(obtained, config.intVal("evidence_hold_days", 7), "evidence_hold_day_unit") : null,
-                sealed, sealed ? obtained.plusDays(30) : null);          // 第31条：封存不超过30日
-    }
-
-    /** 先行登记保存处理决定（第28条）：PRESERVE 保全 / SEAL 转封存 / RELEASE 解除 */
-    @Transactional
-    public void disposeHold(Long caseId, Long evidenceId, String disposal) {
-        requireActive(get(caseId));
-        if (!List.of("PRESERVE", "SEAL", "RELEASE").contains(disposal))
-            throw new BizException(2028, "处理措施须为 保全/封存/解除 之一（第28条）");
-        int n;
-        if ("SEAL".equals(disposal)) {
-            n = jdbc.update("""
-                    update case_evidence set hold_disposal = ?, register_hold = false,
-                        sealed = true, seal_expire_at = ? where id = ? and case_id = ? and register_hold = true""",
-                    disposal, LocalDate.now().plusDays(30), evidenceId, caseId);
-        } else {
-            n = jdbc.update("""
-                    update case_evidence set hold_disposal = ?, register_hold = false
-                    where id = ? and case_id = ? and register_hold = true""", disposal, evidenceId, caseId);
-        }
-        if (n == 0) throw new BizException(2029, "证据不存在或不在先行登记保存状态");
-    }
-
-    /** 证据质证（辽24条：当事人有权对证据发表意见，未经质证的证据不能作为处罚决定依据） */
-    @Transactional
-    public void crossExam(Long caseId, Long evidenceId, String opinion) {
-        CaseFile c = get(caseId);
-        if ("CLOSED".equals(c.getStatus())) throw new BizException(2031, "案件已结案归档");
-        if (opinion == null || opinion.isBlank()) throw new BizException(2045, "须记录当事人对证据的意见（无异议也须注明）");
-        int n = jdbc.update("update case_evidence set cross_exam_opinion = ?, cross_exam_at = ? where id = ? and case_id = ?",
-                opinion, LocalDate.now(), evidenceId, caseId);
-        if (n == 0) throw new BizException(2029, "证据不存在");
-    }
-
-    /** 延长封存（第31条：可延长一次，不超过30日）或解除封存（第33条） */
-    @Transactional
-    public void updateSeal(Long caseId, Long evidenceId, boolean extend) {
-        requireActive(get(caseId));
-        if (extend) {
-            int n = jdbc.update("""
-                    update case_evidence set seal_extended = true, seal_expire_at = seal_expire_at + 30
-                    where id = ? and case_id = ? and sealed = true and seal_extended = false""", evidenceId, caseId);
-            if (n == 0) throw new BizException(2030, "封存延长仅限一次且证据须在封存中（第31条）");
-        } else {
-            int n = jdbc.update("update case_evidence set sealed = false where id = ? and case_id = ? and sealed = true",
-                    evidenceId, caseId);
-            if (n == 0) throw new BizException(2029, "证据不在封存状态");
-        }
     }
 
     // ---------- 文书 ----------
@@ -337,6 +265,14 @@ public class CaseService {
                 "select name from case_officer where case_id = ?", r.getCaseId());
         if (officers.stream().anyMatch(o -> o.get("name").equals(reviewer)))
             throw new BizException(2038, "同一案件的办案人员不得作为法制审核人员（第37条）");
+        // 辽41条：从事案件审核的人员应通过法律职业资格考试（参数开关，比对执法证台账）
+        if (config.bool("review_legal_qualified_required", true)) {
+            Integer qualified = jdbc.queryForObject(
+                    "select count(*) from enforcer where name = ? and legal_qualified = true and enabled = true",
+                    Integer.class, reviewer);
+            if (qualified == null || qualified == 0)
+                throw new BizException(2070, "审核人 " + reviewer + " 未在台账中登记法律职业资格（辽41条）");
+        }
         r.setReviewer(reviewer);
         r.setOpinionType(opinionType);
         r.setOpinion(opinion);
@@ -491,8 +427,8 @@ public class CaseService {
         d.setCaseId(caseId);
         d.setDecisionType(req.decisionType());
         if ("PUNISH".equals(req.decisionType())) {
-            String prefix = cfg("decision_no_prefix", "医保罚") + "〔" + LocalDate.now().getYear() + "〕";
-            d.setDecisionNo(prefix + (decisionRepository.countByDecisionNoStartingWith(prefix) + 1) + "号");
+            d.setDecisionNo(cfg("decision_no_prefix", "医保罚") + "〔" + LocalDate.now().getYear() + "〕"
+                    + seqService.next("DECISION", LocalDate.now().getYear()) + "号");
         }
         d.setFineAmount(fine);
         d.setRecoupAmount(recoup);
@@ -504,9 +440,17 @@ public class CaseService {
         d.setDecidedAt(LocalDate.now());
         decisionRepository.save(d);
 
-        c.setStatus("DECIDED");
         c.setDecidedAt(LocalDate.now());
         c.setName(c.getName().replace("涉嫌", ""));  // 苏医保督〔2024〕1号：决定后案件名称去"涉嫌"
+        if ("TRANSFER_JUDICIAL".equals(req.decisionType())) {
+            // 第47条：移送司法机关追究刑事责任的，终止调查并解除强制措施
+            jdbc.update("update case_evidence set sealed = false, register_hold = false where case_id = ?", caseId);
+            c.setStatus("TERMINATED");
+            c.setTerminateReason("移送司法机关追究刑事责任（第43/47条联动）");
+            c.setTerminatedAt(LocalDate.now());
+        } else {
+            c.setStatus("DECIDED");
+        }
         caseRepository.save(c);
         return d;
     }
@@ -528,9 +472,15 @@ public class CaseService {
         // 第59条：电子送达以当事人同意并签订确认书为前提
         if ("ELECTRONIC".equals(req.method()) && !Boolean.TRUE.equals(c.getEDeliveryConsent()))
             throw new BizException(2054, "当事人未签订电子送达确认书，不得电子送达（第59条）");
-        // 辽58条：送达回证签收日期为送达日期
-        LocalDate deliveredAt = req.receiptSignedAt() != null ? req.receiptSignedAt()
-                : (req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now());
+        // 辽58条：送达回证签收日期为送达日期；辽60条：公告送达自公告之日起满60日视为送达
+        LocalDate deliveredAt;
+        if ("ANNOUNCE".equals(req.method())) {
+            LocalDate announceDate = req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now();
+            deliveredAt = announceDate.plusDays(config.intVal("announce_deliver_days", 60));
+        } else {
+            deliveredAt = req.receiptSignedAt() != null ? req.receiptSignedAt()
+                    : (req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now());
+        }
         jdbc.update("""
                 insert into case_delivery (case_id, method, delivered_at, receiver, note, receipt_no, receipt_signed_at)
                 values (?,?,?,?,?,?,?)""",
@@ -542,53 +492,6 @@ public class CaseService {
     }
 
     // ---------- 执行（第52-55条） ----------
-
-    public record ExecutionReq(String kind, BigDecimal amount, LocalDate paidAt, String method, String note,
-                               String receiptNo) {}
-
-    @Transactional
-    public void addExecution(Long caseId, ExecutionReq req) {
-        CaseFile c = get(caseId);
-        if (!List.of("DECIDED", "DELIVERED").contains(c.getStatus()))
-            throw new BizException(2042, "仅已决定/已送达的案件可登记执行");
-        CaseDecision d = decisionRepository.findByCaseId(caseId)
-                .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
-        if (!List.of("FINE", "RECOUP", "CONFISCATE", "LATE_FEE").contains(req.kind()))
-            throw new BizException(2042, "执行类型须为 罚款/退回基金/没收违法所得/加处罚款");
-        BigDecimal amount = nz(req.amount());
-        if (amount.signum() <= 0) throw new BizException(2042, "执行金额须为正数");
-        // 第52条：当场收缴限额（国家100/辽宁20，参数化）
-        BigDecimal onsiteLimit = config.decimal("onsite_collect_limit", "100");
-        if ("ONSITE".equals(req.method()) && amount.compareTo(onsiteLimit) > 0)
-            throw new BizException(2010, "当场收缴罚款限 " + onsiteLimit + " 元以下（第52条）");
-        // 第55条：加处罚款不得超出罚款数额
-        if ("LATE_FEE".equals(req.kind())) {
-            BigDecimal paidLateFee = sumExecution(caseId, "LATE_FEE");
-            if (paidLateFee.add(amount).compareTo(d.getFineAmount()) > 0)
-                throw new BizException(2012, "加处罚款累计不得超出罚款数额（第55条）");
-        }
-        // 第52条：当场收缴必须出具财政部门统一制发的专用票据
-        if ("ONSITE".equals(req.method()) && (req.receiptNo() == null || req.receiptNo().isBlank()))
-            throw new BizException(2010, "当场收缴必须出具财政统一票据并登记票据号（第52条）");
-        jdbc.update("insert into case_execution (case_id, kind, amount, paid_at, method, note, receipt_no) values (?,?,?,?,?,?,?)",
-                caseId, req.kind(), amount, req.paidAt() != null ? req.paidAt() : LocalDate.now(),
-                req.method(), req.note(), req.receiptNo());
-    }
-
-    /** 加处罚款测算（第55条：每日按罚款数额3%加处，不超出罚款数额；缴款期限=送达后15日） */
-    public Map<String, Object> lateFeeQuote(Long caseId) {
-        CaseFile c = get(caseId);
-        CaseDecision d = decisionRepository.findByCaseId(caseId)
-                .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
-        if (c.getDeliveredAt() == null) throw new BizException(2042, "决定书尚未送达");
-        LocalDate payDeadline = c.getDeliveredAt().plusDays(15);
-        long overdueDays = Math.max(0, ChronoUnit.DAYS.between(payDeadline, LocalDate.now()));
-        BigDecimal accrued = d.getFineAmount().multiply(new BigDecimal("0.03"))
-                .multiply(BigDecimal.valueOf(overdueDays));
-        BigDecimal capped = accrued.min(d.getFineAmount());
-        return Map.of("payDeadline", payDeadline, "overdueDays", overdueDays,
-                "accrued", accrued, "capped", capped, "fineAmount", d.getFineAmount());
-    }
 
     /** 处罚决定公开（局令46条；辽56条：作出决定7日内公开） */
     @Transactional
@@ -609,25 +512,6 @@ public class CaseService {
         d.setGovRecordNo(recordNo);
         d.setGovRecordAt(LocalDate.now());
         return decisionRepository.save(d);
-    }
-
-    /** 暂缓/分期缴纳批准（第54条） */
-    @Transactional
-    public CaseFile approveDefer(Long caseId) {
-        CaseFile c = get(caseId);
-        if (!List.of("DECIDED", "DELIVERED").contains(c.getStatus()))
-            throw new BizException(2042, "仅已决定/已送达的案件可批准暂缓分期");
-        c.setDeferApproved(true);
-        return caseRepository.save(c);
-    }
-
-    /** 申请法院强制执行（第55条） */
-    @Transactional
-    public CaseFile applyCourtEnforce(Long caseId) {
-        CaseFile c = get(caseId);
-        if (!"DELIVERED".equals(c.getStatus())) throw new BizException(2042, "决定书送达且当事人逾期不履行方可申请强制执行");
-        c.setCourtEnforceApplied(true);
-        return caseRepository.save(c);
     }
 
     // ---------- 结案（第56-57条） ----------
@@ -694,6 +578,7 @@ public class CaseService {
                 Map.entry("notices", noticeRepository.findByCaseIdOrderByIdDesc(id)),
                 Map.entry("meetings", jdbc.queryForList("select * from case_meeting where case_id = ? order by id", id)),
                 Map.entry("decision", decisionRepository.findByCaseId(id).map(Object.class::cast).orElse(Map.of())),
+                Map.entry("expertReviews", jdbc.queryForList("select * from expert_review where case_id = ? order by id", id)),
                 Map.entry("hearings", jdbc.queryForList("select * from case_hearing where case_id = ? order by id", id)),
                 Map.entry("assists", jdbc.queryForList("select * from case_assist where case_id = ? order by id", id)),
                 Map.entry("deliveries", jdbc.queryForList("select * from case_delivery where case_id = ? order by id", id)),
@@ -725,16 +610,9 @@ public class CaseService {
     }
 
     private boolean fullyExecuted(Long caseId, CaseDecision d) {
-        return sumExecution(caseId, "FINE").compareTo(d.getFineAmount()) >= 0
-                && sumExecution(caseId, "RECOUP").compareTo(d.getRecoupAmount()) >= 0
-                && sumExecution(caseId, "CONFISCATE").compareTo(d.getConfiscateAmount()) >= 0;
-    }
-
-    private BigDecimal sumExecution(Long caseId, String kind) {
-        BigDecimal v = jdbc.queryForObject(
-                "select coalesce(sum(amount), 0) from case_execution where case_id = ? and kind = ?",
-                BigDecimal.class, caseId, kind);
-        return v == null ? BigDecimal.ZERO : v;
+        return executionService.sum(caseId, "FINE").compareTo(d.getFineAmount()) >= 0
+                && executionService.sum(caseId, "RECOUP").compareTo(d.getRecoupAmount()) >= 0
+                && executionService.sum(caseId, "CONFISCATE").compareTo(d.getConfiscateAmount()) >= 0;
     }
 
     private String cfg(String key, String def) {

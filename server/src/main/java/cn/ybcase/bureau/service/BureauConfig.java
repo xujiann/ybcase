@@ -58,16 +58,7 @@ public class BureauConfig {
             LocalDate d = ((java.sql.Date) r.get("day")).toLocalDate();
             if ("SHIFT_WORK".equals(r.get("kind"))) shiftWork.add(d); else holidays.add(d);
         }
-        LocalDate d = from;
-        int added = 0;
-        while (added < n) {
-            d = d.plusDays(1);
-            boolean weekend = d.getDayOfWeek() == java.time.DayOfWeek.SATURDAY
-                    || d.getDayOfWeek() == java.time.DayOfWeek.SUNDAY;
-            boolean working = (!weekend || shiftWork.contains(d)) && !holidays.contains(d);
-            if (working) added++;
-        }
-        return d;
+        return Workdays.plus(from, n, holidays, shiftWork);
     }
 
     /** 按当事人类型取阈值（自然人 / 单位：经办机构、定点医药机构、其他主体） */

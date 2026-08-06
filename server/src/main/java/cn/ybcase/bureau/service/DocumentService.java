@@ -66,8 +66,8 @@ public class DocumentService {
         vars.put("decisionContent", decision == null ? "" : nv(decision.getContent()));
         vars.put("dueAt", "");
 
-        String title = fill((String) rows.get(0).get("title_tpl"), vars);
-        String content = fill((String) rows.get(0).get("content_tpl"), vars);
+        String title = cn.ybcase.bureau.common.TemplateUtil.fill((String) rows.get(0).get("title_tpl"), vars);
+        String content = cn.ybcase.bureau.common.TemplateUtil.fill((String) rows.get(0).get("content_tpl"), vars);
         return Map.of("docType", docType, "title", title, "content", content);
     }
 
@@ -163,12 +163,6 @@ public class DocumentService {
 
     private static LocalDate toDate(Object v) {
         return v == null ? null : ((java.sql.Date) v).toLocalDate();
-    }
-
-    private static String fill(String tpl, Map<String, String> vars) {
-        String s = tpl;
-        for (var e : vars.entrySet()) s = s.replace("{{" + e.getKey() + "}}", e.getValue());
-        return s;
     }
 
     private static String nv(String v) {

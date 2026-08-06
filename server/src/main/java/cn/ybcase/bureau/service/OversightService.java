@@ -21,6 +21,7 @@ public class OversightService {
     private final ClueService clueService;
     private final CaseClueRepository clueRepository;
     private final JdbcTemplate jdbc;
+    private final BizSeqService seq;
 
     // ---------- 行政检查（清单第10-12项） ----------
 
@@ -31,10 +32,8 @@ public class OversightService {
     public Map<String, Object> createInspection(InspectionReq req, String username) {
         if (req.officers() == null || req.officers().split("[、,，]").length < 2)
             throw new BizException(2063, "检查人员不得少于2人（第16条）");
-        String prefix = "JC" + LocalDate.now().getYear();
-        Long count = jdbc.queryForObject(
-                "select count(*) from inspection where insp_no like ?", Long.class, prefix + "%");
-        String no = prefix + String.format("%04d", (count == null ? 0 : count) + 1);
+        int year = LocalDate.now().getYear();
+        String no = "JC" + year + String.format("%04d", seq.next("INSP", year));
         jdbc.update("""
                 insert into inspection (insp_no, item_id, object_name, object_type, officers, planned_at, created_by)
                 values (?,?,?,?,?,?,?)""",

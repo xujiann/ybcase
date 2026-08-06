@@ -61,6 +61,7 @@ public class OversightController {
         return R.ok();
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','ADMIN')")
     @PostMapping("/rewards/{id}/approve")
     public R<Void> approveReward(@PathVariable Long id, @RequestBody Map<String, Object> body,
                                  Authentication auth) {

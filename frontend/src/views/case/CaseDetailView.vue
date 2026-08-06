@@ -159,9 +159,7 @@
             <el-table-column prop="uploaded_by" label="上传人" width="100" />
             <el-table-column label="下载" width="80">
               <template #default="{ row }">
-                <a :href="`/api/bureau/cases/attachments/${row.id}/download`" target="_blank">
-                  <el-button size="small" text type="primary">下载</el-button>
-                </a>
+                <el-button size="small" text type="primary" @click="onDownload(row)">下载</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -178,13 +176,24 @@
         <el-tab-pane :label="`期限扣除(${detail.exclusions?.length || 0})`">
           <el-button size="small" class="mb" @click="dlg.exclusion = true" :disabled="['CLOSED','TERMINATED'].includes(c.status)">登记扣除期间</el-button>
           <p class="hint">检测检验、鉴定、听证、公告、专家评审时间不计入办案期限（第45条）</p>
-          <el-table :data="detail.exclusions" border size="small">
+          <el-table :data="detail.exclusions" border size="small" class="mb">
             <el-table-column label="事由" width="110">
               <template #default="{ row }">{{ EXCLUSION_REASON[row.reason] }}</template>
             </el-table-column>
             <el-table-column prop="start_at" label="开始" width="110" />
             <el-table-column prop="end_at" label="结束" width="110" />
             <el-table-column prop="note" label="说明" />
+          </el-table>
+          <h4>专家评审（第25条，结束自动登记期限扣除）　<el-button size="small" @click="onStartExpert" :disabled="['CLOSED','TERMINATED'].includes(c.status)">启动评审</el-button></h4>
+          <el-table :data="detail.expertReviews" border size="small">
+            <el-table-column prop="experts" label="专家" width="220" show-overflow-tooltip />
+            <el-table-column prop="started_at" label="开始" width="110" />
+            <el-table-column label="结束/意见">
+              <template #default="{ row }">
+                <span v-if="row.ended_at">{{ row.ended_at }}：{{ row.opinion }}</span>
+                <el-button v-else size="small" text type="primary" @click="onEndExpert(row)">结束并出具意见</el-button>
+              </template>
+            </el-table-column>
           </el-table>
         </el-tab-pane>
 
@@ -197,7 +206,7 @@
             <el-table-column label="意见" width="200">
               <template #default="{ row }">
                 <span v-if="row.reviewedAt">{{ REVIEW_OPINION[row.opinionType] }}：{{ row.opinion }}（{{ row.reviewer }}）</span>
-                <el-button v-else size="small" type="primary" @click="onDoReview(row)">办理审核</el-button>
+                <el-button v-else size="small" type="primary" @click="openReviewDialog(row)">办理审核</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -535,6 +544,36 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="dlg.review" title="法制审核办理（审核人须具备法律职业资格，不得为本案办案人员）" width="480px">
+      <el-form label-width="90px">
+        <el-form-item label="审核人"><el-input v-model="reviewForm.reviewer" /></el-form-item>
+        <el-form-item label="意见类型">
+          <el-select v-model="reviewForm.opinionType" style="width: 100%">
+            <el-option v-for="(v, k) in REVIEW_OPINION" :key="k" :label="v" :value="k" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="审核意见"><el-input v-model="reviewForm.opinion" type="textarea" :rows="3" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dlg.review = false">取消</el-button>
+        <el-button type="primary" @click="onDoReview">提交审核</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="dlg.installment" title="添加分期（第54条）" width="420px">
+      <el-form label-width="80px">
+        <el-form-item label="期数"><el-input-number v-model="installmentForm.seq" :min="1" /></el-form-item>
+        <el-form-item label="到期日">
+          <el-date-picker v-model="installmentForm.dueAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+        </el-form-item>
+        <el-form-item label="金额"><el-input-number v-model="installmentForm.amount" :min="0.01" :precision="2" style="width: 180px" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dlg.installment = false">取消</el-button>
+        <el-button type="primary" @click="onAddInstallment">添加</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="dlg.hearing" title="安排听证（须在通知送达后≥7日举行；主持人不得为本案办案人员）" width="520px">
       <el-form :model="hearingForm" label-width="110px">
         <el-form-item label="公告日期">
@@ -597,8 +636,10 @@ const cause = computed<any>(() => detail.value.cause || {})
 const dlg = reactive<Record<string, boolean>>({
   officer: false, evidence: false, document: false, exclusion: false, report: false,
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
-  execution: false, doc: false, catalog: false, hearing: false,
+  execution: false, doc: false, catalog: false, hearing: false, review: false, installment: false,
 })
+const reviewForm = reactive<any>({ reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
+const installmentForm = reactive<any>({ seq: 1, dueAt: '', amount: 0 })
 const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: new Date().toISOString().slice(0, 10), scheduledAt: '', host: '', hostDept: '', recorder: '' })
 const attachments = ref<any[]>([])
 const timeline = ref<any[]>([])
@@ -648,6 +689,16 @@ async function onRenderTpl() {
 async function onCatalog() {
   catalog.value = (await client.get(`/bureau/cases/${id}/archive-catalog`)).data.data
   dlg.catalog = true
+}
+
+async function onDownload(row: any) {
+  // 带 JWT 的 blob 下载（直链 <a href> 无 Authorization 会 401）
+  const resp = await client.get(`/bureau/cases/attachments/${row.id}/download`, { responseType: 'blob' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(resp.data)
+  a.download = row.filename
+  a.click()
+  URL.revokeObjectURL(a.href)
 }
 
 async function onUpload(e: Event) {
@@ -772,12 +823,19 @@ async function onSubmitReview() {
   load()
 }
 
-async function onDoReview(row: any) {
-  const { value: reviewer } = await ElMessageBox.prompt('审核人（不得为本案办案人员）', '法制审核', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  const { value: opinionType } = await ElMessageBox.prompt('意见类型：AGREE同意/CONTINUE继续调查/CHANGE变更/CORRECT纠正/OTHER其他', '法制审核', { inputValue: 'AGREE', inputPattern: /^(AGREE|CONTINUE|CHANGE|CORRECT|OTHER)$/, inputErrorMessage: '类型无效' })
-  const { value: opinion } = await ElMessageBox.prompt('审核意见', '法制审核', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/reviews/${row.id}`, { reviewer, opinionType, opinion })
+function openReviewDialog(row: any) {
+  reviewForm.reviewId = row.id
+  dlg.review = true
+}
+
+async function onDoReview() {
+  if (!reviewForm.reviewer || !reviewForm.opinion) {
+    ElMessage.warning('审核人与意见必填')
+    return
+  }
+  await client.post(`/bureau/cases/reviews/${reviewForm.reviewId}`, reviewForm)
   ElMessage.success('审核完成')
+  dlg.review = false
   load()
 }
 
@@ -905,11 +963,29 @@ async function onDiscretionSuggest() {
 }
 
 async function onAddInstallment() {
-  const { value: seq } = await ElMessageBox.prompt('期数', '添加分期', { inputPattern: /^\d+$/, inputErrorMessage: '数字' })
-  const { value: dueAt } = await ElMessageBox.prompt('到期日（YYYY-MM-DD）', '添加分期', { inputPattern: /^\d{4}-\d{2}-\d{2}$/, inputErrorMessage: '日期格式' })
-  const { value: amount } = await ElMessageBox.prompt('金额', '添加分期', { inputPattern: /^\d+(\.\d{1,2})?$/, inputErrorMessage: '金额' })
-  await client.post(`/bureau/cases/${id}/installments`, { seq: Number(seq), dueAt, amount: Number(amount) })
+  if (!installmentForm.dueAt || !installmentForm.amount) {
+    dlg.installment = true
+    return
+  }
+  await client.post(`/bureau/cases/${id}/installments`, installmentForm)
   ElMessage.success('已添加')
+  dlg.installment = false
+  installmentForm.seq += 1
+  installmentForm.amount = 0
+  load()
+}
+
+async function onStartExpert(row?: any) {
+  const { value } = await ElMessageBox.prompt('评审专家（顿号分隔）', '启动专家评审', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/expert-reviews`, { experts: value })
+  ElMessage.success('评审已启动')
+  load()
+}
+
+async function onEndExpert(row: any) {
+  const { value } = await ElMessageBox.prompt('评审意见', '结束专家评审', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/expert-reviews/${row.id}/end`, { opinion: value })
+  ElMessage.success('评审结束，期间已计入期限扣除')
   load()
 }
 

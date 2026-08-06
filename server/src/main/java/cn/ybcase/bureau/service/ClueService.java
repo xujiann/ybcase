@@ -17,6 +17,7 @@ public class ClueService {
 
     private final CaseClueRepository clueRepository;
     private final BureauConfig cfg;
+    private final BizSeqService seq;
 
     public record ClueCreateReq(String source, String content, String suspectName,
                                 String suspectType, LocalDate receivedAt, String handler) {}
@@ -26,8 +27,7 @@ public class ClueService {
         if (req.content() == null || req.content().isBlank()) throw new BizException(2020, "线索内容不能为空");
         LocalDate received = req.receivedAt() != null ? req.receivedAt() : LocalDate.now();
         CaseClue clue = new CaseClue();
-        String prefix = "XS" + received.getYear();
-        clue.setClueNo(prefix + String.format("%04d", clueRepository.countByClueNoStartingWith(prefix) + 1));
+        clue.setClueNo("XS" + received.getYear() + String.format("%04d", seq.next("CLUE", received.getYear())));
         clue.setSource(req.source());
         clue.setContent(req.content());
         clue.setSuspectName(req.suspectName());

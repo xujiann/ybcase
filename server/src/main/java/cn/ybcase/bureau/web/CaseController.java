@@ -5,6 +5,7 @@ import cn.ybcase.bureau.repository.CaseFileRepository;
 import cn.ybcase.bureau.service.CaseService;
 import cn.ybcase.core.common.R;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
@@ -17,6 +18,8 @@ import java.util.Map;
 public class CaseController {
 
     private final CaseService caseService;
+    private final cn.ybcase.bureau.service.EvidenceService evidenceService;
+    private final cn.ybcase.bureau.service.ExecutionService executionService;
     private final cn.ybcase.bureau.service.DocumentService documentService;
     private final CaseFileRepository caseRepository;
 
@@ -51,15 +54,15 @@ public class CaseController {
     }
 
     @PostMapping("/{id}/evidences")
-    public R<Void> addEvidence(@PathVariable Long id, @RequestBody CaseService.EvidenceReq req) {
-        caseService.addEvidence(id, req);
+    public R<Void> addEvidence(@PathVariable Long id, @RequestBody cn.ybcase.bureau.service.EvidenceService.EvidenceReq req) {
+        evidenceService.addEvidence(id, req);
         return R.ok();
     }
 
     @PostMapping("/{id}/evidences/{evidenceId}/hold-disposal")
     public R<Void> disposeHold(@PathVariable Long id, @PathVariable Long evidenceId,
                                @RequestBody Map<String, String> body) {
-        caseService.disposeHold(id, evidenceId, body.get("disposal"));
+        evidenceService.disposeHold(id, evidenceId, body.get("disposal"));
         return R.ok();
     }
 
@@ -67,14 +70,14 @@ public class CaseController {
     @PostMapping("/{id}/evidences/{evidenceId}/cross-exam")
     public R<Void> crossExam(@PathVariable Long id, @PathVariable Long evidenceId,
                              @RequestBody Map<String, String> body) {
-        caseService.crossExam(id, evidenceId, body.get("opinion"));
+        evidenceService.crossExam(id, evidenceId, body.get("opinion"));
         return R.ok();
     }
 
     @PostMapping("/{id}/evidences/{evidenceId}/seal")
     public R<Void> updateSeal(@PathVariable Long id, @PathVariable Long evidenceId,
                               @RequestParam boolean extend) {
-        caseService.updateSeal(id, evidenceId, extend);
+        evidenceService.updateSeal(id, evidenceId, extend);
         return R.ok();
     }
 
@@ -113,21 +116,25 @@ public class CaseController {
         return R.ok();
     }
 
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 中止批准（局令：负责人职权）
     @PostMapping("/{id}/suspend")
     public R<CaseFile> suspend(@PathVariable Long id, @RequestBody Map<String, String> body) {
         return R.ok(caseService.suspend(id, body.get("reason")));
     }
 
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 恢复（局令：负责人职权）
     @PostMapping("/{id}/resume")
     public R<CaseFile> resume(@PathVariable Long id) {
         return R.ok(caseService.resume(id));
     }
 
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 终止批准（局令：负责人职权）
     @PostMapping("/{id}/terminate")
     public R<CaseFile> terminate(@PathVariable Long id, @RequestBody Map<String, String> body) {
         return R.ok(caseService.terminate(id, body.get("reason")));
     }
 
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 延期批准（局令：负责人职权）
     @PostMapping("/{id}/extend")
     public R<CaseFile> extend(@PathVariable Long id, @RequestBody Map<String, Object> body) {
         return R.ok(caseService.extend(id, ((Number) body.get("days")).intValue(),
@@ -145,6 +152,7 @@ public class CaseController {
         return R.ok(caseService.submitReview(id, body.get("requiredReason")));
     }
 
+    @PreAuthorize("hasAnyRole('LEGAL','ADMIN')")  // 法制审核由法制机构实施（第37条）
     @PostMapping("/reviews/{reviewId}")
     public R<CaseReview> doReview(@PathVariable Long reviewId, @RequestBody Map<String, String> body) {
         return R.ok(caseService.doReview(reviewId, body.get("reviewer"),
@@ -167,6 +175,7 @@ public class CaseController {
         return R.ok();
     }
 
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 负责人审查决定（局令：负责人职权）
     @PostMapping("/{id}/decide")
     public R<CaseDecision> decide(@PathVariable Long id, @RequestBody CaseService.DecisionReq req) {
         return R.ok(caseService.decide(id, req));
@@ -190,26 +199,28 @@ public class CaseController {
     }
 
     @PostMapping("/{id}/executions")
-    public R<Void> addExecution(@PathVariable Long id, @RequestBody CaseService.ExecutionReq req) {
-        caseService.addExecution(id, req);
+    public R<Void> addExecution(@PathVariable Long id, @RequestBody cn.ybcase.bureau.service.ExecutionService.ExecutionReq req) {
+        executionService.addExecution(id, req);
         return R.ok();
     }
 
     @GetMapping("/{id}/late-fee-quote")
     public R<Map<String, Object>> lateFeeQuote(@PathVariable Long id) {
-        return R.ok(caseService.lateFeeQuote(id));
+        return R.ok(executionService.lateFeeQuote(id));
     }
 
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 暂缓分期批准（局令：负责人职权）
     @PostMapping("/{id}/approve-defer")
     public R<CaseFile> approveDefer(@PathVariable Long id) {
-        return R.ok(caseService.approveDefer(id));
+        return R.ok(executionService.approveDefer(id));
     }
 
     @PostMapping("/{id}/court-enforce")
     public R<CaseFile> applyCourtEnforce(@PathVariable Long id) {
-        return R.ok(caseService.applyCourtEnforce(id));
+        return R.ok(executionService.applyCourtEnforce(id));
     }
 
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 结案批准（局令：负责人职权）
     @PostMapping("/{id}/close")
     public R<CaseFile> close(@PathVariable Long id, @RequestBody Map<String, String> body,
                              Authentication auth) {

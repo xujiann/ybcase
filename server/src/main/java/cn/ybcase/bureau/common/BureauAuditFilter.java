@@ -29,16 +29,20 @@ public class BureauAuditFilter extends OncePerRequestFilter {
         try {
             filterChain.doFilter(request, response);
         } finally {
-            if (WRITE_METHODS.contains(request.getMethod())
-                    && request.getRequestURI().startsWith("/api")
-                    && !request.getRequestURI().equals("/api/auth/login")) {
+            String uri = request.getRequestURI();
+            // 全部写操作 + 敏感读取（附件下载/公示导出/审计查询）留痕
+            boolean sensitiveRead = "GET".equals(request.getMethod())
+                    && (uri.contains("/download") || uri.contains("/publish-export") || uri.startsWith("/api/audit"));
+            if ((WRITE_METHODS.contains(request.getMethod()) || sensitiveRead)
+                    && uri.startsWith("/api")
+                    && !uri.equals("/api/auth/login")) {
                 try {
                     Authentication auth = SecurityContextHolder.getContext().getAuthentication();
                     jdbc.update("""
                             insert into sys_audit_log (username, method, path, http_status, client_ip)
                             values (?,?,?,?,?)""",
                             auth == null ? null : auth.getName(), request.getMethod(),
-                            request.getRequestURI(), response.getStatus(), request.getRemoteAddr());
+                            uri, response.getStatus(), request.getRemoteAddr());
                 } catch (Exception ignore) {
                     // 审计失败不影响业务
                 }

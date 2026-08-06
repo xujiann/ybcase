@@ -17,12 +17,17 @@ public class SysConfigController {
 
     private final JdbcTemplate jdbc;
 
-    /** 公开配置（未登录可读：院名/电话等非敏感信息） */
+    /** 公开配置白名单：仅登录页所需的机构信息，其余参数一律须登录（防口径参数匿名泄露） */
+    private static final java.util.Set<String> PUBLIC_KEYS =
+            java.util.Set.of("org_name", "org_short", "contact_phone", "hospital_name", "hospital_short");
+
     @GetMapping("/public")
     public R<Map<String, String>> publicConfig() {
         var m = new LinkedHashMap<String, String>();
-        jdbc.queryForList("select cfg_key, cfg_value from sys_config").forEach(row ->
-                m.put((String) row.get("cfg_key"), (String) row.get("cfg_value")));
+        jdbc.queryForList("select cfg_key, cfg_value from sys_config").forEach(row -> {
+            String key = (String) row.get("cfg_key");
+            if (PUBLIC_KEYS.contains(key)) m.put(key, (String) row.get("cfg_value"));
+        });
         return R.ok(m);
     }
 

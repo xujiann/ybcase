@@ -19,7 +19,7 @@
 
 ```bash
 mvn -q package -DskipTests
-java -jar server/target/ybcase-server-0.1.0-SNAPSHOT.jar   # 首启自动建表+种子+默认账号
+java -jar server/target/ybcase-server-*.jar   # 首启自动建表+种子+默认账号
 ```
 
 ```bash

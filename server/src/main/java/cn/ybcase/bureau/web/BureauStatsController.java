@@ -17,6 +17,7 @@ import java.util.Map;
 public class BureauStatsController {
 
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.bureau.service.BureauConfig cfg;
 
     /** 总览：案件分状态计数、罚没/追回金额合计、线索转化 */
     @GetMapping("/overview")
@@ -95,11 +96,15 @@ public class BureauStatsController {
                 select h.id, h.case_id, cf.case_no, h.held_at
                 from case_hearing h join case_file cf on cf.id = h.case_id
                 where h.status = 'HELD' and h.held_at + 2 < current_date order by h.held_at"""));
-        // 简易程序备案超期（第51条：决定后7个工作日，按9自然日近似预警）
+        // 简易程序备案超期（第51条：决定后7个工作日，节假日表精确计算）
+        int recordDays = cfg.intVal("summary_record_days", 7);
         m.put("summaryRecordOverdue", jdbc.queryForList("""
                 select id, case_no, name, decided_at from case_file
                 where procedure_type = 'SUMMARY' and decided_at is not null and summary_record_at is null
-                  and decided_at + 9 < current_date order by decided_at"""));
+                order by decided_at""").stream()
+                .filter(r -> cfg.plusWorkdays(((java.sql.Date) r.get("decided_at")).toLocalDate(),
+                        recordDays).isBefore(java.time.LocalDate.now()))
+                .toList());
         // 协查超期（第34条：15日内完成）
         m.put("assistOverdue", jdbc.queryForList("""
                 select a.id, a.case_id, cf.case_no, a.org, a.due_at

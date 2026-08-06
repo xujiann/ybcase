@@ -546,6 +546,109 @@ def main():
     admin.post(f"/bureau/transfers/{trs[0]['id']}/confirm")
     print("    PASS: 移送接收确认")
 
+    # ============ 审阅整改（v1.0.0 加固） ============
+    step("角色分权矩阵：办案员不得决定/延期/结案（403）；法制员不得决定但可审核")
+    banban = Api("banban")
+    banban.post(f"/bureau/cases/{d_case['id']}/extend", json={"days": 10, "reason": "x"}, expect_code=403)
+    banban.post(f"/bureau/cases/{d_case['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 1, "content": "x"}, expect_code=403)
+    banban.post(f"/bureau/cases/{d_case['id']}/close", json={"closeReport": "x"}, expect_code=403)
+    fazhi = Api("fazhi")
+    fazhi.post(f"/bureau/cases/{d_case['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 1, "content": "x"}, expect_code=403)
+    juzhang = Api("juzhang")
+    juzhang.post(f"/bureau/cases/reviews/999", json={"reviewer": "x"}, expect_code=403)  # 局长不可办审核
+    print("    PASS: 批准/决定=LEADER，审核=LEGAL，服务端强制")
+
+    step("审核人法律职业资格校验（2070，辽41条）")
+    q_case = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "资格测试医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    admin.post(f"/bureau/cases/{q_case['id']}/report", json={"content": "终结"})
+    q_rev = admin.post(f"/bureau/cases/{q_case['id']}/reviews", json={"requiredReason": "测试"})
+    admin.post(f"/bureau/cases/reviews/{q_rev['id']}",
+               json={"reviewer": "赵局长", "opinionType": "AGREE", "opinion": "x"}, expect_code=2070)
+    admin.post(f"/bureau/cases/reviews/{q_rev['id']}",
+               json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "具备资格"})
+    print("    PASS: 非法律职业资格人员不得审核")
+
+    step("配置白名单：匿名 /api/config/public 不再泄露口径参数")
+    pub_cfg = requests.get(f"{BASE}/config/public", timeout=10).json()["data"]
+    ok("org_name" in pub_cfg and "hearing_threshold_individual" not in pub_cfg
+       and "legal_review_mode" not in pub_cfg, f"仅暴露 {len(pub_cfg)} 个机构信息键")
+
+    step("执法证守卫（2055）：立案人员不在台账/证名不符已拒（含上批用例）——附件>1MB 上传成功（multipart 修复）")
+    big = ("大附件.bin", b"x" * (2 * 1024 * 1024), "application/octet-stream")
+    r_big = requests.post(f"{BASE}/bureau/cases/{q_case['id']}/attachments", files={"file": big},
+                          timeout=30, headers={"Authorization": f"Bearer {admin.token}"})
+    ok(r_big.json()["code"] == 0, "2MB 附件上传成功（原默认1MB限制已修复）")
+
+    step("编号原子序列：连续创建两线索编号连续无跳号")
+    n1 = admin.post("/bureau/clues", json={"source": "COMPLAINT", "content": "序列测试1",
+        "suspectName": "对象1", "suspectType": "PROVIDER", "receivedAt": str(today)})["clueNo"]
+    n2 = admin.post("/bureau/clues", json={"source": "COMPLAINT", "content": "序列测试2",
+        "suspectName": "对象2", "suspectType": "PROVIDER", "receivedAt": str(today)})["clueNo"]
+    ok(int(n2[-4:]) == int(n1[-4:]) + 1, f"biz_seq 取号 {n1} → {n2}")
+
+    step("移送司法联动终止（第43/47条）：决定 TRANSFER_JUDICIAL 自动终止并解除封存")
+    j_case = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "涉刑测试医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    admin.post(f"/bureau/cases/{j_case['id']}/evidences", json={
+        "type": "DOCUMENT", "name": "涉刑账册", "obtainedAt": str(today), "sealed": True})
+    admin.post(f"/bureau/cases/{j_case['id']}/report", json={"content": "涉嫌犯罪"})
+    admin.post(f"/bureau/cases/{j_case['id']}/notice", json={"content": "移送告知", "proposedFine": 0})
+    j_rev = admin.post(f"/bureau/cases/{j_case['id']}/reviews", json={"requiredReason": "涉刑移送"})
+    admin.post(f"/bureau/cases/reviews/{j_rev['id']}",
+               json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "同意移送"})
+    admin.post(f"/bureau/cases/{j_case['id']}/decide", json={
+        "decisionType": "TRANSFER_JUDICIAL", "content": "移送公安机关追究刑事责任"})
+    j_detail = admin.get(f"/bureau/cases/{j_case['id']}")
+    ok(j_detail["caseFile"]["status"] == "TERMINATED", "自动终止调查")
+    ok(j_detail["evidences"][0]["sealed"] is False, "封存已解除")
+
+    step("公告送达 60 日视为送达（辽60条）")
+    a_case = admin.post("/bureau/cases", json={
+        "causeId": cause31["id"], "procedureType": "SUMMARY",
+        "partyName": "参保人冯某", "partyType": "INDIVIDUAL",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    admin.post(f"/bureau/cases/{a_case['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 50, "content": "当场处罚，当事人下落不明"})
+    ann_date = today - datetime.timedelta(days=61)
+    a_delivered = admin.post(f"/bureau/cases/{a_case['id']}/deliver", json={
+        "method": "ANNOUNCE", "deliveredAt": str(ann_date), "note": "公告张贴于门户网站"})
+    ok(a_delivered["deliveredAt"] == str(ann_date + datetime.timedelta(days=60)), "公告+60日=送达日")
+
+    step("加处罚款 UNPAID 基数口径（参数切换）")
+    admin.post(f"/bureau/cases/{a_case['id']}/executions", json={
+        "kind": "FINE", "amount": 30, "paidAt": str(today), "method": "BANK"})
+    admin.call("PUT", "/config/late_fee_base?value=UNPAID")
+    try:
+        q = admin.get(f"/bureau/cases/{a_case['id']}/late-fee-quote")
+        # 送达=公告+60（昨日），缴款期限+15 未到 → 逾期0；先断言基数=未缴20
+        ok(float(q["base"]) == 20.0, f"UNPAID 基数=未缴 {q['base']} 元")
+    finally:
+        admin.call("PUT", "/config/late_fee_base?value=FULL")
+
+    step("自助修改密码：改密→新密登录→改回")
+    banban.post("/auth/change-password", json={"oldPassword": "admin123", "newPassword": "Fix2026pwd"})
+    r_new = requests.post(f"{BASE}/auth/login",
+                          json={"username": "banban", "password": "Fix2026pwd"}, timeout=10).json()
+    ok(r_new["code"] == 0, "新密码登录成功")
+    # 弱密码拒（1004）后改回演示口令
+    tok = r_new["data"]["token"]
+    weak = requests.post(f"{BASE}/auth/change-password",
+                         json={"oldPassword": "Fix2026pwd", "newPassword": "abc"},
+                         timeout=10, headers={"Authorization": f"Bearer {tok}"}).json()
+    ok(weak["code"] == 1004, "弱密码被策略拒绝")
+    back = requests.post(f"{BASE}/auth/change-password",
+                         json={"oldPassword": "Fix2026pwd", "newPassword": "admin123"},
+                         timeout=10, headers={"Authorization": f"Bearer {tok}"}).json()
+    ok(back["code"] == 0, "改密闭环并复位")
+
+    step("专家评审列表进入案件详情（含UI数据源）")
+    ok("expertReviews" in admin.get(f"/bureau/cases/{d_case['id']}"), "expertReviews 已在详情聚合")
+
     # ============ 五期：协同与上线 ============
     step("智能监控线索批量导入（source=MONITOR）")
     imp = admin.post("/bureau/clues/import", json=[

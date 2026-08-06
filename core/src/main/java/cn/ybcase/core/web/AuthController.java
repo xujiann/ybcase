@@ -25,6 +25,7 @@ public class AuthController {
     private final AuthenticationManager authenticationManager;
     private final JwtService jwtService;
     private final SysUserRepository userRepository;
+    private final org.springframework.security.crypto.password.PasswordEncoder passwordEncoder;
 
     public record LoginRequest(@NotBlank String username, @NotBlank String password) {}
 
@@ -68,6 +69,28 @@ public class AuthController {
         return R.ok(Map.of("token", token,
                 "passwordAgeDays", pwdAgeDays,
                 "passwordExpireWarning", pwdAgeDays >= 90));
+    }
+
+    /** 自助修改密码（等保：口令 90 天更换提醒的配套动作） */
+    public record ChangePasswordRequest(@NotBlank String oldPassword, @NotBlank String newPassword) {}
+
+    @PostMapping("/change-password")
+    public R<Void> changePassword(@RequestBody ChangePasswordRequest req, Authentication authentication) {
+        SysUser user = userRepository.findByUsername(authentication.getName()).orElseThrow();
+        try {
+            authenticationManager.authenticate(
+                    new UsernamePasswordAuthenticationToken(user.getUsername(), req.oldPassword()));
+        } catch (BadCredentialsException e) {
+            return R.fail(1003, "原密码错误");
+        }
+        if (req.newPassword().length() < 8
+                || !req.newPassword().matches(".*[a-zA-Z].*") || !req.newPassword().matches(".*\\d.*")) {
+            return R.fail(1004, "新密码须至少8位且包含字母和数字");
+        }
+        user.setPassword(passwordEncoder.encode(req.newPassword()));
+        user.setPasswordUpdatedAt(java.time.Instant.now());
+        userRepository.save(user);
+        return R.ok();
     }
 
     @GetMapping("/me")
