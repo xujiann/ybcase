@@ -39,4 +39,11 @@ public class ClueController {
     public R<CaseClue> reject(@PathVariable Long id, @RequestBody Map<String, String> body) {
         return R.ok(clueService.reject(id, body.get("verifyResult")));
     }
+
+    /** 核查期限扣除（鉴定/检验时间不计入，辽15条） */
+    @PostMapping("/{id}/exclusions")
+    public R<CaseClue> addExclusion(@PathVariable Long id, @RequestBody Map<String, Object> body) {
+        return R.ok(clueService.addExclusion(id, ((Number) body.get("days")).intValue(),
+                (String) body.get("reason")));
+    }
 }

@@ -93,6 +93,12 @@
             <el-table-column prop="name" label="名称" show-overflow-tooltip />
             <el-table-column prop="source" label="来源" width="140" show-overflow-tooltip />
             <el-table-column prop="obtained_at" label="取得日期" width="105" />
+            <el-table-column label="质证" width="170">
+              <template #default="{ row }">
+                <span v-if="row.cross_exam_at" class="hint">已质证 {{ row.cross_exam_at }}</span>
+                <el-button v-else size="small" text type="primary" @click="onCrossExam(row)">当事人质证</el-button>
+              </template>
+            </el-table-column>
             <el-table-column label="先行登记保存" width="200">
               <template #default="{ row }">
                 <template v-if="row.register_hold">
@@ -191,6 +197,16 @@
               <el-descriptions-item label="罚款">{{ detail.decision.fineAmount }}</el-descriptions-item>
               <el-descriptions-item label="责令退回基金">{{ detail.decision.recoupAmount }}</el-descriptions-item>
               <el-descriptions-item label="没收违法所得">{{ detail.decision.confiscateAmount }}</el-descriptions-item>
+              <el-descriptions-item label="从轻/减轻情形">{{ detail.decision.mitigation || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="裁量理由" :span="2">{{ detail.decision.discretionReason || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="公开">
+                <span v-if="detail.decision.published">已公开 {{ detail.decision.publishedAt }}</span>
+                <el-button v-else size="small" type="warning" @click="onPublish">公开（7日内）</el-button>
+              </el-descriptions-item>
+              <el-descriptions-item label="政府备案" :span="2">
+                <span v-if="detail.decision.govRecordNo">{{ detail.decision.govRecordNo }}（{{ detail.decision.govRecordAt }}）</span>
+                <el-button v-else size="small" text type="primary" @click="onGovRecord">备案登记</el-button>
+              </el-descriptions-item>
               <el-descriptions-item label="决定内容" :span="3">{{ detail.decision.content }}</el-descriptions-item>
             </el-descriptions>
           </template>
@@ -365,6 +381,8 @@
           <el-form-item label="责令退回基金"><el-input-number v-model="decisionForm.recoupAmount" :min="0" :precision="2" style="width: 200px" /></el-form-item>
           <el-form-item label="没收违法所得"><el-input-number v-model="decisionForm.confiscateAmount" :min="0" :precision="2" style="width: 200px" /></el-form-item>
           <el-form-item label="其他措施"><el-input v-model="decisionForm.otherMeasures" placeholder="约谈、建议解除服务协议等" /></el-form-item>
+          <el-form-item label="从轻/减轻"><el-input v-model="decisionForm.mitigation" placeholder="主动消除危害/受胁迫/立功等（辽55条），无则留空" /></el-form-item>
+          <el-form-item label="裁量理由"><el-input v-model="decisionForm.discretionReason" type="textarea" :rows="2" placeholder="裁量性决定应说明考虑的主要因素（辽44条）" /></el-form-item>
         </template>
         <el-form-item label="决定内容"><el-input v-model="decisionForm.content" type="textarea" :rows="5" /></el-form-item>
       </el-form>
@@ -385,6 +403,10 @@
           <el-date-picker v-model="deliveryForm.deliveredAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
         </el-form-item>
         <el-form-item label="受送达人"><el-input v-model="deliveryForm.receiver" /></el-form-item>
+        <el-form-item label="回证编号"><el-input v-model="deliveryForm.receiptNo" placeholder="送达回证编号（辽58条要求必须有回证）" /></el-form-item>
+        <el-form-item label="回证签收日">
+          <el-date-picker v-model="deliveryForm.receiptSignedAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" placeholder="签收日期即送达日期" />
+        </el-form-item>
         <el-form-item label="备注"><el-input v-model="deliveryForm.note" placeholder="电子送达须经当事人签订确认书" /></el-form-item>
       </el-form>
       <template #footer>
@@ -460,8 +482,8 @@ const exclusionForm = reactive({ reason: 'APPRAISE', startAt: today, endAt: toda
 const noticeForm = reactive({ content: '', proposedFine: 0, proposedRecoup: 0 })
 const statementForm = reactive<any>({ statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null })
 const meetingForm = reactive({ heldAt: today, attendees: '', record: '', conclusion: '' })
-const decisionForm = reactive({ decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '' })
-const deliveryForm = reactive({ method: 'DIRECT', deliveredAt: today, receiver: '', note: '' })
+const decisionForm = reactive({ decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
+const deliveryForm = reactive({ method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null as string | null })
 const executionForm = reactive({ kind: 'FINE', amount: 0, paidAt: today, method: 'BANK', note: '' })
 const reportContent = ref('')
 const docView = ref<any>({})
@@ -488,6 +510,26 @@ async function onAvoid(row: any) {
   const { value } = await ElMessageBox.prompt('回避事由（第5条）', '申请回避', { inputPattern: /\S+/, inputErrorMessage: '必填' })
   await client.post(`/bureau/cases/${id}/officers/${row.id}/avoid`, { reason: value })
   ElMessage.success('已回避')
+  load()
+}
+
+async function onCrossExam(row: any) {
+  const { value } = await ElMessageBox.prompt('当事人对该证据的意见（无异议也须注明，辽24条）', '证据质证', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/evidences/${row.id}/cross-exam`, { opinion: value })
+  ElMessage.success('已记录质证')
+  load()
+}
+
+async function onPublish() {
+  await client.post(`/bureau/cases/${id}/publish`)
+  ElMessage.success('处罚决定已公开')
+  load()
+}
+
+async function onGovRecord() {
+  const { value } = await ElMessageBox.prompt('政府备案文号（重大处罚决定报本级政府备案，辽54条）', '备案登记', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/gov-record`, { recordNo: value })
+  ElMessage.success('已登记备案')
   load()
 }
 

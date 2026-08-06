@@ -34,6 +34,9 @@ public class CaseNotice {
     @Column(nullable = false, precision = 14, scale = 2)
     private BigDecimal proposedRecoup = BigDecimal.ZERO;
 
+    /** 陈述申辩截止日（辽44条：告知起3日，逾期视为放弃；null=不限） */
+    private LocalDate statementDeadline;
+
     @Column(nullable = false)
     private Boolean hearingEntitled = false;
 

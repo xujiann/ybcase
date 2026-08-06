@@ -77,6 +77,13 @@ public class BureauStatsController {
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.hold_expire_at
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.register_hold = true and ev.hold_expire_at < current_date order by ev.hold_expire_at"""));
+        // 处罚决定公开超期（辽56条：作出决定7日内公开，参数化）
+        m.put("publishOverdue", jdbc.queryForList("""
+                select cf.id, cf.case_no, cf.name, d.decided_at
+                from case_decision d join case_file cf on cf.id = d.case_id
+                where d.decision_type = 'PUNISH' and d.published = false
+                  and d.decided_at + ?::int < current_date order by d.decided_at""",
+                publishDays()));
         // 封存到期（第31条）
         m.put("sealExpiring", jdbc.queryForList("""
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.seal_expire_at, ev.seal_extended
@@ -87,5 +94,14 @@ public class BureauStatsController {
 
     private Object one(String sql) {
         return jdbc.queryForObject(sql, Object.class);
+    }
+
+    private int publishDays() {
+        var rows = jdbc.queryForList("select cfg_value from sys_config where cfg_key = 'decision_publish_days'");
+        try {
+            return rows.isEmpty() ? 7 : Integer.parseInt(((String) rows.get(0).get("cfg_value")).trim());
+        } catch (NumberFormatException e) {
+            return 7;
+        }
     }
 }

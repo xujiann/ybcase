@@ -61,6 +61,14 @@ public class CaseController {
         return R.ok();
     }
 
+    /** 证据质证（辽24条） */
+    @PostMapping("/{id}/evidences/{evidenceId}/cross-exam")
+    public R<Void> crossExam(@PathVariable Long id, @PathVariable Long evidenceId,
+                             @RequestBody Map<String, String> body) {
+        caseService.crossExam(id, evidenceId, body.get("opinion"));
+        return R.ok();
+    }
+
     @PostMapping("/{id}/evidences/{evidenceId}/seal")
     public R<Void> updateSeal(@PathVariable Long id, @PathVariable Long evidenceId,
                               @RequestParam boolean extend) {
@@ -142,6 +150,18 @@ public class CaseController {
     @PostMapping("/{id}/decide")
     public R<CaseDecision> decide(@PathVariable Long id, @RequestBody CaseService.DecisionReq req) {
         return R.ok(caseService.decide(id, req));
+    }
+
+    /** 处罚决定公开（7日内，辽56条） */
+    @PostMapping("/{id}/publish")
+    public R<CaseDecision> publish(@PathVariable Long id) {
+        return R.ok(caseService.publish(id));
+    }
+
+    /** 重大处罚决定政府备案（辽54条） */
+    @PostMapping("/{id}/gov-record")
+    public R<CaseDecision> govRecord(@PathVariable Long id, @RequestBody Map<String, String> body) {
+        return R.ok(caseService.govRecord(id, body.get("recordNo")));
     }
 
     @PostMapping("/{id}/deliver")

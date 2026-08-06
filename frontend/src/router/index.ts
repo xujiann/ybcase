@@ -17,6 +17,7 @@ const router = createRouter({
         { path: 'case/supervise', component: () => import('../views/case/SupervisionView.vue') },
         { path: 'case/stats', component: () => import('../views/case/StatsView.vue') },
         { path: 'system/users', component: () => import('../views/system/UsersView.vue') },
+        { path: 'system/settings', component: () => import('../views/system/SettingsView.vue') },
         { path: 'system/depts', component: () => import('../views/system/DeptsView.vue') },
         { path: 'system/roles', component: () => import('../views/system/RolesView.vue') },
       ],

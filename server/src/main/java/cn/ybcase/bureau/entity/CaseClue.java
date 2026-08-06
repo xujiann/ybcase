@@ -41,6 +41,10 @@ public class CaseClue {
     @Column(nullable = false)
     private LocalDate deadlineAt;
 
+    /** 核查期限扣除天数（辽15条：鉴定、检验时间不计入） */
+    @Column(nullable = false)
+    private Integer excludedDays = 0;
+
     @Column(nullable = false)
     private Boolean extended = false;
 

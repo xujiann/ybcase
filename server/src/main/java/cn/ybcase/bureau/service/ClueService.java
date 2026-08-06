@@ -16,6 +16,7 @@ import java.time.LocalDate;
 public class ClueService {
 
     private final CaseClueRepository clueRepository;
+    private final BureauConfig cfg;
 
     public record ClueCreateReq(String source, String content, String suspectName,
                                 String suspectType, LocalDate receivedAt, String handler) {}
@@ -32,7 +33,7 @@ public class ClueService {
         clue.setSuspectName(req.suspectName());
         clue.setSuspectType(req.suspectType());
         clue.setReceivedAt(received);
-        clue.setDeadlineAt(Workdays.plus(received, 15));
+        clue.setDeadlineAt(cfg.plusByUnit(received, cfg.intVal("clue_verify_days", 15), "clue_verify_day_unit"));
         clue.setHandler(req.handler());
         clue.setCreatedBy(username);
         return clueRepository.save(clue);
@@ -47,7 +48,21 @@ public class ClueService {
         if (reason == null || reason.isBlank()) throw new BizException(2023, "延期须说明特殊情况并经主要负责人批准");
         clue.setExtended(true);
         clue.setExtendReason(reason);
-        clue.setDeadlineAt(Workdays.plus(clue.getDeadlineAt(), 15));
+        clue.setDeadlineAt(cfg.plusByUnit(clue.getDeadlineAt(), cfg.intVal("clue_extend_days", 15), "clue_verify_day_unit"));
+        return clueRepository.save(clue);
+    }
+
+    /** 核查期限扣除（辽15条：鉴定、检验时间不计入核查期限） */
+    @Transactional
+    public CaseClue addExclusion(Long id, int days, String reason) {
+        CaseClue clue = get(id);
+        if (!"PENDING".equals(clue.getStatus())) throw new BizException(2021, "线索已办结");
+        if (days <= 0) throw new BizException(2026, "扣除天数须为正数");
+        if (reason == null || reason.isBlank()) throw new BizException(2026, "须说明鉴定/检验事由");
+        clue.setExcludedDays(clue.getExcludedDays() + days);
+        clue.setDeadlineAt(clue.getDeadlineAt().plusDays(days));
+        clue.setExtendReason((clue.getExtendReason() == null ? "" : clue.getExtendReason() + "；")
+                + "期限扣除" + days + "日：" + reason);
         return clueRepository.save(clue);
     }
 

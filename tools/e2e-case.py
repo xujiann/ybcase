@@ -176,9 +176,18 @@ def main():
         "decisionType": "PUNISH", "fineAmount": 200000, "recoupAmount": 80000,
         "content": "x"}, expect_code=2007)
 
+    step("较大数额罚款（≥10万）未经集体讨论拒（2047）；讨论后可决定")
+    admin.post(f"/bureau/cases/{cid}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 150000, "recoupAmount": 80000,
+        "content": "x"}, expect_code=2047)
+    admin.post(f"/bureau/cases/{cid}/meetings", json={
+        "heldAt": str(today), "attendees": "局长、分管副局长、基金监督处长、法规处长",
+        "record": "一致同意处罚意见", "conclusion": "同意罚款15万元并责令退回基金8万元"})
+
     step("作出处罚决定：文号生成、案件名称去'涉嫌'、状态 DECIDED")
     decision = admin.post(f"/bureau/cases/{cid}/decide", json={
         "decisionType": "PUNISH", "fineAmount": 150000, "recoupAmount": 80000,
+        "mitigation": None, "discretionReason": "重复收费金额较大、涉及人次多，酌定1倍罚款",
         "content": "责令退回医保基金8万元，并处罚款15万元"})
     ok(decision["decisionNo"] and "〔" in decision["decisionNo"], f"决定书文号 {decision['decisionNo']}")
     cf = admin.get(f"/bureau/cases/{cid}")["caseFile"]
@@ -265,6 +274,133 @@ def main():
     rejected = admin.post(f"/bureau/clues/{clue2['id']}/reject",
                           json={"verifyResult": "经核查系代家人购药，有委托证明，不构成违法"})
     ok(rejected["status"] == "REJECTED", "不予立案")
+
+    step("决定公开与政府备案登记（辽54/56条）")
+    pub = admin.post(f"/bureau/cases/{cid}/publish")
+    ok(pub["published"] is True and pub["publishedAt"], "决定已公开并记录日期")
+    gov = admin.post(f"/bureau/cases/{cid}/gov-record", json={"recordNo": "示府备〔2026〕1号"})
+    ok(gov["govRecordNo"] == "示府备〔2026〕1号", "政府备案已登记")
+
+    # ============ 辽宁参数组：切换省域参数后整链路复验（辽医保发〔2020〕5号） ============
+    liaoning_params = {
+        "clue_verify_day_unit": "NATURAL",
+        "legal_review_mode": "ALL",
+        "legal_review_days": "7",
+        "legal_review_day_unit": "NATURAL",
+        "hearing_threshold_individual": "1000",
+        "hearing_threshold_org": "10000",
+        "summary_fine_limit_individual": "50",
+        "summary_fine_limit_org": "1000",
+        "onsite_collect_limit": "20",
+        "delivery_electronic_decision_allowed": "false",
+        "cross_exam_required": "true",
+    }
+    defaults = {
+        "clue_verify_day_unit": "WORKDAY",
+        "legal_review_mode": "THRESHOLD",
+        "legal_review_days": "10",
+        "legal_review_day_unit": "WORKDAY",
+        "hearing_threshold_individual": "100000",
+        "hearing_threshold_org": "100000",
+        "summary_fine_limit_individual": "200",
+        "summary_fine_limit_org": "3000",
+        "onsite_collect_limit": "100",
+        "delivery_electronic_decision_allowed": "true",
+        "cross_exam_required": "false",
+    }
+    try:
+        step("辽宁参数组：切换 11 项省域参数")
+        for k, v in liaoning_params.items():
+            admin.call("PUT", f"/config/{k}?value={v}")
+        print("    PASS: 参数已切换")
+
+        step("辽·线索：核查期限=15自然日")
+        ln_clue = admin.post("/bureau/clues", json={
+            "source": "COMPLAINT", "content": "举报参保人冒用他人医保凭证购药", "suspectName": "参保人孙某",
+            "suspectType": "INDIVIDUAL", "receivedAt": str(today)})
+        ok(ln_clue["deadlineAt"] == str(today + datetime.timedelta(days=15)), "自然日期限")
+
+        step("辽·线索期限扣除：鉴定5日不计入（辽15条）")
+        exc = admin.post(f"/bureau/clues/{ln_clue['id']}/exclusions",
+                         json={"days": 5, "reason": "笔迹鉴定"})
+        ok(exc["deadlineAt"] == str(today + datetime.timedelta(days=20)), "期限顺延5日")
+
+        step("辽·立案（自然人，普通程序）")
+        ln_case = admin.post("/bureau/cases", json={
+            "clueId": ln_clue["id"], "causeId": cause31["id"], "procedureType": "NORMAL",
+            "partyName": "参保人孙某", "partyType": "INDIVIDUAL", "amountInvolved": 5000,
+            "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                          {"name": "张协办", "certNo": "YB002"}]})
+        lnid = ln_case["id"]
+        admin.post(f"/bureau/cases/{lnid}/evidences", json={
+            "type": "OTHER_MATERIAL", "name": "药店监控截图说明材料", "obtainedAt": str(today)})
+        print("    PASS: 第九类证据 OTHER_MATERIAL 可用（辽23条）")
+
+        step("辽·调查终结+告知：拟罚1500达自然人听证档（1000）")
+        admin.post(f"/bureau/cases/{lnid}/report", json={"content": "调查终结：冒名购药事实清楚"})
+        ln_notice = admin.post(f"/bureau/cases/{lnid}/notice", json={
+            "content": "拟处罚款1500元", "proposedFine": 1500, "proposedRecoup": 3000})
+        ok(ln_notice["hearingEntitled"] is True, "自然人1000元档已告知听证权利")
+        ok(ln_notice["statementDeadline"] == str(today + datetime.timedelta(days=3)), "陈述申辩期限=告知+3日（辽44条）")
+
+        step("辽·全案法制审核：小额案件未审核也不得决定（2005，辽40条）")
+        admin.post(f"/bureau/cases/{lnid}/decide", json={
+            "decisionType": "PUNISH", "fineAmount": 1500, "recoupAmount": 3000,
+            "content": "x"}, expect_code=2005)
+        ln_rev = admin.post(f"/bureau/cases/{lnid}/reviews", json={"requiredReason": "辽宁全案审核"})
+        ok(ln_rev["deadlineAt"] == str(today + datetime.timedelta(days=7)), "审核期限7自然日（辽41条）")
+        admin.post(f"/bureau/cases/reviews/{ln_rev['id']}",
+                   json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "同意"})
+
+        step("辽·质证守卫：证据未质证不得决定（2045，辽24条）；质证后可决定")
+        admin.post(f"/bureau/cases/{lnid}/decide", json={
+            "decisionType": "PUNISH", "fineAmount": 1500, "recoupAmount": 3000,
+            "content": "x"}, expect_code=2045)
+        ev = admin.get(f"/bureau/cases/{lnid}")["evidences"][0]
+        admin.post(f"/bureau/cases/{lnid}/evidences/{ev['id']}/cross-exam",
+                   json={"opinion": "当事人无异议"})
+        ln_dec = admin.post(f"/bureau/cases/{lnid}/decide", json={
+            "decisionType": "PUNISH", "fineAmount": 1500, "recoupAmount": 3000,
+            "discretionReason": "初犯且金额较小，按下限处罚",
+            "content": "责令退回基金3000元，并处罚款1500元"})
+        ok(ln_dec["decisionNo"], "决定书文号")
+
+        step("辽·送达：决定书禁电子送达（2049，辽61条）；回证签收日=送达日（辽58条）")
+        admin.post(f"/bureau/cases/{lnid}/deliver",
+                   json={"method": "ELECTRONIC", "receiver": "孙某"}, expect_code=2049)
+        receipt_day = today - datetime.timedelta(days=1)
+        delivered = admin.post(f"/bureau/cases/{lnid}/deliver", json={
+            "method": "DIRECT", "receiver": "孙某",
+            "receiptNo": "回证2026-001", "receiptSignedAt": str(receipt_day)})
+        ok(delivered["deliveredAt"] == str(receipt_day), "送达日=回证签收日")
+
+        step("辽·当场收缴限20元：50拒（2010）；20可")
+        admin.post(f"/bureau/cases/{lnid}/executions", json={
+            "kind": "FINE", "amount": 50, "paidAt": str(today), "method": "ONSITE"}, expect_code=2010)
+        admin.post(f"/bureau/cases/{lnid}/executions", json={
+            "kind": "FINE", "amount": 20, "paidAt": str(today), "method": "ONSITE"})
+        admin.post(f"/bureau/cases/{lnid}/executions", json={
+            "kind": "FINE", "amount": 1480, "paidAt": str(today), "method": "BANK"})
+        admin.post(f"/bureau/cases/{lnid}/executions", json={
+            "kind": "RECOUP", "amount": 3000, "paidAt": str(today), "method": "BANK"})
+        closed_ln = admin.post(f"/bureau/cases/{lnid}/close", json={"closeReport": "执行完毕结案"})
+        ok(closed_ln["status"] == "CLOSED", "辽宁参数组全流程结案")
+
+        step("辽·简易程序限额50/1000：公民100拒（2003）；50可当场决定")
+        ln_sum = admin.post("/bureau/cases", json={
+            "causeId": cause31["id"], "procedureType": "SUMMARY",
+            "partyName": "参保人钱某", "partyType": "INDIVIDUAL",
+            "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+        admin.post(f"/bureau/cases/{ln_sum['id']}/decide", json={
+            "decisionType": "PUNISH", "fineAmount": 100, "content": "x"}, expect_code=2003)
+        admin.post(f"/bureau/cases/{ln_sum['id']}/decide", json={
+            "decisionType": "PUNISH", "fineAmount": 50, "content": "当场处罚款50元"})
+        print("    PASS: 辽宁简易限额生效")
+    finally:
+        for k, v in defaults.items():
+            admin.call("PUT", f"/config/{k}?value={v}")
+    step("参数复位为国家默认值")
+    print("    PASS: 已复位")
 
     print(f"\n=== 医保案件查办 E2E 全部通过（{step_no} 步）===")
 

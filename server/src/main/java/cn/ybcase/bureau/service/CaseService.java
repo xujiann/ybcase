@@ -33,6 +33,7 @@ public class CaseService {
     private final CaseDecisionRepository decisionRepository;
     private final ClueService clueService;
     private final JdbcTemplate jdbc;
+    private final BureauConfig config;
 
     // ---------- 立案 ----------
 
@@ -71,7 +72,7 @@ public class CaseService {
         c.setSummary(req.summary());
         c.setAmountInvolved(req.amountInvolved() == null ? BigDecimal.ZERO : req.amountInvolved());
         c.setFiledAt(today);
-        c.setDeadlineAt(today.plusDays(90));  // 第45条：立案之日起九十日
+        c.setDeadlineAt(today.plusDays(config.intVal("case_deadline_days", 90)));  // 第45条：立案之日起九十日（可配）
         c.setCreatedBy(username);
         caseRepository.save(c);
 
@@ -110,8 +111,9 @@ public class CaseService {
     public record EvidenceReq(String type, String name, String source, LocalDate obtainedAt,
                               String keeper, String note, Boolean registerHold, Boolean sealed) {}
 
+    /** 证据种类：国家局令 8 类 + 辽23条第九类"法律法规规章规定可以作为证据的其他材料" */
     private static final List<String> EVIDENCE_TYPES = List.of(
-            "DOCUMENT", "PHYSICAL", "AV", "EDATA", "TESTIMONY", "STATEMENT", "EXPERT", "RECORD");
+            "DOCUMENT", "PHYSICAL", "AV", "EDATA", "TESTIMONY", "STATEMENT", "EXPERT", "RECORD", "OTHER_MATERIAL");
 
     @Transactional
     public void addEvidence(Long caseId, EvidenceReq req) {
@@ -126,7 +128,8 @@ public class CaseService {
                     register_hold, hold_expire_at, sealed, seal_expire_at)
                 values (?,?,?,?,?,?,?,?,?,?,?)""",
                 caseId, req.type(), req.name(), req.source(), obtained, req.keeper(), req.note(),
-                hold, hold ? Workdays.plus(obtained, 7) : null,          // 第26条：7个工作日内作出处理决定
+                // 第26条：7个工作日内作出处理决定（辽33条为7自然日，参数化）
+                hold, hold ? config.plusByUnit(obtained, config.intVal("evidence_hold_days", 7), "evidence_hold_day_unit") : null,
                 sealed, sealed ? obtained.plusDays(30) : null);          // 第31条：封存不超过30日
     }
 
@@ -148,6 +151,17 @@ public class CaseService {
                     where id = ? and case_id = ? and register_hold = true""", disposal, evidenceId, caseId);
         }
         if (n == 0) throw new BizException(2029, "证据不存在或不在先行登记保存状态");
+    }
+
+    /** 证据质证（辽24条：当事人有权对证据发表意见，未经质证的证据不能作为处罚决定依据） */
+    @Transactional
+    public void crossExam(Long caseId, Long evidenceId, String opinion) {
+        CaseFile c = get(caseId);
+        if ("CLOSED".equals(c.getStatus())) throw new BizException(2031, "案件已结案归档");
+        if (opinion == null || opinion.isBlank()) throw new BizException(2045, "须记录当事人对证据的意见（无异议也须注明）");
+        int n = jdbc.update("update case_evidence set cross_exam_opinion = ?, cross_exam_at = ? where id = ? and case_id = ?",
+                opinion, LocalDate.now(), evidenceId, caseId);
+        if (n == 0) throw new BizException(2029, "证据不存在");
     }
 
     /** 延长封存（第31条：可延长一次，不超过30日）或解除封存（第33条） */
@@ -243,11 +257,13 @@ public class CaseService {
         CaseFile c = get(caseId);
         requireActive(c);
         if (days <= 0) throw new BizException(2009, "延长天数须为正数");
+        int firstMax = config.intVal("extension_first_max", 30);
+        int totalMax = config.intVal("extension_total_max", 90);
         int already = c.getExtensionDays();
         if (already == 0) {
-            if (days > 30) throw new BizException(2009, "首次延期经负责人批准最长30日（第45条）");
+            if (days > firstMax) throw new BizException(2009, "首次延期经负责人批准最长" + firstMax + "日（第45条）");
         } else {
-            if (already + days > 90) throw new BizException(2009, "继续延期须集体讨论且累计不超过90日（30+60，第45条）");
+            if (already + days > totalMax) throw new BizException(2009, "继续延期须集体讨论且累计不超过" + totalMax + "日（第45条）");
             boolean hasMeeting = !jdbc.queryForList("select id from case_meeting where case_id = ?", caseId).isEmpty();
             if (!hasMeeting) throw new BizException(2009, "继续延期应当由负责人集体讨论决定，请先录入集体讨论记录（第45条）");
         }
@@ -284,7 +300,9 @@ public class CaseService {
         r.setCaseId(caseId);
         r.setRequiredReason(requiredReason);
         r.setSubmittedAt(LocalDate.now());
-        r.setDeadlineAt(Workdays.plus(LocalDate.now(), 10));  // 第40条：10个工作日
+        // 国家第40条：10个工作日；辽41条：7日+3——参数化
+        r.setDeadlineAt(config.plusByUnit(LocalDate.now(),
+                config.intVal("legal_review_days", 10), "legal_review_day_unit"));
         return reviewRepository.save(r);
     }
 
@@ -315,7 +333,8 @@ public class CaseService {
     @Transactional
     public CaseNotice notify(Long caseId, NoticeReq req) {
         CaseFile c = get(caseId);
-        if (!"REPORTED".equals(c.getStatus()))
+        // REPORTED 首次告知；NOTIFIED 允许再次告知（辽52条：改变原认定的事实/证据/依据须重新履行告知程序）
+        if (!List.of("REPORTED", "NOTIFIED").contains(c.getStatus()))
             throw new BizException(2004, "调查终结后方可作出处罚告知（第36/41条）");
         CaseNotice n = new CaseNotice();
         n.setCaseId(caseId);
@@ -323,8 +342,12 @@ public class CaseService {
         n.setContent(req.content());
         n.setProposedFine(nz(req.proposedFine()));
         n.setProposedRecoup(nz(req.proposedRecoup()));
-        // 拟罚款达到听证标准：告知听证权利
-        n.setHearingEntitled(nz(req.proposedFine()).compareTo(cfgDecimal("hearing_fine_threshold")) >= 0);
+        // 陈述申辩期限（辽44条：告知须载明期限与逾期后果；0=不启用）
+        int stmtDays = config.intVal("statement_deadline_days", 3);
+        if (stmtDays > 0) n.setStatementDeadline(LocalDate.now().plusDays(stmtDays));
+        // 拟罚款达到听证标准（按当事人类型分档，辽46条）：告知听证权利
+        n.setHearingEntitled(nz(req.proposedFine()).compareTo(config.byPartyType(c.getPartyType(),
+                "hearing_threshold_individual", "hearing_threshold_org", "100000")) >= 0);
         noticeRepository.save(n);
         c.setStatus("NOTIFIED");
         caseRepository.save(c);
@@ -338,11 +361,20 @@ public class CaseService {
     public CaseNotice recordStatement(Long caseId, StatementReq req) {
         CaseNotice n = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
                 .orElseThrow(() -> new BizException(2006, "尚未作出处罚告知"));
+        // 辽44条：期限内未行使陈述权、申辩权的，视为放弃
+        if (req.statement() != null && n.getStatementDeadline() != null
+                && LocalDate.now().isAfter(n.getStatementDeadline()))
+            throw new BizException(2046, "已超过陈述申辩期限（" + n.getStatementDeadline() + "），视为放弃权利（辽44条）");
         if (req.statement() != null) n.setStatement(req.statement());
         if (req.statementReview() != null) n.setStatementReview(req.statementReview());
         if (req.hearingRequested() != null) {
             if (Boolean.TRUE.equals(req.hearingRequested()) && !Boolean.TRUE.equals(n.getHearingEntitled()))
                 throw new BizException(2039, "该案未达听证标准，无听证权利告知记录");
+            // 辽46条：听证申请应当自告知之日起3日内提出（参数化）
+            int reqDays = config.intVal("hearing_request_days", 3);
+            if (Boolean.TRUE.equals(req.hearingRequested()) && reqDays > 0
+                    && LocalDate.now().isAfter(n.getNotifiedAt().plusDays(reqDays)))
+                throw new BizException(2046, "听证申请已超过期限（告知起" + reqDays + "日内）");
             n.setHearingRequested(req.hearingRequested());
         }
         if (req.hearingHeldAt() != null) {
@@ -368,7 +400,8 @@ public class CaseService {
     // ---------- 处理决定（第43-45条） ----------
 
     public record DecisionReq(String decisionType, BigDecimal fineAmount, BigDecimal recoupAmount,
-                              BigDecimal confiscateAmount, String otherMeasures, String content) {}
+                              BigDecimal confiscateAmount, String otherMeasures, String content,
+                              String mitigation, String discretionReason) {}
 
     @Transactional
     public CaseDecision decide(Long caseId, DecisionReq req) {
@@ -386,11 +419,12 @@ public class CaseService {
         if (summary) {
             if (!"INVESTIGATING".equals(c.getStatus()))
                 throw new BizException(2003, "简易程序应在调查中当场作出决定（第48条）");
-            // 第48条：公民≤200元，法人或其他组织≤3000元
-            BigDecimal limit = "INDIVIDUAL".equals(c.getPartyType())
-                    ? new BigDecimal("200") : new BigDecimal("3000");
+            // 第48条：公民/单位限额（参数化：新处罚法200/3000，辽宁旧口径50/1000）
+            BigDecimal limit = config.byPartyType(c.getPartyType(),
+                    "summary_fine_limit_individual", "summary_fine_limit_org",
+                    "INDIVIDUAL".equals(c.getPartyType()) ? "200" : "3000");
             if ("PUNISH".equals(req.decisionType()) && fine.compareTo(limit) > 0)
-                throw new BizException(2003, "简易程序罚款限额：公民200元、法人或其他组织3000元，超限请转普通程序（第48条）");
+                throw new BizException(2003, "简易程序罚款超限（当事人类别限额 " + limit + " 元），请转普通程序（第48条）");
         } else {
             if (!"NOTIFIED".equals(c.getStatus()))
                 throw new BizException(2006, "作出处罚决定前应当书面告知当事人并听取陈述申辩（第41条）");
@@ -399,13 +433,30 @@ public class CaseService {
             // 第41条：不得因陈述、申辩或申请听证而加重处罚
             if (fine.compareTo(notice.getProposedFine()) > 0 || recoup.compareTo(notice.getProposedRecoup()) > 0)
                 throw new BizException(2007, "决定金额不得高于告知金额——不得因陈述申辩而加重处罚（第41条）");
-            // 第37条：罚款数额较大或经过听证的案件，未经法制审核或审核未通过，不得作出决定
-            boolean needReview = fine.compareTo(cfgDecimal("legal_review_fine_threshold")) >= 0
+            // 法制审核：THRESHOLD=数额较大或经听证必审（国家37条）；ALL=全案必审（辽40条）
+            boolean needReview = "ALL".equalsIgnoreCase(config.str("legal_review_mode", "THRESHOLD"))
+                    || fine.compareTo(cfgDecimal("legal_review_fine_threshold")) >= 0
                     || notice.getHearingHeldAt() != null;
             if (needReview) {
                 CaseReview review = reviewRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
                 if (review == null || !Boolean.TRUE.equals(review.getPassed()))
-                    throw new BizException(2005, "罚款数额较大或经听证的案件，未经法制审核通过不得作出决定（第37条）");
+                    throw new BizException(2005, "本案属法制审核范围，未经审核通过不得作出决定（第37条/辽40条）");
+            }
+            // 辽24条：未经当事人质证（发表意见）的证据不能作为处罚决定依据（参数开关）
+            if (config.bool("cross_exam_required", false) && "PUNISH".equals(req.decisionType())) {
+                Integer unexamined = jdbc.queryForObject(
+                        "select count(*) from case_evidence where case_id = ? and cross_exam_at is null",
+                        Integer.class, caseId);
+                if (unexamined != null && unexamined > 0)
+                    throw new BizException(2045, "尚有 " + unexamined + " 份证据未经当事人质证，不能作为决定依据（辽24条）");
+            }
+            // 辽54条：较大数额罚款必须经负责人集体讨论决定（按当事人类型分档）
+            if ("PUNISH".equals(req.decisionType())) {
+                BigDecimal meetingThreshold = config.byPartyType(c.getPartyType(),
+                        "meeting_required_fine_individual", "meeting_required_fine_org", "100000");
+                boolean hasMeeting = !jdbc.queryForList("select id from case_meeting where case_id = ?", caseId).isEmpty();
+                if (fine.compareTo(meetingThreshold) >= 0 && !hasMeeting)
+                    throw new BizException(2047, "较大数额罚款（≥" + meetingThreshold + "元）应当经负责人集体讨论决定，请先录入讨论记录（辽54条/局令44条）");
             }
             // 第45条：办案期限（含批准延长），扣除期间不计入
             LocalDate effectiveDeadline = c.getDeadlineAt().plusDays(totalExclusionDays(caseId));
@@ -425,6 +476,8 @@ public class CaseService {
         d.setConfiscateAmount(nz(req.confiscateAmount()));
         d.setOtherMeasures(req.otherMeasures());
         d.setContent(req.content());
+        d.setMitigation(req.mitigation());
+        d.setDiscretionReason(req.discretionReason());
         d.setDecidedAt(LocalDate.now());
         decisionRepository.save(d);
 
@@ -437,7 +490,8 @@ public class CaseService {
 
     // ---------- 送达（第59条） ----------
 
-    public record DeliveryReq(String method, LocalDate deliveredAt, String receiver, String note) {}
+    public record DeliveryReq(String method, LocalDate deliveredAt, String receiver, String note,
+                              String receiptNo, LocalDate receiptSignedAt) {}
 
     @Transactional
     public CaseFile deliver(Long caseId, DeliveryReq req) {
@@ -445,11 +499,19 @@ public class CaseService {
         if (!"DECIDED".equals(c.getStatus())) throw new BizException(2041, "仅已决定的案件可登记送达（第59条）");
         if (!List.of("DIRECT", "MAIL", "LEFT", "ELECTRONIC", "ANNOUNCE").contains(req.method()))
             throw new BizException(2041, "送达方式须为 直接/邮寄/留置/电子/公告 之一");
-        jdbc.update("insert into case_delivery (case_id, method, delivered_at, receiver, note) values (?,?,?,?,?)",
-                caseId, req.method(), req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now(),
-                req.receiver(), req.note());
+        // 辽61条：行政处罚决定书不得电子送达（国家局令59条允许但须签确认书——参数开关）
+        if ("ELECTRONIC".equals(req.method()) && !config.bool("delivery_electronic_decision_allowed", true))
+            throw new BizException(2049, "当前规则下处罚决定书不得电子送达（辽61条），请改用直接/邮寄/留置/公告送达");
+        // 辽58条：送达回证签收日期为送达日期
+        LocalDate deliveredAt = req.receiptSignedAt() != null ? req.receiptSignedAt()
+                : (req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now());
+        jdbc.update("""
+                insert into case_delivery (case_id, method, delivered_at, receiver, note, receipt_no, receipt_signed_at)
+                values (?,?,?,?,?,?,?)""",
+                caseId, req.method(), deliveredAt, req.receiver(), req.note(),
+                req.receiptNo(), req.receiptSignedAt());
         c.setStatus("DELIVERED");
-        c.setDeliveredAt(req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now());
+        c.setDeliveredAt(deliveredAt);
         return caseRepository.save(c);
     }
 
@@ -468,9 +530,10 @@ public class CaseService {
             throw new BizException(2042, "执行类型须为 罚款/退回基金/没收违法所得/加处罚款");
         BigDecimal amount = nz(req.amount());
         if (amount.signum() <= 0) throw new BizException(2042, "执行金额须为正数");
-        // 第52条：当场收缴限一百元以下（或不当场收缴事后难以执行——系统按金额硬校验）
-        if ("ONSITE".equals(req.method()) && amount.compareTo(new BigDecimal("100")) > 0)
-            throw new BizException(2010, "当场收缴罚款限一百元以下（第52条）");
+        // 第52条：当场收缴限额（国家100/辽宁20，参数化）
+        BigDecimal onsiteLimit = config.decimal("onsite_collect_limit", "100");
+        if ("ONSITE".equals(req.method()) && amount.compareTo(onsiteLimit) > 0)
+            throw new BizException(2010, "当场收缴罚款限 " + onsiteLimit + " 元以下（第52条）");
         // 第55条：加处罚款不得超出罚款数额
         if ("LATE_FEE".equals(req.kind())) {
             BigDecimal paidLateFee = sumExecution(caseId, "LATE_FEE");
@@ -495,6 +558,27 @@ public class CaseService {
         BigDecimal capped = accrued.min(d.getFineAmount());
         return Map.of("payDeadline", payDeadline, "overdueDays", overdueDays,
                 "accrued", accrued, "capped", capped, "fineAmount", d.getFineAmount());
+    }
+
+    /** 处罚决定公开（局令46条；辽56条：作出决定7日内公开） */
+    @Transactional
+    public CaseDecision publish(Long caseId) {
+        CaseDecision d = decisionRepository.findByCaseId(caseId)
+                .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
+        d.setPublished(true);
+        d.setPublishedAt(LocalDate.now());
+        return decisionRepository.save(d);
+    }
+
+    /** 重大处罚决定政府备案登记（辽54条） */
+    @Transactional
+    public CaseDecision govRecord(Long caseId, String recordNo) {
+        CaseDecision d = decisionRepository.findByCaseId(caseId)
+                .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
+        if (recordNo == null || recordNo.isBlank()) throw new BizException(2042, "须填写备案文号");
+        d.setGovRecordNo(recordNo);
+        d.setGovRecordAt(LocalDate.now());
+        return decisionRepository.save(d);
     }
 
     /** 暂缓/分期缴纳批准（第54条） */

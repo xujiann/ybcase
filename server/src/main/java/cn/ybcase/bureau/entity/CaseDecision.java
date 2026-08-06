@@ -48,7 +48,23 @@ public class CaseDecision {
     @Column(nullable = false)
     private LocalDate decidedAt;
 
-    /** 处罚决定公开（第46条） */
+    /** 处罚决定公开（第46条；辽56条：作出决定7日内公开） */
     @Column(nullable = false)
     private Boolean published = false;
+
+    private LocalDate publishedAt;
+
+    /** 从轻/减轻/不予处罚情形（辽55条） */
+    @Column(length = 512)
+    private String mitigation;
+
+    /** 裁量理由（辽40/44条：裁量性决定须说明考虑因素） */
+    @Column(columnDefinition = "text")
+    private String discretionReason;
+
+    /** 重大处罚决定政府备案（辽54条） */
+    @Column(length = 64)
+    private String govRecordNo;
+
+    private LocalDate govRecordAt;
 }
