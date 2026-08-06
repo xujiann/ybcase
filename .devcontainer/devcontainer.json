@@ -7,21 +7,45 @@
       "jdkDistro": "tem",
       "installMaven": true
     },
-    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
-    "ghcr.io/devcontainers/features/python:1": { "version": "3.12" },
-    "ghcr.io/itsmechlark/features/postgresql:1": { "version": "16" }
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    },
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.12"
+    },
+    "ghcr.io/itsmechlark/features/postgresql:1": {
+      "version": "16"
+    },
+    "ghcr.io/devcontainers/features/sshd:1": {
+      "version": "latest"
+    }
   },
-  "forwardPorts": [5174, 8090],
+  "forwardPorts": [
+    5174,
+    8090
+  ],
   "portsAttributes": {
-    "5174": { "label": "前端（登录页）", "onAutoForward": "openPreview" },
-    "8090": { "label": "后端 API", "onAutoForward": "silent" }
+    "5174": {
+      "label": "前端（登录页）",
+      "onAutoForward": "openPreview"
+    },
+    "8090": {
+      "label": "后端 API",
+      "onAutoForward": "silent"
+    }
   },
   "postCreateCommand": "bash .devcontainer/setup.sh",
   "postStartCommand": "bash .devcontainer/start.sh",
   "customizations": {
     "vscode": {
-      "extensions": ["vscjava.vscode-java-pack", "Vue.volar"]
+      "extensions": [
+        "vscjava.vscode-java-pack",
+        "Vue.volar"
+      ]
     }
   },
-  "hostRequirements": { "cpus": 4, "memory": "8gb" }
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb"
+  }
 }
