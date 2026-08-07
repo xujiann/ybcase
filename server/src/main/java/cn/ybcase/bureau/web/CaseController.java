@@ -23,22 +23,39 @@ public class CaseController {
     private final cn.ybcase.bureau.service.DocumentService documentService;
     private final CaseFileRepository caseRepository;
 
+    private static boolean privileged(Authentication auth) {
+        return auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
+                        || a.getAuthority().equals("ROLE_ADMIN"));
+    }
+
     @GetMapping
     public R<?> list(@RequestParam(required = false) String status,
                      @RequestParam(required = false) Integer page,
                      @RequestParam(defaultValue = "20") int size,
-                     @RequestParam(required = false) String q) {
-        // 未传 page 保持旧契约（E2E/既有前端）；传 page 走分页
-        if (page == null && q == null) {
+                     @RequestParam(required = false) String q,
+                     Authentication auth) {
+        // 未传 page 且未开数据范围时保持旧契约（E2E/既有前端）；否则走分页（含范围过滤）
+        if (page == null && q == null && !caseService.scopedSelf(privileged(auth))) {
             return R.ok(status == null ? caseRepository.findTop200ByOrderByIdDesc()
                     : caseRepository.findByStatusOrderByIdDesc(status));
         }
-        return R.ok(caseService.pageList(status, q, page == null ? 1 : page, Math.min(size, 100)));
+        return R.ok(caseService.pageList(status, q, page == null ? 1 : page, Math.min(size, 100),
+                auth.getName(), privileged(auth)));
     }
 
     @GetMapping("/{id}")
-    public R<Map<String, Object>> detail(@PathVariable Long id) {
+    public R<Map<String, Object>> detail(@PathVariable Long id, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), privileged(auth));
         return R.ok(caseService.detail(id));
+    }
+
+    /** 案件移交（承办人变更，负责人操作） */
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")
+    @PostMapping("/{id}/transfer-owner")
+    public R<CaseFile> transferOwner(@PathVariable Long id, @RequestBody Map<String, String> body,
+                                     Authentication auth) {
+        return R.ok(caseService.transferOwner(id, body.get("newOwner"), auth.getName()));
     }
 
     @PostMapping

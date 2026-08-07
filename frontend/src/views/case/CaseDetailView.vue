@@ -7,6 +7,8 @@
           <div class="hint" style="margin-top: 6px">
             <el-tag :type="(CASE_STATUS_TAG[c.status] as any)" size="small">{{ CASE_STATUS[c.status] }}</el-tag>
             <span style="margin-left: 12px">{{ c.procedureType === 'SUMMARY' ? '简易程序' : '普通程序' }}</span>
+            <span style="margin-left: 12px">承办人 {{ c.ownerUser || '-' }}
+              <el-button size="small" text type="primary" @click="onTransferOwner">移交</el-button></span>
             <span style="margin-left: 12px">立案 {{ c.filedAt }}</span>
             <span style="margin-left: 12px">办案期限 {{ detail.effectiveDeadline }}（含延长 {{ c.extensionDays }} 日与扣除期间）</span>
           </div>
@@ -1178,6 +1180,13 @@ async function onSummaryRecord() {
 async function onEConsent() {
   await client.post(`/bureau/cases/${id}/e-delivery-consent`)
   ElMessage.success('已登记电子送达确认书')
+  load()
+}
+
+async function onTransferOwner() {
+  const { value } = await ElMessageBox.prompt('接收人登录账号（承办人变更，负责人权限）', '案件移交', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id}/transfer-owner`, { newOwner: value })
+  ElMessage.success('已移交')
   load()
 }
 

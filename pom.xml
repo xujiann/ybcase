@@ -6,7 +6,7 @@
 
     <groupId>cn.ybcase</groupId>
     <artifactId>ybcase-parent</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
     <packaging>pom</packaging>
     <name>医保基金监管案件查办系统</name>
     <description>市级医保局行政执法案件全流程管理（依据国家医保局令第4号）</description>

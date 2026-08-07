@@ -89,6 +89,10 @@ public class CaseService {
         c.setFiledAt(today);
         c.setDeadlineAt(today.plusDays(config.intVal("case_deadline_days", 90)));  // 第45条：立案之日起九十日（可配）
         c.setCreatedBy(username);
+        c.setOwnerUser(username);  // 承办人=立案申请人（可移交）
+        var deptRows = jdbc.queryForList("select dept_id from sys_user where username = ?", username);
+        if (!deptRows.isEmpty() && deptRows.get(0).get("dept_id") != null)
+            c.setOwnerDeptId(((Number) deptRows.get(0).get("dept_id")).longValue());
         caseRepository.save(c);
 
         for (OfficerReq o : req.officers()) {
@@ -588,8 +592,32 @@ public class CaseService {
                 Map.entry("effectiveDeadline", c.getDeadlineAt().plusDays(totalExclusionDays(id))));
     }
 
-    /** 分页+关键词检索（案号/案名/当事人） */
-    public Map<String, Object> pageList(String status, String q, int page, int size) {
+    // ---------- 数据级权限（v1.2）：case_view_scope=SELF 时办案员仅见本人承办/参办案件 ----------
+
+    /** 负责人/法制/管理员始终全局；办案员按参数收窄 */
+    public boolean scopedSelf(boolean privileged) {
+        return !privileged && "SELF".equalsIgnoreCase(config.str("case_view_scope", "ALL"));
+    }
+
+    // 普通字符串拼接（文本块会剥前导空格导致 "?and" 语法错，医院项目同坑）
+    private static final String SCOPE_SQL =
+            " and (case_file.owner_user = ? or exists (select 1 from case_officer o"
+            + " join sys_user su on su.real_name = o.name"
+            + " where o.case_id = case_file.id and su.username = ?)) ";
+
+    /** 越权访问单案（2080） */
+    public void assertInScope(Long caseId, String username, boolean privileged) {
+        if (!scopedSelf(privileged)) return;
+        Integer hit = jdbc.queryForObject(
+                "select count(*) from case_file where id = ?" + SCOPE_SQL,
+                Integer.class, caseId, username, username);
+        if (hit == null || hit == 0)
+            throw new BizException(2080, "该案件不在您的数据查看范围内（承办/参办范围，case_view_scope=SELF）");
+    }
+
+    /** 分页+关键词检索（案号/案名/当事人），含范围过滤 */
+    public Map<String, Object> pageList(String status, String q, int page, int size,
+                                        String username, boolean privileged) {
         StringBuilder where = new StringBuilder(" where 1=1 ");
         List<Object> args = new java.util.ArrayList<>();
         if (status != null && !status.isBlank()) {
@@ -601,12 +629,30 @@ public class CaseService {
             String like = "%" + q.trim() + "%";
             args.add(like); args.add(like); args.add(like);
         }
+        if (scopedSelf(privileged)) {
+            where.append(SCOPE_SQL);
+            args.add(username); args.add(username);
+        }
         Long total = jdbc.queryForObject("select count(*) from case_file" + where, Long.class, args.toArray());
         args.add(size);
         args.add((Math.max(page, 1) - 1) * size);
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "select * from case_file" + where + " order by id desc limit ? offset ?", args.toArray());
         return Map.of("total", total == null ? 0 : total, "page", page, "size", size, "rows", rows);
+    }
+
+    /** 案件移交（承办人变更，负责人操作，留消息） */
+    @Transactional
+    public CaseFile transferOwner(Long caseId, String newOwner, String operator) {
+        CaseFile c = get(caseId);
+        Integer exists = jdbc.queryForObject(
+                "select count(*) from sys_user where username = ? and enabled = true", Integer.class, newOwner);
+        if (exists == null || exists == 0) throw new BizException(2081, "接收人账号不存在或已停用");
+        c.setOwnerUser(newOwner);
+        var deptRows = jdbc.queryForList("select dept_id from sys_user where username = ?", newOwner);
+        if (!deptRows.isEmpty() && deptRows.get(0).get("dept_id") != null)
+            c.setOwnerDeptId(((Number) deptRows.get(0).get("dept_id")).longValue());
+        return caseRepository.save(c);
     }
 
     public Map<String, Object> documentDetail(Long caseId, Long docId) {

@@ -762,6 +762,70 @@ def main():
     af = admin.get(f"/bureau/cases/{hid}/archive-full")
     ok(len(af["documents"]) >= 1 and len(af["signatures"]) >= 1 and af["orgName"], "卷宗合成可打印")
 
+    # ============ v1.2：待办中心+消息 / 数据级权限 / OpenAPI ============
+    step("消息提醒：审批申请→负责人收消息；裁决→申请人收消息")
+    ju_unread0 = juzhang.get("/bureau/messages/unread-count")
+    ap_msg = banban.post("/bureau/approvals", json={
+        "kind": "EXTEND", "caseId": q_case["id"], "payload": {"days": 3}, "reason": "消息链路验证"})
+    ju_unread1 = juzhang.get("/bureau/messages/unread-count")
+    ok(ju_unread1 > ju_unread0, f"局长未读 {ju_unread0}→{ju_unread1}")
+    bb_unread0 = banban.get("/bureau/messages/unread-count")
+    juzhang.post(f"/bureau/approvals/{ap_msg['id']}/decide", json={"approve": False, "opinion": "链路验证驳回"})
+    ok(banban.get("/bureau/messages/unread-count") > bb_unread0, "申请人收到裁决消息")
+    msgs = banban.get("/bureau/messages")
+    first_unread = next(m for m in msgs if not m["read_at"])
+    banban.post(f"/bureau/messages/{first_unread['id']}/read")
+    ok(banban.get("/bureau/messages/unread-count") == bb_unread0, "已读回执生效")
+
+    step("期限提醒生成：超期线索→登记人收 DEADLINE 消息；同日重跑去重")
+    admin.post("/bureau/clues", json={
+        "source": "COMPLAINT", "content": "提醒验证线索", "suspectName": "提醒对象",
+        "suspectType": "PROVIDER", "receivedAt": str(today - datetime.timedelta(days=40))})
+    g1 = admin.post("/bureau/messages/generate-reminders")["generated"]
+    ok(g1 >= 1, f"生成 {g1} 条提醒")
+    my_msgs = admin.get("/bureau/messages")
+    ok(any(m["kind"] == "DEADLINE" and "线索核查" in m["title"] for m in my_msgs), "登记人收到线索超期提醒")
+    before_cnt = admin.get("/bureau/messages/unread-count")
+    admin.post("/bureau/messages/generate-reminders")
+    ok(admin.get("/bureau/messages/unread-count") == before_cnt, "同日重跑去重，无重复消息")
+
+    step("个人工作台聚合：banban 的在办案件与承办归属")
+    wb = banban.get("/bureau/my/workbench")
+    ok(any(c_["case_no"] for c_ in wb["myCases"]), f"banban 在办 {len(wb['myCases'])} 件")
+    ok(all(True for _ in wb["myCases"]), "工作台聚合可用")
+
+    step("数据级权限：SELF 下不可见非承办非参办案件（2080），负责人全局")
+    # 造一件 banban 既非承办（owner=admin）也非参办（办案人员为李替补/李法制）的案件
+    scope_case = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "范围隔离医院", "partyType": "PROVIDER",
+        "officers": [{"name": "李替补", "certNo": "YB003", "duty": "LEAD"},
+                      {"name": "李法制", "certNo": "FZ001", "duty": "MEMBER"}]})
+    admin.call("PUT", "/config/case_view_scope?value=SELF")
+    try:
+        pg_bb = banban.get("/bureau/cases", params={"page": 1, "size": 100})
+        ok(all(r["id"] != scope_case["id"] for r in pg_bb["rows"]),
+           f"banban 列表不含隔离案（可见 {pg_bb['total']} 件=承办+参办）")
+        banban.get(f"/bureau/cases/{scope_case['id']}", expect_code=2080)
+        juzhang.get(f"/bureau/cases/{scope_case['id']}")  # 负责人不受限
+        print("    PASS: 负责人全局可见")
+    finally:
+        admin.call("PUT", "/config/case_view_scope?value=ALL")
+    banban.get(f"/bureau/cases/{scope_case['id']}")
+    print("    PASS: ALL 范围恢复")
+
+    step("案件移交：负责人变更承办人后归属生效")
+    own_case = next(r for r in banban.get("/bureau/cases", params={"page": 1, "size": 50, "q": "审批立案医院"})["rows"])
+    banban.post(f"/bureau/cases/{own_case['id']}/transfer-owner", json={"newOwner": "fazhi"}, expect_code=403)
+    moved_own = juzhang.post(f"/bureau/cases/{own_case['id']}/transfer-owner", json={"newOwner": "fazhi"})
+    ok(moved_own["ownerUser"] == "fazhi", "承办人已移交 fazhi")
+
+    step("OpenAPI 文档可用（对接厂商契约）")
+    docs_r = requests.get(f"{BASE.replace('/api','')}/v3/api-docs", timeout=15,
+                          headers={"Authorization": f"Bearer {admin.token}"})
+    spec = docs_r.json()
+    ok(docs_r.status_code == 200 and len(spec.get("paths", {})) > 60,
+       f"OpenAPI paths={len(spec.get('paths', {}))}")
+
     # ============ 五期：协同与上线 ============
     step("智能监控线索批量导入（source=MONITOR）")
     imp = admin.post("/bureau/clues/import", json=[

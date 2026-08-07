@@ -9,3 +9,10 @@ ybcase:
   security:
     jwt-secret: ${YBCASE_JWT_SECRET}
     jwt-expiry-hours: ${YBCASE_JWT_EXPIRY_HOURS:12}
+
+# 生产默认关闭接口文档；对接联调环境设 YBCASE_SWAGGER=true 开启
+springdoc:
+  api-docs:
+    enabled: ${YBCASE_SWAGGER:false}
+  swagger-ui:
+    enabled: ${YBCASE_SWAGGER:false}

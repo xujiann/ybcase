@@ -28,8 +28,9 @@ public class SecurityConfig {
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
-                        // 最小放行面：登录、登录页机构信息、健康检查
-                        .requestMatchers("/api/auth/login", "/api/config/public", "/actuator/health").permitAll()
+                        // 最小放行面：登录、登录页机构信息、健康检查；接口文档（生产以 springdoc.api-docs.enabled=false 整体关闭）
+                        .requestMatchers("/api/auth/login", "/api/config/public", "/actuator/health",
+                                "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .anyRequest().authenticated())
                 .exceptionHandling(eh -> eh.authenticationEntryPoint(
                         (req, res, e) -> res.sendError(HttpStatus.UNAUTHORIZED.value(), "未登录或登录已过期")))

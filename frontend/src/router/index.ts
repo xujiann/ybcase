@@ -9,7 +9,7 @@ const router = createRouter({
       component: () => import('../views/MainLayout.vue'),
       children: [
         { path: '', redirect: '/dashboard' },
-        { path: 'dashboard', component: () => import('../views/case/StatsView.vue') },
+        { path: 'dashboard', component: () => import('../views/case/MyWorkbenchView.vue') },
         { path: 'case/clues', component: () => import('../views/case/CluesView.vue') },
         { path: 'case/list', component: () => import('../views/case/CasesView.vue') },
         { path: 'case/detail/:id', component: () => import('../views/case/CaseDetailView.vue') },

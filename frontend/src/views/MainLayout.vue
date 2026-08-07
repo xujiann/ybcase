@@ -22,6 +22,9 @@
                   style="width: 320px" @keyup.enter="onSearch">
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
+        <el-badge :value="unread" :hidden="!unread" style="margin-right: 20px">
+          <el-icon style="cursor: pointer; font-size: 20px" @click="openMessages"><Bell /></el-icon>
+        </el-badge>
         <el-dropdown @command="onCommand">
           <span class="user-name">
             {{ auth.user?.realName || auth.user?.username }}
@@ -46,6 +49,20 @@
           <el-button type="primary" @click="onChangePassword">保存</el-button>
         </template>
       </el-dialog>
+      <el-drawer v-model="msgVisible" title="站内消息" size="420px">
+        <div class="mb" style="text-align: right">
+          <el-button size="small" @click="onReadAll">全部已读</el-button>
+        </div>
+        <div v-for="m in messages" :key="m.id" class="msg" :class="{ unreadMsg: !m.read_at }"
+             @click="onOpenMessage(m)">
+          <div><el-tag size="small" :type="m.kind === 'DEADLINE' ? 'danger' : 'warning'">
+            {{ m.kind === 'DEADLINE' ? '期限' : m.kind === 'APPROVAL' ? '审批' : '系统' }}</el-tag>
+            <b style="margin-left: 6px">{{ m.title }}</b></div>
+          <div class="hint">{{ m.content || '' }}　{{ m.created_at?.slice(0, 16).replace('T', ' ') }}</div>
+        </div>
+        <p v-if="!messages.length" class="hint">暂无消息</p>
+      </el-drawer>
+
       <el-dialog v-model="searchVisible" title="搜索结果" width="640px">
         <h4>案件（{{ searchResult.cases?.length || 0 }}）</h4>
         <el-table :data="searchResult.cases" size="small" border class="mb"
@@ -83,6 +100,38 @@ const pwdForm = reactive({ oldPassword: '', newPassword: '', confirm: '' })
 const searchQ = ref('')
 const searchVisible = ref(false)
 const searchResult = ref<any>({})
+const unread = ref(0)
+const msgVisible = ref(false)
+const messages = ref<any[]>([])
+
+async function refreshUnread() {
+  try {
+    unread.value = (await client.get('/bureau/messages/unread-count')).data.data
+  } catch { /* 未登录等场景忽略 */ }
+}
+
+async function openMessages() {
+  messages.value = (await client.get('/bureau/messages')).data.data
+  msgVisible.value = true
+}
+
+async function onOpenMessage(m: any) {
+  if (!m.read_at) {
+    await client.post(`/bureau/messages/${m.id}/read`)
+    m.read_at = new Date().toISOString()
+    refreshUnread()
+  }
+  if (m.link) {
+    msgVisible.value = false
+    router.push(m.link)
+  }
+}
+
+async function onReadAll() {
+  await client.post('/bureau/messages/read-all')
+  messages.value.forEach((m) => { if (!m.read_at) m.read_at = new Date().toISOString() })
+  refreshUnread()
+}
 
 async function onSearch() {
   if (searchQ.value.trim().length < 2) return
@@ -93,6 +142,8 @@ async function onSearch() {
 
 onMounted(() => {
   if (!auth.user) auth.fetchMe().catch(() => {})
+  refreshUnread()
+  setInterval(refreshUnread, 60000)  // 轻量轮询未读数
 })
 
 function onCommand(cmd: string) {
@@ -147,4 +198,7 @@ async function onChangePassword() {
 .main { background: #f5f7fa; }
 .mb { margin-bottom: 12px; }
 h4 { margin: 6px 0; }
+.msg { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+.msg:hover { background: #f5f7fa; }
+.unreadMsg { background: #fdf6ec; }
 </style>

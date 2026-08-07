@@ -128,6 +128,12 @@ public class CaseFile {
     @Column(nullable = false)
     private Boolean healthHarm = false;
 
+    /** 承办人（数据级权限归属；可移交） */
+    @Column(length = 64)
+    private String ownerUser;
+
+    private Long ownerDeptId;
+
     @Column(length = 64)
     private String createdBy;
 

@@ -6,7 +6,7 @@
     <parent>
         <groupId>cn.ybcase</groupId>
         <artifactId>ybcase-parent</artifactId>
-        <version>1.1.0</version>
+        <version>1.2.0</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -21,6 +21,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <!-- 对接厂商的接口文档（/swagger-ui、/v3/api-docs）；生产 pilot profile 默认关闭 -->
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.8.5</version>
         </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>

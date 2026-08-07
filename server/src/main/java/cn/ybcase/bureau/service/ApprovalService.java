@@ -21,9 +21,13 @@ public class ApprovalService {
 
     private final CaseService caseService;
     private final ExecutionService executionService;
+    private final MessageService messageService;
     private final JdbcTemplate jdbc;
     // 用 Spring 全局 ObjectMapper（含 JavaTime 模块，LocalDate 反序列化正确）
     private final ObjectMapper objectMapper;
+
+    private static final Map<String, String> KIND_NAMES = Map.of(
+            "FILE_CASE", "立案", "EXTEND", "延期", "SUSPEND", "中止", "TERMINATE", "终止", "DEFER", "暂缓分期");
 
     private static final List<String> KINDS = List.of("FILE_CASE", "EXTEND", "SUSPEND", "TERMINATE", "DEFER");
 
@@ -40,10 +44,15 @@ public class ApprovalService {
             throw new BizException(2071, "须关联案件");
         }
         String payload = toJson(req.payload());
-        return jdbc.queryForObject("""
+        Long id = jdbc.queryForObject("""
                 insert into biz_approval (kind, clue_id, case_id, payload, reason, applicant)
                 values (?,?,?,?,?,?) returning id""", Long.class,
                 req.kind(), req.clueId(), req.caseId(), payload, req.reason(), applicant);
+        // 即时通知负责人
+        messageService.sendToRole("LEADER", "APPROVAL",
+                "新审批单：" + KIND_NAMES.getOrDefault(req.kind(), req.kind()) + "（" + applicant + "）",
+                req.reason(), "/case/approvals");
+        return id;
     }
 
     /** 负责人裁决：批准即执行对应动作（同事务，失败则整单回滚） */
@@ -60,6 +69,11 @@ public class ApprovalService {
                 update biz_approval set status = ?, approver = ?, decided_at = now(), opinion = ?
                 where id = ?""",
                 approve ? "APPROVED" : "REJECTED", approver, opinion, approvalId);
+        // 即时通知申请人
+        messageService.send((String) a.get("applicant"), "APPROVAL",
+                "审批单 #" + approvalId + "（" + KIND_NAMES.getOrDefault((String) a.get("kind"), "") + "）"
+                        + (approve ? "已批准" : "已驳回"),
+                opinion, a.get("case_id") == null ? "/case/approvals" : "/case/detail/" + a.get("case_id"), null);
         return Map.of("approved", approve, "result", executed == null ? Map.of() : executed);
     }
 
