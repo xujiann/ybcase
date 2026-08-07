@@ -23,6 +23,16 @@ export default defineConfig({
       },
     },
   },
+  // 部署形态本地预览：npm run preview 服务 dist 构建产物（无 HMR），代理同 dev
+  preview: {
+    port: 5174,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8090',
+        changeOrigin: true,
+      },
+    },
+  },
   server: {
     // autoPort：预览环境经 PORT 注入端口，本地手工启动回落 5174
     port: Number(process.env.PORT) || 5174,

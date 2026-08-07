@@ -4,9 +4,26 @@
     {
       "name": "ybcase-frontend",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--prefix", "frontend"],
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "frontend"
+      ],
       "port": 5174,
       "autoPort": true
+    },
+    {
+      "name": "ybcase-deploy",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "preview",
+        "--prefix",
+        "frontend"
+      ],
+      "port": 5174,
+      "autoPort": false
     }
   ]
 }
