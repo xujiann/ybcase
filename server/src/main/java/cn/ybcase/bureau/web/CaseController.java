@@ -24,9 +24,16 @@ public class CaseController {
     private final CaseFileRepository caseRepository;
 
     @GetMapping
-    public R<List<CaseFile>> list(@RequestParam(required = false) String status) {
-        return R.ok(status == null ? caseRepository.findTop200ByOrderByIdDesc()
-                : caseRepository.findByStatusOrderByIdDesc(status));
+    public R<?> list(@RequestParam(required = false) String status,
+                     @RequestParam(required = false) Integer page,
+                     @RequestParam(defaultValue = "20") int size,
+                     @RequestParam(required = false) String q) {
+        // 未传 page 保持旧契约（E2E/既有前端）；传 page 走分页
+        if (page == null && q == null) {
+            return R.ok(status == null ? caseRepository.findTop200ByOrderByIdDesc()
+                    : caseRepository.findByStatusOrderByIdDesc(status));
+        }
+        return R.ok(caseService.pageList(status, q, page == null ? 1 : page, Math.min(size, 100)));
     }
 
     @GetMapping("/{id}")

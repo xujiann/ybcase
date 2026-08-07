@@ -8,8 +8,22 @@ on:
 
 jobs:
   backend:
-    name: 后端构建与测试（mvn test）
+    name: 后端构建与测试（单测+集成测试）
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ybcase_test
+          POSTGRES_USER: hip
+          POSTGRES_PASSWORD: hip123456
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hip -d ybcase_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 

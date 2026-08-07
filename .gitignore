@@ -9,3 +9,4 @@ deploy/.env
 deploy/dist/
 deploy/*.jar
 deploy/*.dump
+data/

@@ -1,0 +1,17 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://127.0.0.1:5432/ybcase_test
+    username: hip
+    password: hip123456
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+ybcase:
+  security:
+    jwt-secret: test-only-secret-0123456789-0123456789-0123456789
+    jwt-expiry-hours: 1

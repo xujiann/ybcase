@@ -2,7 +2,11 @@
   <el-card>
     <div class="toolbar">
       <h3>参数设置<span class="hint">（期限/限额/阈值全部可配；默认=新《行政处罚法》+国家局令第4号，辽宁口径可切换，修改留痕入审计）</span></h3>
-      <el-input v-model="filter" placeholder="搜索参数" clearable style="width: 220px" />
+      <div>
+        <el-input v-model="auditMonth" placeholder="YYYY-MM" style="width: 110px; margin-right: 6px" />
+        <el-button size="small" @click="onAuditExport">导出审计日志</el-button>
+        <el-input v-model="filter" placeholder="搜索参数" clearable style="width: 200px; margin-left: 12px" />
+      </div>
     </div>
     <el-table :data="rows.filter((r) => !filter || r.key.includes(filter) || (r.remark || '').includes(filter))"
               border stripe size="small" v-loading="loading">
@@ -25,6 +29,17 @@ import client from '../../api/client'
 const rows = ref<{ key: string; value: string; remark: string }[]>([])
 const loading = ref(false)
 const filter = ref('')
+const auditMonth = ref(new Date().toISOString().slice(0, 7))
+
+async function onAuditExport() {
+  const resp = await client.get('/bureau/audit/export', { params: { month: auditMonth.value }, responseType: 'blob' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(resp.data)
+  a.download = `audit-${auditMonth.value}.csv`
+  a.click()
+  URL.revokeObjectURL(a.href)
+  ElMessage.success('审计日志已导出（等保：定期归档留存）')
+}
 
 async function load() {
   loading.value = true

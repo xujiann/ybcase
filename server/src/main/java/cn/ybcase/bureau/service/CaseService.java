@@ -579,11 +579,34 @@ public class CaseService {
                 Map.entry("meetings", jdbc.queryForList("select * from case_meeting where case_id = ? order by id", id)),
                 Map.entry("decision", decisionRepository.findByCaseId(id).map(Object.class::cast).orElse(Map.of())),
                 Map.entry("expertReviews", jdbc.queryForList("select * from expert_review where case_id = ? order by id", id)),
+                Map.entry("agreementActions", jdbc.queryForList("select * from agreement_action where case_id = ? order by id", id)),
+                Map.entry("approvals", jdbc.queryForList("select * from biz_approval where case_id = ? order by id desc", id)),
                 Map.entry("hearings", jdbc.queryForList("select * from case_hearing where case_id = ? order by id", id)),
                 Map.entry("assists", jdbc.queryForList("select * from case_assist where case_id = ? order by id", id)),
                 Map.entry("deliveries", jdbc.queryForList("select * from case_delivery where case_id = ? order by id", id)),
                 Map.entry("executions", jdbc.queryForList("select * from case_execution where case_id = ? order by id", id)),
                 Map.entry("effectiveDeadline", c.getDeadlineAt().plusDays(totalExclusionDays(id))));
+    }
+
+    /** 分页+关键词检索（案号/案名/当事人） */
+    public Map<String, Object> pageList(String status, String q, int page, int size) {
+        StringBuilder where = new StringBuilder(" where 1=1 ");
+        List<Object> args = new java.util.ArrayList<>();
+        if (status != null && !status.isBlank()) {
+            where.append(" and status = ? ");
+            args.add(status);
+        }
+        if (q != null && !q.isBlank()) {
+            where.append(" and (case_no ilike ? or name ilike ? or party_name ilike ?) ");
+            String like = "%" + q.trim() + "%";
+            args.add(like); args.add(like); args.add(like);
+        }
+        Long total = jdbc.queryForObject("select count(*) from case_file" + where, Long.class, args.toArray());
+        args.add(size);
+        args.add((Math.max(page, 1) - 1) * size);
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select * from case_file" + where + " order by id desc limit ? offset ?", args.toArray());
+        return Map.of("total", total == null ? 0 : total, "page", page, "size", size, "rows", rows);
     }
 
     public Map<String, Object> documentDetail(Long caseId, Long docId) {

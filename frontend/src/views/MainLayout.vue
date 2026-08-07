@@ -18,7 +18,10 @@
     </el-aside>
     <el-container>
       <el-header class="header">
-        <div />
+        <el-input v-model="searchQ" placeholder="全局搜索：案号/案名/当事人/线索" clearable
+                  style="width: 320px" @keyup.enter="onSearch">
+          <template #prefix><el-icon><Search /></el-icon></template>
+        </el-input>
         <el-dropdown @command="onCommand">
           <span class="user-name">
             {{ auth.user?.realName || auth.user?.username }}
@@ -43,6 +46,22 @@
           <el-button type="primary" @click="onChangePassword">保存</el-button>
         </template>
       </el-dialog>
+      <el-dialog v-model="searchVisible" title="搜索结果" width="640px">
+        <h4>案件（{{ searchResult.cases?.length || 0 }}）</h4>
+        <el-table :data="searchResult.cases" size="small" border class="mb"
+                  @row-click="(r: any) => { searchVisible = false; router.push(`/case/detail/${r.id}`) }">
+          <el-table-column prop="case_no" label="案号" width="170" />
+          <el-table-column prop="name" label="案件名称" show-overflow-tooltip />
+          <el-table-column prop="status" label="状态" width="120" />
+        </el-table>
+        <h4>线索（{{ searchResult.clues?.length || 0 }}）</h4>
+        <el-table :data="searchResult.clues" size="small" border
+                  @row-click="() => { searchVisible = false; router.push('/case/clues') }">
+          <el-table-column prop="clue_no" label="线索号" width="130" />
+          <el-table-column prop="suspect_name" label="嫌疑人" />
+          <el-table-column prop="status" label="状态" width="120" />
+        </el-table>
+      </el-dialog>
       <el-main class="main">
         <router-view />
       </el-main>
@@ -61,6 +80,16 @@ const router = useRouter()
 const auth = useAuthStore()
 const pwdVisible = ref(false)
 const pwdForm = reactive({ oldPassword: '', newPassword: '', confirm: '' })
+const searchQ = ref('')
+const searchVisible = ref(false)
+const searchResult = ref<any>({})
+
+async function onSearch() {
+  if (searchQ.value.trim().length < 2) return
+  const resp = await client.get('/bureau/search', { params: { q: searchQ.value.trim() } })
+  searchResult.value = resp.data.data
+  searchVisible.value = true
+}
 
 onMounted(() => {
   if (!auth.user) auth.fetchMe().catch(() => {})
@@ -116,4 +145,6 @@ async function onChangePassword() {
 }
 .user-name { cursor: pointer; color: #333; display: flex; align-items: center; gap: 4px; }
 .main { background: #f5f7fa; }
+.mb { margin-bottom: 12px; }
+h4 { margin: 6px 0; }
 </style>

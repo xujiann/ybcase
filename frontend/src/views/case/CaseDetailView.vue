@@ -64,6 +64,10 @@
           <el-button type="success" @click="onCloseCase">结案</el-button>
         </template>
         <el-button v-if="!['CLOSED', 'TERMINATED'].includes(c.status)" @click="dlg.meeting = true">集体讨论记录</el-button>
+        <el-button v-if="!['CLOSED', 'TERMINATED'].includes(c.status)" @click="dlg.apply = true">提交审批申请</el-button>
+      </div>
+      <div v-if="pendingApprovals.length" class="hint" style="margin-top: 8px">
+        <el-tag type="warning" size="small">本案有 {{ pendingApprovals.length }} 张审批单待负责人裁决（见"待办审批"）</el-tag>
       </div>
     </el-card>
 
@@ -127,6 +131,7 @@
           <el-button size="small" class="mb" @click="dlg.document = true" :disabled="c.status === 'CLOSED'">制作文书</el-button>
           <el-button size="small" class="mb" type="primary" @click="onRenderTpl" :disabled="c.status === 'CLOSED'">模板生成</el-button>
           <el-button size="small" class="mb" @click="onCatalog">案卷目录</el-button>
+          <el-button size="small" class="mb" type="success" @click="onPrintArchive">打印卷宗</el-button>
           <el-table :data="detail.documents" border size="small">
             <el-table-column label="类型" width="130">
               <template #default="{ row }">{{ DOC_TYPE[row.doc_type] || row.doc_type }}</template>
@@ -137,9 +142,12 @@
             <el-table-column label="签名确认" width="90">
               <template #default="{ row }">{{ row.signed ? '已签' : '未签' }}</template>
             </el-table-column>
-            <el-table-column label="查看" width="80">
+            <el-table-column label="操作" width="230">
               <template #default="{ row }">
                 <el-button size="small" text type="primary" @click="viewDoc(row)">查看</el-button>
+                <el-button size="small" text @click="onSignDoc(row)">签章</el-button>
+                <el-button size="small" text @click="onVerifyDoc(row)">验签</el-button>
+                <el-button size="small" text @click="onDeliverDoc(row)">送达</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -147,11 +155,19 @@
 
         <el-tab-pane :label="`附件(${attachments.length})`">
           <div class="mb">
+            <el-select v-model="uploadCategory" size="small" style="width: 140px; margin-right: 8px">
+              <el-option label="文书扫描件" value="DOC_SCAN" />
+              <el-option label="执法音像" value="AV_RECORD" />
+              <el-option label="其他" value="OTHER" />
+            </el-select>
             <input ref="fileInput" type="file" style="display: none" @change="onUpload" />
             <el-button size="small" type="primary" @click="(fileInput as any)?.click()">上传附件</el-button>
-            <span class="hint" style="margin-left: 8px">笔录扫描件、影像证据等，单文件 ≤10MB</span>
+            <span class="hint" style="margin-left: 8px">扫描件 ≤10MB；执法音像走外置存储（FILE 模式）≤200MB</span>
           </div>
           <el-table :data="attachments" border size="small">
+            <el-table-column label="分类" width="100">
+              <template #default="{ row }">{{ ({ DOC_SCAN: '扫描件', AV_RECORD: '执法音像', OTHER: '其他' } as any)[row.category] || '-' }}</template>
+            </el-table-column>
             <el-table-column prop="filename" label="文件名" show-overflow-tooltip />
             <el-table-column label="大小" width="100">
               <template #default="{ row }">{{ (row.size_bytes / 1024).toFixed(1) }} KB</template>
@@ -311,6 +327,20 @@
               <template #default="{ row }">
                 <span v-if="row.paid_at">已缴 {{ row.paid_at }}</span>
                 <el-button v-else size="small" text type="primary" @click="onPayInstallment(row)">登记缴纳</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <h4>协议处理台账（联动经办）　<el-button size="small" @click="onAddAgreement" :disabled="!detail.decision?.decisionType">移交经办处理</el-button></h4>
+          <el-table :data="detail.agreementActions" border size="small" class="mb">
+            <el-table-column label="处理" width="110">
+              <template #default="{ row }">{{ ({ INTERVIEW: '约谈', SUSPEND_AGREEMENT: '暂停协议', TERMINATE_AGREEMENT: '解除协议', REFUSE_PAY: '拒付', RECOVER: '追回' } as any)[row.action] }}</template>
+            </el-table-column>
+            <el-table-column prop="org" label="经办机构" width="160" show-overflow-tooltip />
+            <el-table-column prop="sent_at" label="移交日期" width="110" />
+            <el-table-column label="办理结果">
+              <template #default="{ row }">
+                <span v-if="row.replied_at">{{ row.replied_at }}：{{ row.result }}</span>
+                <el-button v-else size="small" text type="primary" @click="onReplyAgreement(row)">登记结果</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -544,6 +574,43 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="dlg.apply" title="提交审批申请（负责人批准后自动执行）" width="480px">
+      <el-form label-width="90px">
+        <el-form-item label="申请类型">
+          <el-select v-model="applyForm.kind" style="width: 100%">
+            <el-option label="延长办案期限" value="EXTEND" />
+            <el-option label="中止调查" value="SUSPEND" />
+            <el-option label="终止调查" value="TERMINATE" />
+            <el-option label="暂缓/分期缴纳" value="DEFER" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="applyForm.kind === 'EXTEND'" label="延长天数">
+          <el-input-number v-model="applyForm.days" :min="1" :max="90" />
+        </el-form-item>
+        <el-form-item label="申请理由"><el-input v-model="applyForm.reason" type="textarea" :rows="3" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dlg.apply = false">取消</el-button>
+        <el-button type="primary" @click="onApply">提交</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="dlg.docDeliver" :title="`文书送达：${docDeliverForm.title}`" width="440px">
+      <el-form label-width="90px">
+        <el-form-item label="送达方式">
+          <el-select v-model="docDeliverForm.method" style="width: 100%">
+            <el-option v-for="(v, k) in DELIVERY_METHOD" :key="k" :label="v" :value="k" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="受送达人"><el-input v-model="docDeliverForm.receiver" /></el-form-item>
+        <el-form-item label="回证编号"><el-input v-model="docDeliverForm.receiptNo" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dlg.docDeliver = false">取消</el-button>
+        <el-button type="primary" @click="onDocDeliverSubmit">登记送达</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="dlg.review" title="法制审核办理（审核人须具备法律职业资格，不得为本案办案人员）" width="480px">
       <el-form label-width="90px">
         <el-form-item label="审核人"><el-input v-model="reviewForm.reviewer" /></el-form-item>
@@ -617,10 +684,13 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRoute } from 'vue-router'
 import client from '../../api/client'
+import { useAuthStore } from '../../stores/auth'
 import {
   CASE_STATUS, CASE_STATUS_TAG, DECISION_TYPE, DELIVERY_METHOD, DOC_TYPE,
   EVIDENCE_TYPE, EXCLUSION_REASON, EXEC_KIND, EXEC_METHOD, PARTY_TYPE, REVIEW_OPINION,
 } from './labels'
+
+const auth = useAuthStore()
 
 const CLOSE_REASON: Record<string, string> = {
   EXECUTED: '执行完毕', COURT: '法院受理强制执行', NO_NEED: '无须执行', OTHER: '其他',
@@ -637,7 +707,12 @@ const dlg = reactive<Record<string, boolean>>({
   officer: false, evidence: false, document: false, exclusion: false, report: false,
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
   execution: false, doc: false, catalog: false, hearing: false, review: false, installment: false,
+  apply: false, docDeliver: false,
 })
+const uploadCategory = ref('DOC_SCAN')
+const applyForm = reactive<any>({ kind: 'EXTEND', days: 30, reason: '' })
+const docDeliverForm = reactive<any>({ documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', receiver: '', receiptNo: '' })
+const pendingApprovals = computed(() => (detail.value.approvals || []).filter((a: any) => a.status === 'PENDING'))
 const reviewForm = reactive<any>({ reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
 const installmentForm = reactive<any>({ seq: 1, dueAt: '', amount: 0 })
 const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: new Date().toISOString().slice(0, 10), scheduledAt: '', host: '', hostDept: '', recorder: '' })
@@ -706,10 +781,109 @@ async function onUpload(e: Event) {
   if (!file) return
   const fd = new FormData()
   fd.append('file', file)
+  fd.append('category', uploadCategory.value)
   await client.post(`/bureau/cases/${id}/attachments`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
   ElMessage.success('已上传')
   ;(e.target as HTMLInputElement).value = ''
   load()
+}
+
+async function onSignDoc(row: any) {
+  const { value } = await ElMessageBox.prompt('签章人（办案人员/当事人/负责人）', '电子签章', { inputValue: auth.user?.realName || '', inputPattern: /\S+/, inputErrorMessage: '必填' })
+  const resp = await client.post(`/bureau/cases/${id}/documents/${row.id}/sign`, { signer: value })
+  ElMessage.success(`已签章（${resp.data.data.provider}，摘要 ${resp.data.data.contentHash.slice(0, 12)}…）`)
+  load()
+}
+
+async function onVerifyDoc(row: any) {
+  const sigs = (await client.get(`/bureau/cases/${id}/documents/${row.id}/verify`)).data.data
+  if (!sigs.length) {
+    ElMessage.info('该文书尚无签章')
+    return
+  }
+  const ok = sigs.every((s: any) => s.valid)
+  ElMessageBox.alert(sigs.map((s: any) => `${s.signer}（${s.signer_role}）${s.signed_at}：${s.valid ? '有效' : '内容已被篡改！'}`).join('\n'),
+    ok ? '验签通过' : '验签失败', { type: ok ? 'success' : 'error' })
+}
+
+function onDeliverDoc(row: any) {
+  docDeliverForm.documentId = row.id
+  docDeliverForm.title = row.title
+  docDeliverForm.docKind = row.doc_type
+  dlg.docDeliver = true
+}
+
+async function onDocDeliverSubmit() {
+  await client.post(`/bureau/cases/${id}/doc-deliveries`, docDeliverForm)
+  ElMessage.success('文书送达已登记')
+  dlg.docDeliver = false
+  load()
+}
+
+async function onApply() {
+  if (!applyForm.reason.trim()) {
+    ElMessage.warning('请填写理由')
+    return
+  }
+  await client.post('/bureau/approvals', {
+    kind: applyForm.kind, caseId: Number(id),
+    payload: applyForm.kind === 'EXTEND' ? { days: applyForm.days } : null,
+    reason: applyForm.reason,
+  })
+  ElMessage.success('已提交，待负责人在"待办审批"裁决')
+  dlg.apply = false
+  load()
+}
+
+async function onAddAgreement() {
+  const { value: action } = await ElMessageBox.prompt(
+    '处理类型：INTERVIEW 约谈 / SUSPEND_AGREEMENT 暂停协议 / TERMINATE_AGREEMENT 解除协议 / REFUSE_PAY 拒付 / RECOVER 追回',
+    '移交经办处理', { inputValue: 'REFUSE_PAY', inputPattern: /^(INTERVIEW|SUSPEND_AGREEMENT|TERMINATE_AGREEMENT|REFUSE_PAY|RECOVER)$/, inputErrorMessage: '类型无效' })
+  await client.post(`/bureau/cases/${id}/agreement-actions`, { action, org: '医保经办机构' })
+  ElMessage.success('已移交')
+  load()
+}
+
+async function onReplyAgreement(row: any) {
+  const { value } = await ElMessageBox.prompt('经办办理结果', '登记结果', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/agreement-actions/${row.id}/reply`, { result: value })
+  ElMessage.success('已登记')
+  load()
+}
+
+async function onPrintArchive() {
+  const d = (await client.get(`/bureau/cases/${id}/archive-full`)).data.data
+  const cat = (await client.get(`/bureau/cases/${id}/archive-catalog`)).data.data
+  const order: Record<number, number> = {}
+  cat.catalog.forEach((x: any) => { order[x.id] = x.seq })
+  const docs = [...d.documents].sort((a: any, b: any) => (order[a.id] || 99) - (order[b.id] || 99))
+  const sigOf = (docId: number) => d.signatures.filter((s: any) => s.document_id === docId)
+    .map((s: any) => `［电子签章］${s.signer}（${s.signed_at?.slice(0, 10)}，${s.provider}）`).join('　')
+  const w = window.open('', '_blank')
+  if (!w) return
+  const pages = docs.map((doc: any, i: number) => `
+    <section class="page"><h2>${doc.title}</h2>
+    <pre>${doc.content}</pre>
+    <p class="sig">${sigOf(doc.id)}</p>
+    <p class="foot">第 ${i + 2} 页</p></section>`).join('')
+  const toc = docs.map((doc: any, i: number) => `<tr><td>${i + 1}</td><td>${doc.title}</td><td>${doc.made_at}</td><td>${i + 2}</td></tr>`).join('')
+  w.document.write(`<html><head><title>${d.caseFile.case_no} 卷宗</title><style>
+    body{font-family:SimSun,serif;line-height:1.9}
+    .page{page-break-after:always;padding:40px 50px;min-height:90vh;position:relative}
+    h1,h2{text-align:center} pre{white-space:pre-wrap;font-family:inherit;font-size:15px}
+    table{width:100%;border-collapse:collapse}td,th{border:1px solid #333;padding:4px 8px;font-size:14px}
+    .sig{margin-top:24px;font-size:13px;color:#333}
+    .foot{position:absolute;bottom:16px;left:0;right:0;text-align:center;font-size:12px;color:#666}
+    </style></head><body>
+    <section class="page"><h1>${d.orgName}<br/>行政处罚案卷</h1>
+      <p style="text-align:center;font-size:18px">${d.caseFile.name}</p>
+      <p style="text-align:center">案号：${d.caseFile.case_no}　案卷号：${d.caseFile.archive_no || '（未结案）'}</p>
+      <h2>卷内目录</h2>
+      <table><tr><th>序号</th><th>文书名称</th><th>日期</th><th>页码</th></tr>${toc}</table>
+      <p class="foot">第 1 页</p></section>
+    ${pages}</body></html>`)
+  w.document.close()
+  w.print()
 }
 
 function printDoc() {

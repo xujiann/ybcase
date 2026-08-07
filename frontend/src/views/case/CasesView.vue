@@ -3,7 +3,10 @@
     <div class="toolbar">
       <h3>案件办理<span class="hint">（普通程序自立案之日起 90 日内作出处理决定）</span></h3>
       <div>
-        <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 130px; margin-right: 8px" @change="load">
+        <el-input v-model="q" placeholder="案号/案名/当事人" clearable style="width: 200px; margin-right: 8px"
+                  @keyup.enter="() => { page = 1; load() }" @clear="() => { page = 1; load() }" />
+        <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 130px; margin-right: 8px"
+                   @change="() => { page = 1; load() }">
           <el-option v-for="(v, k) in CASE_STATUS" :key="k" :label="v" :value="k" />
         </el-select>
         <el-button type="primary" @click="openCreate()">立案</el-button>
@@ -27,6 +30,9 @@
       </el-table-column>
       <el-table-column prop="amountInvolved" label="涉案金额" width="110" align="right" />
     </el-table>
+    <el-pagination style="margin-top: 12px; justify-content: flex-end"
+                   layout="total, prev, pager, next" :total="total" :page-size="pageSize"
+                   :current-page="page" @current-change="(p: number) => { page = p; load() }" />
 
     <el-dialog v-model="createVisible" title="立案（执法人员不得少于两人）" width="640px">
       <el-form :model="form" label-width="110px">
@@ -116,6 +122,10 @@ const causes = ref<any[]>([])
 const loading = ref(false)
 const statusFilter = ref('')
 const createVisible = ref(false)
+const q = ref('')
+const page = ref(1)
+const pageSize = 20
+const total = ref(0)
 
 const emptyOfficers = () => [
   { name: '', certNo: '', duty: 'LEAD' },
@@ -133,8 +143,17 @@ const enforceItems = ref<any[]>([])
 async function load() {
   loading.value = true
   try {
-    const resp = await client.get('/bureau/cases', { params: statusFilter.value ? { status: statusFilter.value } : {} })
-    records.value = resp.data.data
+    const params: any = { page: page.value, size: pageSize }
+    if (statusFilter.value) params.status = statusFilter.value
+    if (q.value.trim()) params.q = q.value.trim()
+    const resp = await client.get('/bureau/cases', { params })
+    // 分页接口返回 snake_case 行（JdbcTemplate），统一映射展示字段
+    records.value = resp.data.data.rows.map((r: any) => ({
+      id: r.id, caseNo: r.case_no, name: r.name, partyType: r.party_type,
+      procedureType: r.procedure_type, filedAt: r.filed_at, deadlineAt: r.deadline_at,
+      status: r.status, amountInvolved: r.amount_involved,
+    }))
+    total.value = resp.data.data.total
   } finally {
     loading.value = false
   }

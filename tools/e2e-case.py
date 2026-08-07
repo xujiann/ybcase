@@ -443,8 +443,8 @@ def main():
     e_case_before = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
     admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews", json={"experts": "临床专家A、医保专家B"})
     er_start = str(today - datetime.timedelta(days=4))
-    ers = admin.get(f"/bureau/cases/{d_case['id']}")  # 取评审id：detail无该表，直接查执行——改用固定id=1? 用返回列表
-    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews/1/end", json={
+    er_id = admin.get(f"/bureau/cases/{d_case['id']}")["expertReviews"][-1]["id"]  # 用本次创建的真实 id，非全新库也可跑
+    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews/{er_id}/end", json={
         "opinion": "病历评审意见：过度诊疗成立", "startedAt": er_start, "endedAt": str(today)})
     e_case_after = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
     ok(datetime.date.fromisoformat(e_case_after) - datetime.date.fromisoformat(e_case_before)
@@ -657,6 +657,110 @@ def main():
 
     step("专家评审列表进入案件详情（含UI数据源）")
     ok("expertReviews" in admin.get(f"/bureau/cases/{d_case['id']}"), "expertReviews 已在详情聚合")
+
+    # ============ v1.1：正式化能力 ============
+    step("文书模板管理：修改留历史")
+    tpls = admin.get("/bureau/doc-templates")
+    ok(any(t["doc_type"] == "TRANSFER_LETTER" for t in tpls), "行刑衔接模板已内置")
+    old_tpl = next(t for t in tpls if t["doc_type"] == "ASSIST_LETTER")
+    admin.call("PUT", "/bureau/doc-templates/ASSIST_LETTER",
+               json={"titleTpl": old_tpl["title_tpl"], "contentTpl": old_tpl["content_tpl"] + "\n（v1.1 修订）"})
+    hist = admin.get("/bureau/doc-templates/ASSIST_LETTER/history")
+    ok(len(hist) >= 1, "旧版已入历史")
+
+    step("电子签章 SPI：签章+验签（Mock=SHA-256 摘要，防篡改基准）")
+    docs_h = admin.get(f"/bureau/cases/{hid}")["documents"]
+    target_doc = docs_h[0]
+    sig = admin.post(f"/bureau/cases/{hid}/documents/{target_doc['id']}/sign",
+                     json={"signer": "王办案", "signerRole": "OFFICER"})
+    ok(sig["provider"] == "MOCK" and len(sig["contentHash"]) == 64, "签章生成")
+    vres = admin.get(f"/bureau/cases/{hid}/documents/{target_doc['id']}/verify")
+    ok(len(vres) == 1 and vres[0]["valid"] is True, "验签有效")
+
+    step("审批单据化：办案员申请延期→局长批准→期限顺延（第17条精神）")
+    ap = banban.post("/bureau/approvals", json={
+        "kind": "EXTEND", "caseId": q_case["id"], "payload": {"days": 5}, "reason": "补充鉴定"})
+    banban.post(f"/bureau/approvals/{ap['id']}/decide", json={"approve": True}, expect_code=403)
+    before_dl = admin.get(f"/bureau/cases/{q_case['id']}")["caseFile"]["deadlineAt"]
+    juzhang.post(f"/bureau/approvals/{ap['id']}/decide", json={"approve": True, "opinion": "同意"})
+    after_dl = admin.get(f"/bureau/cases/{q_case['id']}")["caseFile"]["deadlineAt"]
+    ok(datetime.date.fromisoformat(after_dl) == datetime.date.fromisoformat(before_dl) + datetime.timedelta(days=5),
+       "批准即执行，期限+5")
+
+    step("立案审批单：申请→驳回→不产生案件；再申请→批准→产生案件")
+    file_payload = {
+        "causeId": cause13["id"], "partyName": "审批立案医院", "partyType": "PROVIDER",
+        "summary": "审批流立案", "officers": [
+            {"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+            {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]}
+    ap2 = banban.post("/bureau/approvals", json={
+        "kind": "FILE_CASE", "payload": file_payload, "reason": "线索核查属实，申请立案"})
+    juzhang.post(f"/bureau/approvals/{ap2['id']}/decide", json={"approve": False, "opinion": "证据不足"})
+    ap3 = banban.post("/bureau/approvals", json={
+        "kind": "FILE_CASE", "payload": file_payload, "reason": "已补充证据，再次申请"})
+    r3 = juzhang.post(f"/bureau/approvals/{ap3['id']}/decide", json={"approve": True, "opinion": "同意立案"})
+    ok(r3["result"].get("caseNo"), f"审批立案成功 {r3['result'].get('caseNo')}")
+
+    step("送达泛化：告知书电子送达无确认书拒（2054）；直接送达登记回证")
+    admin.post(f"/bureau/cases/{d_case['id']}/doc-deliveries", json={
+        "docKind": "NOTICE", "method": "ELECTRONIC", "receiver": "当事人"}, expect_code=2054)
+    admin.post(f"/bureau/cases/{d_case['id']}/doc-deliveries", json={
+        "docKind": "NOTICE", "method": "DIRECT", "receiver": "当事人", "receiptNo": "告知回证-001"})
+    dels = admin.get(f"/bureau/cases/{d_case['id']}")["deliveries"]
+    ok(any(x.get("doc_kind") == "NOTICE" for x in dels), "文书级送达已入台账")
+
+    step("协议处理台账：移交经办→登记结果（行政↔协议联动）")
+    admin.post(f"/bureau/cases/{d_case['id']}/agreement-actions",
+               json={"action": "REFUSE_PAY", "org": "市医保事务服务中心"})
+    aa = admin.get(f"/bureau/cases/{d_case['id']}")["agreementActions"][0]
+    admin.post(f"/bureau/agreement-actions/{aa['id']}/reply", json={"result": "已拒付相关费用并冻结结算"})
+    ok(admin.get(f"/bureau/cases/{d_case['id']}")["agreementActions"][0]["replied_at"], "经办结果闭环")
+
+    step("行刑衔接回执：司法移送登记受案回执")
+    admin.post("/bureau/transfers", json={
+        "caseId": j_case["id"], "direction": "OUT", "targetOrg": "市公安局",
+        "kind": "JUDICIAL", "reason": "涉嫌诈骗罪移送"})
+    trs2 = admin.get("/bureau/transfers")
+    jt = next(t for t in trs2 if t.get("kind") == "JUDICIAL")
+    admin.post(f"/bureau/transfers/{jt['id']}/receipt", json={"receiptNo": "公（治）受案字〔2026〕001号"})
+    ok(any(t.get("receipt_no") for t in admin.get("/bureau/transfers")), "受案回执登记")
+
+    step("附件外置存储（FILE 模式）+音像分类")
+    admin.call("PUT", "/config/attachment_storage?value=FILE")
+    try:
+        files = {"file": ("现场执法记录.mp4", b"FAKE_VIDEO" * 1000, "video/mp4")}
+        r_av = requests.post(f"{BASE}/bureau/cases/{d_case['id']}/attachments",
+                             files=files, data={"category": "AV_RECORD"}, timeout=30,
+                             headers={"Authorization": f"Bearer {admin.token}"})
+        assert r_av.json()["code"] == 0, r_av.text
+        atts2 = admin.get(f"/bureau/cases/{d_case['id']}/attachments")
+        av = next(a for a in atts2 if a["category"] == "AV_RECORD")
+        ok(av["external"] is True, "音像件外置存储")
+        dl2 = requests.get(f"{BASE}/bureau/cases/attachments/{av['id']}/download", timeout=15,
+                           headers={"Authorization": f"Bearer {admin.token}"})
+        ok(dl2.content.startswith(b"FAKE_VIDEO"), "外置文件下载一致")
+    finally:
+        admin.call("PUT", "/config/attachment_storage?value=DB")
+
+    step("全局搜索+案件分页")
+    sr = admin.get("/bureau/search", params={"q": "第一医院"})
+    ok(len(sr["cases"]) >= 1, f"搜索命中 {len(sr['cases'])} 案")
+    pg = admin.get("/bureau/cases", params={"page": 1, "size": 5})
+    ok(pg["total"] >= 5 and len(pg["rows"]) == 5, f"分页 total={pg['total']}")
+
+    step("审计导出（等保归档）")
+    month = str(today)[:7]
+    r_csv = requests.get(f"{BASE}/bureau/audit/export", params={"month": month}, timeout=15,
+                         headers={"Authorization": f"Bearer {admin.token}"})
+    ok(r_csv.status_code == 200 and len(r_csv.content) > 200, f"审计 CSV {len(r_csv.content)} 字节")
+
+    step("监控拉取 SPI（Mock 空源，链路可用）")
+    fm = admin.post("/bureau/clues/fetch-monitor")
+    ok(fm["fetched"] == 0 and "Mock" in fm["adapter"], f"适配器 {fm['adapter']}")
+
+    step("卷宗合成数据源（含签章）")
+    af = admin.get(f"/bureau/cases/{hid}/archive-full")
+    ok(len(af["documents"]) >= 1 and len(af["signatures"]) >= 1 and af["orgName"], "卷宗合成可打印")
 
     # ============ 五期：协同与上线 ============
     step("智能监控线索批量导入（source=MONITOR）")

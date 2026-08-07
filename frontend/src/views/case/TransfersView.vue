@@ -23,6 +23,13 @@
           <el-button v-else size="small" text type="primary" @click="onConfirm(row)">确认接收</el-button>
         </template>
       </el-table-column>
+      <el-table-column label="受案回执（行刑衔接）" width="180">
+        <template #default="{ row }">
+          <span v-if="row.receipt_no">{{ row.receipt_no }}（{{ row.receipt_at }}）</span>
+          <el-button v-else-if="row.kind === 'JUDICIAL'" size="small" text type="primary" @click="onReceipt(row)">登记回执</el-button>
+          <span v-else class="hint">-</span>
+        </template>
+      </el-table-column>
     </el-table>
 
     <el-dialog v-model="dlg" title="登记移送" width="520px">
@@ -53,7 +60,7 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '../../api/client'
 
 const KIND: Record<string, string> = { ADMIN: '其他行政机关', JUDICIAL: '司法机关', MSA: '医保部门间' }
@@ -84,6 +91,13 @@ async function onCreate() {
 
 async function onConfirm(row: any) {
   await client.post(`/bureau/transfers/${row.id}/confirm`)
+  load()
+}
+
+async function onReceipt(row: any) {
+  const { value } = await ElMessageBox.prompt('受案回执文号（公安/检察机关出具）', '登记回执', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/transfers/${row.id}/receipt`, { receiptNo: value })
+  ElMessage.success('回执已登记')
   load()
 }
 
