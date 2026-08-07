@@ -5,3 +5,7 @@ dist/
 components.d.ts
 *.log
 .DS_Store
+deploy/.env
+deploy/dist/
+deploy/*.jar
+deploy/*.dump

@@ -1,0 +1,18 @@
+# 有域名：自动签发 HTTPS（Let's Encrypt）。DEMO_DOMAIN 在 .env 里配，如 demo.example.com
+# 无域名裸 IP 演示：把第一行改成 :80 （无 HTTPS，仅限临时）
+{$DEMO_DOMAIN}
+
+encode gzip
+
+# API 反代到后端（actuator 不对公网暴露）
+@api path /api/*
+handle @api {
+    reverse_proxy app:8090
+}
+
+# SPA 静态资源 + 前端路由回退
+handle {
+    root * /srv/dist
+    try_files {path} /index.html
+    file_server
+}

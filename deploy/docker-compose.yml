@@ -1,0 +1,56 @@
+# 公网演示部署（单机 Docker Compose）：Caddy(443 自动HTTPS) → 前端dist + /api→app → PostgreSQL
+# 用法见 deploy/README-公网演示.md；敏感值全部来自同目录 .env（勿提交真实 .env）
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ybcase
+      POSTGRES_USER: hip
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hip -d ybcase"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # 不映射 5432 到宿主机：数据库只在 compose 内网可达
+
+  app:
+    image: eclipse-temurin:21-jre
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./ybcase-server.jar:/app/ybcase-server.jar:ro
+    environment:
+      YBCASE_DB_URL: jdbc:postgresql://db:5432/ybcase
+      YBCASE_DB_USER: hip
+      YBCASE_DB_PASSWORD: ${DB_PASSWORD}
+      YBCASE_JWT_SECRET: ${JWT_SECRET}
+    command: ["java", "-Xms256m", "-Xmx768m", "-jar", "/app/ybcase-server.jar",
+              "--spring.profiles.active=pilot"]
+    # 8090 不暴露公网，仅供 caddy 反代
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./dist:/srv/dist:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DEMO_DOMAIN: ${DEMO_DOMAIN}
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
