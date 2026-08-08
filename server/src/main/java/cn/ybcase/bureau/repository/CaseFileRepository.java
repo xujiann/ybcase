@@ -11,5 +11,4 @@ public interface CaseFileRepository extends JpaRepository<CaseFile, Long> {
 
     List<CaseFile> findByStatusOrderByIdDesc(String status);
 
-    long countByCaseNoStartingWith(String prefix);
 }

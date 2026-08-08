@@ -30,9 +30,10 @@ public class BureauAuditFilter extends OncePerRequestFilter {
             filterChain.doFilter(request, response);
         } finally {
             String uri = request.getRequestURI();
-            // 全部写操作 + 敏感读取（附件下载/公示导出/审计查询）留痕
+            // 全部写操作 + 敏感读取（附件下载/公示导出/审计查询/反馈截图/卷宗合成）留痕
             boolean sensitiveRead = "GET".equals(request.getMethod())
-                    && (uri.contains("/download") || uri.contains("/publish-export") || uri.startsWith("/api/audit"));
+                    && (uri.contains("/download") || uri.contains("/publish-export") || uri.startsWith("/api/audit")
+                        || uri.contains("/screenshot") || uri.contains("/archive-full"));
             if ((WRITE_METHODS.contains(request.getMethod()) || sensitiveRead)
                     && uri.startsWith("/api")
                     && !uri.equals("/api/auth/login")) {

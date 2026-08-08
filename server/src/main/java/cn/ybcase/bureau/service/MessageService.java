@@ -90,6 +90,18 @@ public class MessageService {
                 n++;
             }
         }
+        // 已解决反馈超期未确认 → 自动关闭并告知提交人
+        int autoDays = config.intVal("feedback_autoclose_days", 7);
+        for (var r : jdbc.queryForList("""
+                select id, username, title from feedback
+                where status = 'RESOLVED' and handled_at <= now() - make_interval(days => ?)""", autoDays)) {
+            jdbc.update("update feedback set status = 'CLOSED' where id = ? and status = 'RESOLVED'", r.get("id"));
+            send((String) r.get("username"), "SYSTEM",
+                    "反馈「" + r.get("title") + "」已自动关闭",
+                    "已解决满 " + autoDays + " 天未确认，系统自动关闭；如未解决请重新提交",
+                    "/my/feedback", "FEEDBACK-AUTOCLOSE-" + r.get("id"));
+            n++;
+        }
         log.info("期限提醒生成 {} 条", n);
         return n;
     }

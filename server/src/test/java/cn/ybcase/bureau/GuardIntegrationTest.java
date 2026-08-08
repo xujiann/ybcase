@@ -105,6 +105,25 @@ class GuardIntegrationTest {
     }
 
     @Test
+    void 立案审批payload含LocalDate字段可正确执行() {
+        // violationEndDate 走 JSON 存 payload 再反序列化为 LocalDate（须 JavaTime 模块，回归 ObjectMapper 注入修复）
+        var cause = providerCause();
+        String party = "IT-立案审批" + System.nanoTime();
+        long id = approvalService.apply(new ApprovalService.ApplyReq("FILE_CASE", null, null,
+                Map.of("causeId", cause.getId(), "procedureType", "NORMAL",
+                        "partyName", party, "partyType", "PROVIDER",
+                        "summary", "含时效日期的立案审批", "amountInvolved", 100,
+                        "violationEndDate", java.time.LocalDate.now().minusMonths(6).toString(),
+                        "healthHarm", false,
+                        "officers", List.of(
+                                Map.of("name", "王办案", "certNo", "YB001", "duty", "LEAD"),
+                                Map.of("name", "张协办", "certNo", "YB002", "duty", "MEMBER"))),
+                "立案审批表"), "banban");
+        var result = approvalService.decide(id, true, "同意立案", "juzhang");
+        assertTrue((Boolean) result.get("approved"));
+    }
+
+    @Test
     void 审批驳回不执行动作() {
         CaseFile c = caseService.create(req("IT-驳回" + System.nanoTime(), TWO), "banban");
         long id = approvalService.apply(new ApprovalService.ApplyReq(

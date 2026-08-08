@@ -9,5 +9,4 @@ public interface CaseDecisionRepository extends JpaRepository<CaseDecision, Long
 
     Optional<CaseDecision> findByCaseId(Long caseId);
 
-    long countByDecisionNoStartingWith(String prefix);
 }

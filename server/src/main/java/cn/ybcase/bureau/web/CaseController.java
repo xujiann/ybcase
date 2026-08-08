@@ -18,6 +18,7 @@ import java.util.Map;
 public class CaseController {
 
     private final CaseService caseService;
+    private final cn.ybcase.bureau.service.ApprovalService approvalService;
     private final cn.ybcase.bureau.service.EvidenceService evidenceService;
     private final cn.ybcase.bureau.service.ExecutionService executionService;
     private final cn.ybcase.bureau.service.DocumentService documentService;
@@ -112,7 +113,8 @@ public class CaseController {
     }
 
     @GetMapping("/{id}/documents/{docId}")
-    public R<Map<String, Object>> document(@PathVariable Long id, @PathVariable Long docId) {
+    public R<Map<String, Object>> document(@PathVariable Long id, @PathVariable Long docId, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), privileged(auth));
         return R.ok(caseService.documentDetail(id, docId));
     }
 
@@ -124,13 +126,15 @@ public class CaseController {
 
     /** 案卷目录（一案一卷排序+齐全性检查，第57条） */
     @GetMapping("/{id}/archive-catalog")
-    public R<Map<String, Object>> archiveCatalog(@PathVariable Long id) {
+    public R<Map<String, Object>> archiveCatalog(@PathVariable Long id, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), privileged(auth));
         return R.ok(documentService.archiveCatalog(id));
     }
 
     /** 案件大事记（全过程记录时间轴，第4/35条） */
     @GetMapping("/{id}/timeline")
-    public R<List<Map<String, Object>>> timeline(@PathVariable Long id) {
+    public R<List<Map<String, Object>>> timeline(@PathVariable Long id, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), privileged(auth));
         return R.ok(documentService.timeline(id));
     }
 
@@ -142,8 +146,11 @@ public class CaseController {
 
     @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 中止批准（局令：负责人职权）
     @PostMapping("/{id}/suspend")
-    public R<CaseFile> suspend(@PathVariable Long id, @RequestBody Map<String, String> body) {
-        return R.ok(caseService.suspend(id, body.get("reason")));
+    public R<CaseFile> suspend(@PathVariable Long id, @RequestBody Map<String, String> body,
+                               Authentication auth) {
+        CaseFile r = caseService.suspend(id, body.get("reason"));
+        approvalService.recordDirect("SUSPEND", id, body.get("reason"), auth.getName());
+        return R.ok(r);
     }
 
     @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 恢复（局令：负责人职权）
@@ -154,15 +161,22 @@ public class CaseController {
 
     @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 终止批准（局令：负责人职权）
     @PostMapping("/{id}/terminate")
-    public R<CaseFile> terminate(@PathVariable Long id, @RequestBody Map<String, String> body) {
-        return R.ok(caseService.terminate(id, body.get("reason")));
+    public R<CaseFile> terminate(@PathVariable Long id, @RequestBody Map<String, String> body,
+                                 Authentication auth) {
+        CaseFile r = caseService.terminate(id, body.get("reason"));
+        approvalService.recordDirect("TERMINATE", id, body.get("reason"), auth.getName());
+        return R.ok(r);
     }
 
     @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 延期批准（局令：负责人职权）
     @PostMapping("/{id}/extend")
-    public R<CaseFile> extend(@PathVariable Long id, @RequestBody Map<String, Object> body) {
-        return R.ok(caseService.extend(id, ((Number) body.get("days")).intValue(),
-                (String) body.get("reason")));
+    public R<CaseFile> extend(@PathVariable Long id, @RequestBody Map<String, Object> body,
+                              Authentication auth) {
+        CaseFile r = caseService.extend(id, ((Number) body.get("days")).intValue(),
+                (String) body.get("reason"));
+        approvalService.recordDirect("EXTEND", id,
+                "延长" + body.get("days") + "日：" + body.get("reason"), auth.getName());
+        return R.ok(r);
     }
 
     @PostMapping("/{id}/report")
@@ -229,14 +243,17 @@ public class CaseController {
     }
 
     @GetMapping("/{id}/late-fee-quote")
-    public R<Map<String, Object>> lateFeeQuote(@PathVariable Long id) {
+    public R<Map<String, Object>> lateFeeQuote(@PathVariable Long id, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), privileged(auth));
         return R.ok(executionService.lateFeeQuote(id));
     }
 
     @PreAuthorize("hasAnyRole('LEADER','ADMIN')")  // 暂缓分期批准（局令：负责人职权）
     @PostMapping("/{id}/approve-defer")
-    public R<CaseFile> approveDefer(@PathVariable Long id) {
-        return R.ok(executionService.approveDefer(id));
+    public R<CaseFile> approveDefer(@PathVariable Long id, Authentication auth) {
+        CaseFile r = executionService.approveDefer(id);
+        approvalService.recordDirect("DEFER", id, null, auth.getName());
+        return R.ok(r);
     }
 
     @PostMapping("/{id}/court-enforce")

@@ -28,9 +28,16 @@ public class AttachmentController {
     private static final long MAX_SIZE = 10 * 1024 * 1024;
 
     private final cn.ybcase.bureau.service.BureauConfig config;
+    private final cn.ybcase.bureau.service.CaseService caseService;
 
     /** 音像类（执法记录仪等）建议 FILE 外置且限额放宽到 200MB */
     private static final long MAX_AV_SIZE = 200L * 1024 * 1024;
+
+    private static boolean isPrivileged(Authentication auth) {
+        return auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
+                        || a.getAuthority().equals("ROLE_ADMIN"));
+    }
 
     @PostMapping("/{id}/attachments")
     public R<Void> upload(@PathVariable Long id, @RequestParam("file") MultipartFile file,
@@ -72,7 +79,8 @@ public class AttachmentController {
     }
 
     @GetMapping("/{id}/attachments")
-    public R<List<Map<String, Object>>> list(@PathVariable Long id) {
+    public R<List<Map<String, Object>>> list(@PathVariable Long id, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), isPrivileged(auth));
         return R.ok(jdbc.queryForList("""
                 select id, document_id, evidence_id, filename, content_type, size_bytes, category,
                        (file_path is not null) as external, uploaded_by, uploaded_at
@@ -80,10 +88,12 @@ public class AttachmentController {
     }
 
     @GetMapping("/attachments/{attachmentId}/download")
-    public ResponseEntity<byte[]> download(@PathVariable Long attachmentId) throws IOException {
+    public ResponseEntity<byte[]> download(@PathVariable Long attachmentId, Authentication auth) throws IOException {
         var rows = jdbc.queryForList(
-                "select filename, content_type, data, file_path from case_attachment where id = ?", attachmentId);
+                "select case_id, filename, content_type, data, file_path from case_attachment where id = ?", attachmentId);
         if (rows.isEmpty()) return ResponseEntity.notFound().build();
+        caseService.assertInScope(((Number) rows.get(0).get("case_id")).longValue(),
+                auth.getName(), isPrivileged(auth));
         var row = rows.get(0);
         byte[] body = row.get("file_path") != null
                 ? java.nio.file.Files.readAllBytes(java.nio.file.Path.of((String) row.get("file_path")))

@@ -86,13 +86,17 @@ public class ApprovalService {
                 kind, caseId, reason == null ? "（直接操作）" : reason, operator, operator);
     }
 
-    public List<Map<String, Object>> pending() {
-        return jdbc.queryForList("""
+    /** applicant 非空时只看本人提交的（非负责人/管理员视角） */
+    public List<Map<String, Object>> pending(String applicant) {
+        String base = """
                 select a.*, cf.case_no, cf.name as case_name, c.clue_no
                 from biz_approval a
                 left join case_file cf on cf.id = a.case_id
                 left join case_clue c on c.id = a.clue_id
-                where a.status = 'PENDING' order by a.id""");
+                where a.status = 'PENDING'""";
+        return applicant == null
+                ? jdbc.queryForList(base + " order by a.id")
+                : jdbc.queryForList(base + " and a.applicant = ? order by a.id", applicant);
     }
 
     public List<Map<String, Object>> byCase(Long caseId) {

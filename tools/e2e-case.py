@@ -676,6 +676,7 @@ def main():
     ok(sig["provider"] == "MOCK" and len(sig["contentHash"]) == 64, "签章生成")
     vres = admin.get(f"/bureau/cases/{hid}/documents/{target_doc['id']}/verify")
     ok(len(vres) == 1 and vres[0]["valid"] is True, "验签有效")
+    ok(vres[0]["operator"] == "admin", "签章记录含实际操作人（signer 署名≠operator 登录人可追溯）")
 
     step("审批单据化：办案员申请延期→局长批准→期限顺延（第17条精神）")
     ap = banban.post("/bureau/approvals", json={
@@ -808,16 +809,44 @@ def main():
         banban.get(f"/bureau/cases/{scope_case['id']}", expect_code=2080)
         juzhang.get(f"/bureau/cases/{scope_case['id']}")  # 负责人不受限
         print("    PASS: 负责人全局可见")
+        # 侧门读接口同样 2080（第二轮整改：详情之外的旁路一并封堵）
+        banban.get(f"/bureau/cases/{scope_case['id']}/timeline", expect_code=2080)
+        banban.get(f"/bureau/cases/{scope_case['id']}/archive-full", expect_code=2080)
+        banban.get(f"/bureau/cases/{scope_case['id']}/attachments", expect_code=2080)
+        banban.get(f"/bureau/cases/{scope_case['id']}/installments", expect_code=2080)
+        banban.get(f"/bureau/cases/{scope_case['id']}/discretion-suggest", expect_code=2080)
+        print("    PASS: 大事记/卷宗/附件/分期/裁量侧门全部 2080")
+        sr_bb = banban.get("/bureau/search", params={"q": "范围隔离"})
+        ok(all(c_["id"] != scope_case["id"] for c_ in sr_bb["cases"]), "SELF 下全局搜索不含隔离案")
+        sr_ju = juzhang.get("/bureau/search", params={"q": "范围隔离"})
+        ok(any(c_["id"] == scope_case["id"] for c_ in sr_ju["cases"]), "负责人搜索可见")
     finally:
         admin.call("PUT", "/config/case_view_scope?value=ALL")
     banban.get(f"/bureau/cases/{scope_case['id']}")
     print("    PASS: ALL 范围恢复")
 
+    step("负责人直接延期：自动补记『申请即批准』审批单（凡批准必有单）")
+    juzhang.post(f"/bureau/cases/{scope_case['id']}/extend", json={"days": 10, "reason": "直接批准回归"})
+    aps_direct = admin.get(f"/bureau/cases/{scope_case['id']}/approvals")
+    ok(any(a["kind"] == "EXTEND" and a["status"] == "APPROVED" and a["opinion"] == "负责人直接批准"
+           and a["approver"] == "juzhang" for a in aps_direct), "直接延期已补单")
+
+    step("待批列表：非裁决角色仅见本人申请")
+    own_case = next(r for r in banban.get("/bureau/cases", params={"page": 1, "size": 50, "q": "审批立案医院"})["rows"])
+    ap_pf = banban.post("/bureau/approvals", json={
+        "kind": "SUSPEND", "caseId": own_case["id"], "reason": "待批过滤回归"})
+    ok(any(a["id"] == ap_pf["id"] for a in banban.get("/bureau/approvals/pending")), "申请人可见本人待批")
+    ok(all(a["id"] != ap_pf["id"] for a in fazhi.get("/bureau/approvals/pending")), "法制看不到他人待批")
+    ok(any(a["id"] == ap_pf["id"] for a in juzhang.get("/bureau/approvals/pending")), "负责人全量可见")
+    juzhang.post(f"/bureau/approvals/{ap_pf['id']}/decide", json={"approve": False, "opinion": "回归清理"})
+
     step("案件移交：负责人变更承办人后归属生效")
     own_case = next(r for r in banban.get("/bureau/cases", params={"page": 1, "size": 50, "q": "审批立案医院"})["rows"])
     banban.post(f"/bureau/cases/{own_case['id']}/transfer-owner", json={"newOwner": "fazhi"}, expect_code=403)
+    fz_unread0 = fazhi.get("/bureau/messages/unread-count")
     moved_own = juzhang.post(f"/bureau/cases/{own_case['id']}/transfer-owner", json={"newOwner": "fazhi"})
     ok(moved_own["ownerUser"] == "fazhi", "承办人已移交 fazhi")
+    ok(fazhi.get("/bureau/messages/unread-count") > fz_unread0, "接收人收到移交消息")
 
     step("OpenAPI 文档可用（对接厂商契约）")
     docs_r = requests.get(f"{BASE.replace('/api','')}/v3/api-docs", timeout=15,
@@ -858,6 +887,12 @@ def main():
     shot = requests.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
                         headers={"Authorization": f"Bearer {admin.token}"})
     ok(shot.status_code == 200 and shot.content[1:4] == b"PNG", "截图可取")
+    shot_ju = requests.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
+                           headers={"Authorization": f"Bearer {juzhang.token}"})
+    ok(shot_ju.status_code == 403, "非本人非管理员取截图 403")
+    shot_bb = requests.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
+                           headers={"Authorization": f"Bearer {banban.token}"})
+    ok(shot_bb.status_code == 200, "提交人本人可取")
     admin.post(f"/bureau/feedback/{fb['id']}/handle",
                json={"status": "RESOLVED"}, expect_code=2091)  # 解决须回复
     bb_unread_fb = banban.get("/bureau/messages/unread-count")
@@ -870,6 +905,19 @@ def main():
     banban.post(f"/bureau/feedback/{fb['id']}/close")
     mine = banban.get("/bureau/feedback/mine")
     ok(any(m["id"] == fb["id"] and m["status"] == "CLOSED" for m in mine), "反馈 CLOSED 闭环")
+
+    step("已解决反馈超期未确认 → 提醒任务自动关闭并通知")
+    fb2 = banban.post("/bureau/feedback", json={
+        "kind": "QUESTION", "title": "自动关闭回归", "content": "提交后不确认，等系统关"})
+    admin.post(f"/bureau/feedback/{fb2['id']}/handle",
+               json={"status": "RESOLVED", "reply": "已答复"})
+    admin.call("PUT", "/config/feedback_autoclose_days?value=0")
+    try:
+        admin.post("/bureau/messages/generate-reminders")
+        mine2 = banban.get("/bureau/feedback/mine")
+        ok(any(m["id"] == fb2["id"] and m["status"] == "CLOSED" for m in mine2), "超期已自动关闭")
+    finally:
+        admin.call("PUT", "/config/feedback_autoclose_days?value=7")
 
     step("反馈导出 CSV")
     r_fcsv = requests.get(f"{BASE}/bureau/feedback/export", timeout=10,

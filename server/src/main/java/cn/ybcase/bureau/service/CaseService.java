@@ -38,6 +38,7 @@ public class CaseService {
     private final ProcedureService procedureService;
     private final BizSeqService seqService;
     private final ExecutionService executionService;
+    private final MessageService messageService;
 
     // ---------- 立案 ----------
 
@@ -652,7 +653,22 @@ public class CaseService {
         var deptRows = jdbc.queryForList("select dept_id from sys_user where username = ?", newOwner);
         if (!deptRows.isEmpty() && deptRows.get(0).get("dept_id") != null)
             c.setOwnerDeptId(((Number) deptRows.get(0).get("dept_id")).longValue());
-        return caseRepository.save(c);
+        CaseFile saved = caseRepository.save(c);
+        messageService.send(newOwner, "SYSTEM",
+                "案件移交：" + c.getCaseNo() + " 已移交给您承办",
+                operator + " 操作移交", "/case/detail/" + caseId, null);
+        return saved;
+    }
+
+    /** 全局搜索（案件部分），SELF 范围时同样收窄 */
+    public List<Map<String, Object>> searchCases(String like, String username, boolean privileged) {
+        String base = "select id, case_no, name, party_name, status, filed_at from case_file"
+                + " where (case_no ilike ? or name ilike ? or party_name ilike ?)";
+        if (scopedSelf(privileged)) {
+            return jdbc.queryForList(base + SCOPE_SQL + " order by id desc limit 20",
+                    like, like, like, username, username);
+        }
+        return jdbc.queryForList(base + " order by id desc limit 20", like, like, like);
     }
 
     public Map<String, Object> documentDetail(Long caseId, Long docId) {

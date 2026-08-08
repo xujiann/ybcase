@@ -130,6 +130,7 @@ async function onHandle() {
 
 async function viewContext(row: any) {
   cur.value = row
+  if (shotUrl.value) URL.revokeObjectURL(shotUrl.value)  // 释放上一张，避免累积占内存
   shotUrl.value = ''
   if (row.has_screenshot) {
     const resp = await client.get(`/bureau/feedback/${row.id}/screenshot`, { responseType: 'blob' })

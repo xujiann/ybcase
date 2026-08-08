@@ -11,5 +11,4 @@ public interface CaseClueRepository extends JpaRepository<CaseClue, Long> {
 
     List<CaseClue> findByStatusOrderByIdDesc(String status);
 
-    long countByClueNoStartingWith(String prefix);
 }

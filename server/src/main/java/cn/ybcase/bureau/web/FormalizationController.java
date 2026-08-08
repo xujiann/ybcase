@@ -34,29 +34,41 @@ public class FormalizationController {
     private final MonitorFeedAdapter monitorFeedAdapter;
     private final BureauConfig config;
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.bureau.service.CaseService caseService;
+
+    private static boolean privileged(Authentication auth) {
+        return auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
+                        || a.getAuthority().equals("ROLE_ADMIN"));
+    }
 
     // ---------- 电子签章 ----------
 
     @PostMapping("/cases/{caseId}/documents/{docId}/sign")
     public R<Map<String, Object>> sign(@PathVariable Long caseId, @PathVariable Long docId,
                                        @RequestBody Map<String, String> body, Authentication auth) {
+        caseService.assertInScope(caseId, auth.getName(), privileged(auth));
         var rows = jdbc.queryForList(
                 "select content from case_document where id = ? and case_id = ?", docId, caseId);
         if (rows.isEmpty()) throw new BizException(2045, "文书不存在");
         String signer = body.getOrDefault("signer", auth.getName());
         String role = body.getOrDefault("signerRole", "OFFICER");
         var result = signatureProvider.sign((String) rows.get(0).get("content"), signer);
+        // operator=登录用户：signer 可以是署名主体（如机构负责人），但谁点的签章必须可追溯
         jdbc.update("""
-                insert into doc_signature (case_id, document_id, signer, signer_role, content_hash, signature, provider)
-                values (?,?,?,?,?,?,?)""",
-                caseId, docId, signer, role, result.contentHash(), result.signature(), result.provider());
+                insert into doc_signature (case_id, document_id, signer, signer_role, content_hash, signature, provider, operator)
+                values (?,?,?,?,?,?,?,?)""",
+                caseId, docId, signer, role, result.contentHash(), result.signature(), result.provider(),
+                auth.getName());
         jdbc.update("update case_document set signed = true where id = ?", docId);
         return R.ok(Map.of("provider", result.provider(), "contentHash", result.contentHash()));
     }
 
     /** 验签：文书当前内容与签章时摘要一致性（防篡改） */
     @GetMapping("/cases/{caseId}/documents/{docId}/verify")
-    public R<List<Map<String, Object>>> verify(@PathVariable Long caseId, @PathVariable Long docId) {
+    public R<List<Map<String, Object>>> verify(@PathVariable Long caseId, @PathVariable Long docId,
+                                                Authentication auth) {
+        caseService.assertInScope(caseId, auth.getName(), privileged(auth));
         var doc = jdbc.queryForList(
                 "select content from case_document where id = ? and case_id = ?", docId, caseId);
         if (doc.isEmpty()) throw new BizException(2045, "文书不存在");
@@ -77,8 +89,10 @@ public class FormalizationController {
     }
 
     @GetMapping("/approvals/pending")
-    public R<List<Map<String, Object>>> pending() {
-        return R.ok(approvalService.pending());
+    public R<List<Map<String, Object>>> pending(Authentication auth) {
+        boolean decider = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_ADMIN"));
+        return R.ok(approvalService.pending(decider ? null : auth.getName()));
     }
 
     @GetMapping("/cases/{caseId}/approvals")
@@ -187,14 +201,11 @@ public class FormalizationController {
     // ---------- 全局搜索 ----------
 
     @GetMapping("/search")
-    public R<Map<String, Object>> search(@RequestParam String q) {
+    public R<Map<String, Object>> search(@RequestParam String q, Authentication auth) {
         if (q == null || q.trim().length() < 2) throw new BizException(2074, "关键词至少2个字符");
         String like = "%" + q.trim() + "%";
         return R.ok(Map.of(
-                "cases", jdbc.queryForList("""
-                        select id, case_no, name, party_name, status, filed_at from case_file
-                        where case_no ilike ? or name ilike ? or party_name ilike ?
-                        order by id desc limit 20""", like, like, like),
+                "cases", caseService.searchCases(like, auth.getName(), privileged(auth)),
                 "clues", jdbc.queryForList("""
                         select id, clue_no, suspect_name, status, received_at from case_clue
                         where clue_no ilike ? or suspect_name ilike ? or content ilike ?
@@ -241,7 +252,8 @@ public class FormalizationController {
     // ---------- 卷宗合成（全部文书全文+签章，前端一次打印成册） ----------
 
     @GetMapping("/cases/{caseId}/archive-full")
-    public R<Map<String, Object>> archiveFull(@PathVariable Long caseId) {
+    public R<Map<String, Object>> archiveFull(@PathVariable Long caseId, Authentication auth) {
+        caseService.assertInScope(caseId, auth.getName(), privileged(auth));
         var cf = jdbc.queryForList("select case_no, name, archive_no, closed_at from case_file where id = ?", caseId);
         if (cf.isEmpty()) throw new BizException(2043, "案件不存在");
         var docs = jdbc.queryForList("select * from case_document where case_id = ?", caseId);

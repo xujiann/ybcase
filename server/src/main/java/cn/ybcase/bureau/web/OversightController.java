@@ -20,6 +20,13 @@ public class OversightController {
 
     private final OversightService oversightService;
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.bureau.service.CaseService caseService;
+
+    private static boolean privileged(Authentication auth) {
+        return auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
+                        || a.getAuthority().equals("ROLE_ADMIN"));
+    }
 
     // 行政检查
     @GetMapping("/inspections")
@@ -77,13 +84,15 @@ public class OversightController {
 
     // 裁量建议
     @GetMapping("/cases/{id}/discretion-suggest")
-    public R<Map<String, Object>> discretionSuggest(@PathVariable Long id) {
+    public R<Map<String, Object>> discretionSuggest(@PathVariable Long id, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), privileged(auth));
         return R.ok(oversightService.discretionSuggest(id));
     }
 
     // 分期计划
     @GetMapping("/cases/{id}/installments")
-    public R<List<Map<String, Object>>> installments(@PathVariable Long id) {
+    public R<List<Map<String, Object>>> installments(@PathVariable Long id, Authentication auth) {
+        caseService.assertInScope(id, auth.getName(), privileged(auth));
         return R.ok(jdbc.queryForList("select * from case_installment where case_id = ? order by seq", id));
     }
 

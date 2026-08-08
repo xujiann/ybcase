@@ -128,6 +128,9 @@ public class FeedbackController {
     public ResponseEntity<byte[]> screenshot(@PathVariable Long id, Authentication auth) {
         var rows = jdbc.queryForList("select username, screenshot from feedback where id = ?", id);
         if (rows.isEmpty() || rows.get(0).get("screenshot") == null) return ResponseEntity.notFound().build();
+        boolean admin = auth.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
+        if (!admin && !auth.getName().equals(rows.get(0).get("username")))
+            return ResponseEntity.status(403).build();
         return ResponseEntity.ok().contentType(MediaType.IMAGE_PNG).body((byte[]) rows.get(0).get("screenshot"));
     }
 
