@@ -147,20 +147,30 @@ public class OversightService {
     // ---------- 专家评审（第25条，期间不计入办案期限） ----------
 
     @Transactional
-    public void startExpertReview(Long caseId, String experts) {
+    /** 起始日在"启动评审"时登记（可为实际开始日，受校验），结束时不得再改——否则期限扣除等于由客户端随意设定 */
+    public void startExpertReview(Long caseId, String experts, LocalDate startedAt) {
         if (experts == null || experts.isBlank()) throw new BizException(2066, "须填写评审专家");
+        var cf = jdbc.queryForList("select filed_at from case_file where id = ?", caseId);
+        if (cf.isEmpty()) throw new BizException(2043, "案件不存在");
+        LocalDate filedAt = ((java.sql.Date) cf.get(0).get("filed_at")).toLocalDate();
+        LocalDate start = startedAt == null ? LocalDate.now() : startedAt;
+        if (start.isBefore(filedAt)) throw new BizException(2066, "评审开始日期不得早于立案日期（" + filedAt + "）");
+        if (start.isAfter(LocalDate.now())) throw new BizException(2066, "评审开始日期不得晚于今天");
         jdbc.update("insert into expert_review (case_id, experts, started_at) values (?,?,?)",
-                caseId, experts, LocalDate.now());
+                caseId, experts, start);
     }
 
     @Transactional
     public void endExpertReview(Long caseId, Long reviewId, String opinion, LocalDate startedAt, LocalDate endedAt) {
         if (opinion == null || opinion.isBlank()) throw new BizException(2066, "须填写评审意见");
-        LocalDate end = endedAt != null ? endedAt : LocalDate.now();
         var rows = jdbc.queryForList("select started_at from expert_review where id = ? and case_id = ? and ended_at is null",
                 reviewId, caseId);
         if (rows.isEmpty()) throw new BizException(2066, "评审不存在或已结束");
-        LocalDate start = startedAt != null ? startedAt : ((java.sql.Date) rows.get(0).get("started_at")).toLocalDate();
+        // 起始日一律取库内登记值：允许调用方自带 startedAt 等于把期限扣除交给客户端随意设定
+        LocalDate start = ((java.sql.Date) rows.get(0).get("started_at")).toLocalDate();
+        LocalDate end = endedAt != null ? endedAt : LocalDate.now();
+        if (end.isBefore(start)) throw new BizException(2066, "评审结束日期不得早于开始日期（" + start + "）");
+        if (end.isAfter(LocalDate.now())) throw new BizException(2066, "评审结束日期不得晚于今天");
         jdbc.update("update expert_review set ended_at = ?, opinion = ? where id = ?", end, opinion, reviewId);
         // 第45条：专家评审时间不计入办案期限——自动登记期限扣除
         jdbc.update("insert into case_period_exclusion (case_id, reason, start_at, end_at, note) values (?,?,?,?,?)",

@@ -4,6 +4,15 @@
 
 encode gzip
 
+# 安全响应头：令牌存 localStorage 且会话 12 小时，须防点击劫持与 MIME 嗅探
+header {
+    X-Frame-Options "DENY"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "same-origin"
+    Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+    -Server
+}
+
 # API 反代到后端（actuator 不对公网暴露）
 @api path /api/*
 handle @api {

@@ -1,23 +1,20 @@
 package cn.ybcase.core.security;
 
+import io.jsonwebtoken.Claims;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
-
-import java.util.List;
-import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 
-/** 从 Authorization: Bearer <token> 解析登录态 */
+/** 从 Authorization: Bearer &lt;token&gt; 解析登录态 */
 @Component
 @RequiredArgsConstructor
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
@@ -32,17 +29,14 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         if (header != null && header.startsWith("Bearer ")
                 && SecurityContextHolder.getContext().getAuthentication() == null) {
             try {
-                String subject = jwtService.verify(header.substring(7));
-                UsernamePasswordAuthenticationToken auth;
-                if (subject.startsWith("portal:")) {
-                    // 患者端令牌：主体为 portal:{patientId}，不关联员工账号
-                    auth = new UsernamePasswordAuthenticationToken(subject, null,
-                            List.of(new SimpleGrantedAuthority("ROLE_PORTAL")));
-                } else {
-                    UserDetails userDetails = userDetailsService.loadUserByUsername(subject);
-                    auth = new UsernamePasswordAuthenticationToken(
-                            userDetails, null, userDetails.getAuthorities());
-                }
+                Claims claims = jwtService.parse(header.substring(7));
+                AuthUser user = userDetailsService.loadUserByUsername(claims.getSubject());
+                // 停用即断：过滤器不走 DaoAuthenticationProvider，须自行判账号状态
+                if (!user.isEnabled()) throw new IllegalStateException("账号已停用");
+                // 改密/停用会自增版本，旧令牌到此失效
+                if (JwtService.tokenVersionOf(claims) != user.getTokenVersion())
+                    throw new IllegalStateException("令牌已失效（口令或账号状态已变更）");
+                var auth = new UsernamePasswordAuthenticationToken(user, null, user.getAuthorities());
                 auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
                 SecurityContextHolder.getContext().setAuthentication(auth);
             } catch (Exception ignored) {

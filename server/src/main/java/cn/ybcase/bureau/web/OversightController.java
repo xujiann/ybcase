@@ -3,6 +3,7 @@ package cn.ybcase.bureau.web;
 import cn.ybcase.bureau.entity.CaseClue;
 import cn.ybcase.bureau.service.OversightService;
 import cn.ybcase.core.common.R;
+import static cn.ybcase.bureau.common.ReqValues.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.core.Authentication;
@@ -76,6 +77,7 @@ public class OversightController {
         return R.ok();
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','ADMIN')")
     @PostMapping("/rewards/{id}/pay")
     public R<Void> payReward(@PathVariable Long id) {
         oversightService.payReward(id);
@@ -103,7 +105,12 @@ public class OversightController {
     }
 
     @PostMapping("/installments/{id}/pay")
-    public R<Void> payInstallment(@PathVariable Long id) {
+    public R<Void> payInstallment(@PathVariable Long id, Authentication auth) {
+        // 该路径不含 caseId，拦截器覆盖不到，此处按分期所属案件补范围校验
+        var rows = jdbc.queryForList("select case_id from case_installment where id = ?", id);
+        if (rows.isEmpty()) throw new cn.ybcase.bureau.common.BizException(2065, "分期记录不存在");
+        caseService.assertInScope(((Number) rows.get(0).get("case_id")).longValue(),
+                auth.getName(), privileged(auth));
         oversightService.payInstallment(id);
         return R.ok();
     }
@@ -111,7 +118,8 @@ public class OversightController {
     // 专家评审
     @PostMapping("/cases/{id}/expert-reviews")
     public R<Void> startExpertReview(@PathVariable Long id, @RequestBody Map<String, String> body) {
-        oversightService.startExpertReview(id, body.get("experts"));
+        oversightService.startExpertReview(id, body.get("experts"),
+                optDate(body, "startedAt", "评审开始日期"));
         return R.ok();
     }
 
@@ -119,8 +127,7 @@ public class OversightController {
     public R<Void> endExpertReview(@PathVariable Long id, @PathVariable Long reviewId,
                                    @RequestBody Map<String, String> body) {
         oversightService.endExpertReview(id, reviewId, body.get("opinion"),
-                body.get("startedAt") == null ? null : java.time.LocalDate.parse(body.get("startedAt")),
-                body.get("endedAt") == null ? null : java.time.LocalDate.parse(body.get("endedAt")));
+                optDate(body, "startedAt", "评审开始日期"), optDate(body, "endedAt", "评审结束日期"));
         return R.ok();
     }
 
@@ -133,7 +140,7 @@ public class OversightController {
                 from case_decision d
                 join case_file cf on cf.id = d.case_id
                 join case_cause cc on cc.id = cf.cause_id
-                where d.published = true order by d.published_at desc""");
+                where d.published = true order by d.published_at desc limit 2000""");
         for (var r : rows) {
             if ("INDIVIDUAL".equals(r.get("party_type"))) {
                 String name = (String) r.get("party_name");

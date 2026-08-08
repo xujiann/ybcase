@@ -28,6 +28,7 @@ public class FeedbackController {
     private final JdbcTemplate jdbc;
 
     private static final List<String> KINDS = List.of("BUG", "FEATURE", "QUESTION");
+    private static final int MAX_SCREENSHOT = 5 * 1024 * 1024;
     private static final Map<String, String> KIND_NAMES = Map.of(
             "BUG", "问题缺陷", "FEATURE", "功能需求", "QUESTION", "使用咨询");
 
@@ -43,9 +44,12 @@ public class FeedbackController {
         byte[] screenshot = null;
         if (req.screenshotBase64() != null && !req.screenshotBase64().isBlank()) {
             String b64 = req.screenshotBase64();
+            // 先按字符串长度预判再解码：解码后才判，一个几百 MB 的 base64 串就能把堆打爆
+            if ((long) b64.length() * 3 / 4 > MAX_SCREENSHOT)
+                throw new BizException(2090, "截图不得超过 5MB");
             int comma = b64.indexOf(',');
             screenshot = Base64.getDecoder().decode(comma >= 0 ? b64.substring(comma + 1) : b64);
-            if (screenshot.length > 5 * 1024 * 1024) throw new BizException(2090, "截图不得超过 5MB");
+            if (screenshot.length > MAX_SCREENSHOT) throw new BizException(2090, "截图不得超过 5MB");
         }
         Long id = jdbc.queryForObject("""
                 insert into feedback (kind, title, content, page_route, case_ref, app_version,
@@ -140,7 +144,7 @@ public class FeedbackController {
     public ResponseEntity<byte[]> export() {
         var rows = jdbc.queryForList("""
                 select id, kind, status, title, content, page_route, app_version, request_id,
-                       username, created_at, handler, reply from feedback order by id""");
+                       username, created_at, handler, reply from feedback order by id limit 5000""");
         StringBuilder sb = new StringBuilder("﻿id,类型,状态,标题,描述,页面,版本,request_id,提交人,时间,处理人,回复\n");
         for (var r : rows) {
             sb.append(r.get("id")).append(',').append(r.get("kind")).append(',').append(r.get("status")).append(',')

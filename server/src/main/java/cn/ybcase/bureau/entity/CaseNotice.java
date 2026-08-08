@@ -50,4 +50,12 @@ public class CaseNotice {
 
     @Column(columnDefinition = "text")
     private String statementReview;
+
+    /** 当事人明确放弃陈述申辩（放弃后方可在期限届满前决定） */
+    @Column(nullable = false)
+    private Boolean statementWaived = false;
+
+    /** 再次告知且加重时，改变原认定事实/证据/依据的理由（辽52条） */
+    @Column(length = 500)
+    private String changeReason;
 }

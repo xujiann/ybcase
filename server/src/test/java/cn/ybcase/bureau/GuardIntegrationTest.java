@@ -86,9 +86,45 @@ class GuardIntegrationTest {
                 new CaseService.DecisionReq("PUNISH", BigDecimal.ONE, null, null, null, "x", null, "r")));
         assertEquals(2006, e.code);
         caseService.report(c.getId(), "调查终结：集成测试", "it");
-        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("1000"), BigDecimal.ZERO));
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("1000"), BigDecimal.ZERO, null));
         var e2 = assertThrows(BizException.class, () -> caseService.decide(c.getId(),
                 new CaseService.DecisionReq("PUNISH", new BigDecimal("2000"), null, null, null, "x", null, "r")));
+        assertEquals(2007, e2.code);
+    }
+
+    @Test
+    void 申请听证未举行不得决定拒2075与陈述申辩期未届满拒2076() {
+        CaseFile c = caseService.create(req("IT-听证" + System.nanoTime(), TWO), "it");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("150000"),
+                BigDecimal.ZERO, null));
+        // 未放弃、未陈述申辩且期限未届满
+        var e1 = assertThrows(BizException.class, () -> caseService.decide(c.getId(),
+                new CaseService.DecisionReq("PUNISH", new BigDecimal("150000"), null, null, null, "x", null, "r")));
+        assertEquals(2076, e1.code);
+        // 申请听证后即便放弃陈述申辩也须先开听证
+        caseService.recordStatement(c.getId(),
+                new CaseService.StatementReq(null, null, true, null, true));
+        var e2 = assertThrows(BizException.class, () -> caseService.decide(c.getId(),
+                new CaseService.DecisionReq("PUNISH", new BigDecimal("150000"), null, null, null, "x", null, "r")));
+        assertEquals(2075, e2.code);
+    }
+
+    @Test
+    void 重复告知加重须载明变更理由拒2077() {
+        CaseFile c = caseService.create(req("IT-再告知" + System.nanoTime(), TWO), "it");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚1万", new BigDecimal("10000"),
+                BigDecimal.ZERO, null));
+        var e = assertThrows(BizException.class, () -> caseService.notify(c.getId(),
+                new CaseService.NoticeReq("改拟罚10万", new BigDecimal("100000"), BigDecimal.ZERO, null)));
+        assertEquals(2077, e.code);
+        caseService.notify(c.getId(), new CaseService.NoticeReq("改拟罚10万", new BigDecimal("100000"),
+                BigDecimal.ZERO, "复核发现新增违法事实，认定金额变更"));
+        // 决定仍以历次告知最低额为上限
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        var e2 = assertThrows(BizException.class, () -> caseService.decide(c.getId(),
+                new CaseService.DecisionReq("PUNISH", new BigDecimal("100000"), null, null, null, "x", null, "r")));
         assertEquals(2007, e2.code);
     }
 

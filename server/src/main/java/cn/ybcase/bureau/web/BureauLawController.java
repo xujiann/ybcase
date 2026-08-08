@@ -1,6 +1,7 @@
 package cn.ybcase.bureau.web;
 
 import cn.ybcase.core.common.R;
+import static cn.ybcase.bureau.common.ReqValues.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -37,17 +38,18 @@ public class BureauLawController {
     @PostMapping("/holidays")
     @PreAuthorize("hasRole('ADMIN')")
     public R<Void> addHoliday(@RequestBody Map<String, String> body) {
+        // 先解析成 LocalDate：交给 ?::date 由数据库解析，格式错会变成 500
         jdbc.update("""
-                insert into sys_holiday (day, kind, name) values (?::date, ?, ?)
+                insert into sys_holiday (day, kind, name) values (?, ?, ?)
                 on conflict (day) do update set kind = excluded.kind, name = excluded.name""",
-                body.get("day"), body.getOrDefault("kind", "HOLIDAY"), body.get("name"));
+                reqDate(body, "day", "日期"), body.getOrDefault("kind", "HOLIDAY"), body.get("name"));
         return R.ok();
     }
 
     @DeleteMapping("/holidays/{day}")
     @PreAuthorize("hasRole('ADMIN')")
     public R<Void> deleteHoliday(@PathVariable String day) {
-        jdbc.update("delete from sys_holiday where day = ?::date", day);
+        jdbc.update("delete from sys_holiday where day = ?", reqDate(Map.of("day", day), "day", "日期"));
         return R.ok();
     }
 }

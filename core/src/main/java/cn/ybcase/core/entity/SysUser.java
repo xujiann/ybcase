@@ -52,6 +52,10 @@ public class SysUser {
     @Column(nullable = false)
     private Instant passwordUpdatedAt = Instant.now();
 
+    /** 令牌版本：改密或停用时自增，使已签发的 JWT 立即失效 */
+    @Column(nullable = false)
+    private Integer tokenVersion = 0;
+
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 

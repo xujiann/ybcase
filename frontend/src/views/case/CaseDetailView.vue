@@ -8,7 +8,7 @@
             <el-tag :type="(CASE_STATUS_TAG[c.status] as any)" size="small">{{ CASE_STATUS[c.status] }}</el-tag>
             <span style="margin-left: 12px">{{ c.procedureType === 'SUMMARY' ? '简易程序' : '普通程序' }}</span>
             <span style="margin-left: 12px">承办人 {{ c.ownerUser || '-' }}
-              <el-button size="small" text type="primary" @click="onTransferOwner">移交</el-button></span>
+              <el-button v-if="isLeader" size="small" text type="primary" @click="onTransferOwner">移交</el-button></span>
             <span style="margin-left: 12px">立案 {{ c.filedAt }}</span>
             <span style="margin-left: 12px">办案期限 {{ detail.effectiveDeadline }}（含延长 {{ c.extensionDays }} 日与扣除期间）</span>
           </div>
@@ -32,13 +32,14 @@
       <div class="actions">
         <template v-if="c.status === 'INVESTIGATING'">
           <el-button v-if="c.procedureType === 'NORMAL'" type="primary" @click="dlg.report = true">调查终结报告</el-button>
-          <el-button v-if="c.procedureType === 'SUMMARY'" type="primary" @click="openDecide">当场处罚决定</el-button>
-          <el-button @click="onSuspend">中止调查</el-button>
-          <el-button @click="onExtendCase">延长期限</el-button>
-          <el-button type="warning" @click="onTerminate">终止调查</el-button>
+          <el-button v-if="c.procedureType === 'SUMMARY' && isLeader" type="primary" @click="openDecide">当场处罚决定</el-button>
+          <el-button v-if="isLeader" @click="onSuspend">中止调查</el-button>
+          <el-button v-if="isLeader" @click="onExtendCase">延长期限</el-button>
+          <el-button v-else @click="dlg.apply = true">申请延期/中止</el-button>
+          <el-button v-if="isLeader" type="warning" @click="onTerminate">终止调查</el-button>
         </template>
         <template v-if="c.status === 'SUSPENDED'">
-          <el-button type="primary" @click="onResume">恢复调查</el-button>
+          <el-button v-if="isLeader" type="primary" @click="onResume">恢复调查</el-button>
         </template>
         <template v-if="c.status === 'REPORTED'">
           <el-button type="primary" @click="dlg.notice = true">处罚告知</el-button>
@@ -46,7 +47,7 @@
           <el-button @click="onExtendCase">延长期限</el-button>
         </template>
         <template v-if="c.status === 'NOTIFIED'">
-          <el-button type="primary" @click="openDecide">作出决定</el-button>
+          <el-button v-if="isLeader" type="primary" @click="openDecide">作出决定</el-button>
           <el-button @click="dlg.statement = true">陈述申辩/听证</el-button>
           <el-button @click="onSubmitReview">提交法制审核</el-button>
           <el-button @click="onExtendCase">延长期限</el-button>
@@ -56,14 +57,14 @@
           <el-button v-if="c.procedureType === 'SUMMARY' && !c.summaryRecordAt" @click="onSummaryRecord">简易程序备案</el-button>
           <el-button v-if="!c.eDeliveryConsent" @click="onEConsent">电子送达确认书</el-button>
           <el-button @click="dlg.execution = true">登记执行</el-button>
-          <el-button @click="onCloseCase">结案</el-button>
+          <el-button v-if="isLeader" @click="onCloseCase">结案</el-button>
         </template>
         <template v-if="c.status === 'DELIVERED'">
           <el-button type="primary" @click="dlg.execution = true">登记执行</el-button>
           <el-button @click="onLateFee">加处罚款测算</el-button>
-          <el-button @click="onApproveDefer">批准暂缓/分期</el-button>
+          <el-button v-if="isLeader" @click="onApproveDefer">批准暂缓/分期</el-button>
           <el-button @click="onCourtEnforce">申请法院强制执行</el-button>
-          <el-button type="success" @click="onCloseCase">结案</el-button>
+          <el-button v-if="isLeader" type="success" @click="onCloseCase">结案</el-button>
         </template>
         <el-button v-if="!['CLOSED', 'TERMINATED'].includes(c.status)" @click="dlg.meeting = true">集体讨论记录</el-button>
         <el-button v-if="!['CLOSED', 'TERMINATED'].includes(c.status)" @click="dlg.apply = true">提交审批申请</el-button>
@@ -224,7 +225,8 @@
             <el-table-column label="意见" width="200">
               <template #default="{ row }">
                 <span v-if="row.reviewedAt">{{ REVIEW_OPINION[row.opinionType] }}：{{ row.opinion }}（{{ row.reviewer }}）</span>
-                <el-button v-else size="small" type="primary" @click="openReviewDialog(row)">办理审核</el-button>
+                <el-button v-else-if="isLegal" size="small" type="primary" @click="openReviewDialog(row)">办理审核</el-button>
+                <span v-else class="hint">待法制机构审核</span>
               </template>
             </el-table-column>
           </el-table>
@@ -320,7 +322,7 @@
             <el-table-column prop="receiver" label="受送达人" width="140" />
             <el-table-column prop="note" label="备注" />
           </el-table>
-          <h4>分期计划（第54条）　<el-button size="small" @click="onAddInstallment" :disabled="!c.deferApproved">添加分期</el-button></h4>
+          <h4>分期计划（第54条）　<el-button size="small" @click="openInstallment" :disabled="!c.deferApproved">添加分期</el-button></h4>
           <el-table :data="installments" border size="small" class="mb">
             <el-table-column prop="seq" label="期数" width="70" />
             <el-table-column prop="due_at" label="到期日" width="120" />
@@ -682,10 +684,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRoute } from 'vue-router'
-import client from '../../api/client'
+import client, { LARGE_TRANSFER } from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import {
   CASE_STATUS, CASE_STATUS_TAG, DECISION_TYPE, DELIVERY_METHOD, DOC_TYPE,
@@ -698,8 +700,19 @@ const CLOSE_REASON: Record<string, string> = {
   EXECUTED: '执行完毕', COURT: '法院受理强制执行', NO_NEED: '无须执行', OTHER: '其他',
 }
 
+/** 本地时区的今天：toISOString 取的是 UTC，中国时区 0-8 点会算成昨天 */
+function todayLocal() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+const isLeader = computed(() => auth.user?.roles?.some((r: string) => ['LEADER', 'ADMIN'].includes(r)))
+const isLegal = computed(() => auth.user?.roles?.some((r: string) => ['LEGAL', 'ADMIN'].includes(r)))
+
 const route = useRoute()
-const id = route.params.id
+// 同路由不同 id 会复用组件：必须响应式取值 + watch 重载，
+// 否则从 A 详情页跳到 B 后页面仍是 A 的数据，而操作按钮打的是 A
+const id = computed(() => route.params.id as string)
 const detail = ref<any>({})
 const loading = ref(false)
 const c = computed<any>(() => detail.value.caseFile || {})
@@ -717,14 +730,14 @@ const docDeliverForm = reactive<any>({ documentId: null, title: '', docKind: 'OT
 const pendingApprovals = computed(() => (detail.value.approvals || []).filter((a: any) => a.status === 'PENDING'))
 const reviewForm = reactive<any>({ reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
 const installmentForm = reactive<any>({ seq: 1, dueAt: '', amount: 0 })
-const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: new Date().toISOString().slice(0, 10), scheduledAt: '', host: '', hostDept: '', recorder: '' })
+const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
 const attachments = ref<any[]>([])
 const timeline = ref<any[]>([])
 const installments = ref<any[]>([])
 const catalog = ref<any>({})
 const fileInput = ref<HTMLInputElement>()
 
-const today = new Date().toISOString().slice(0, 10)
+const today = todayLocal()
 const officerForm = reactive({ name: '', certNo: '', duty: 'MEMBER' })
 const evidenceForm = reactive({ type: 'DOCUMENT', name: '', source: '', obtainedAt: today, keeper: '', note: '', registerHold: false, sealed: false })
 const documentForm = reactive({ docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false })
@@ -741,11 +754,11 @@ const docView = ref<any>({})
 async function load() {
   loading.value = true
   try {
-    const resp = await client.get(`/bureau/cases/${id}`)
+    const resp = await client.get(`/bureau/cases/${id.value}`)
     detail.value = resp.data.data
-    attachments.value = (await client.get(`/bureau/cases/${id}/attachments`)).data.data
-    timeline.value = (await client.get(`/bureau/cases/${id}/timeline`)).data.data
-    installments.value = (await client.get(`/bureau/cases/${id}/installments`)).data.data
+    attachments.value = (await client.get(`/bureau/cases/${id.value}/attachments`)).data.data
+    timeline.value = (await client.get(`/bureau/cases/${id.value}/timeline`)).data.data
+    installments.value = (await client.get(`/bureau/cases/${id.value}/installments`)).data.data
   } finally {
     loading.value = false
   }
@@ -755,7 +768,7 @@ async function onRenderTpl() {
   const { value: docType } = await ElMessageBox.prompt(
     '文书类型：NOTICE 告知书 / DECISION 决定书 / FINAL_REPORT 终结报告 / ORDER_CORRECT 责令改正 / CLOSE_REPORT 结案报告 / ASSIST_LETTER 协查函',
     '模板生成', { inputValue: 'NOTICE', inputPattern: /^(NOTICE|DECISION|FINAL_REPORT|ORDER_CORRECT|CLOSE_REPORT|ASSIST_LETTER)$/, inputErrorMessage: '类型无效' })
-  const resp = await client.get(`/bureau/cases/${id}/documents/render`, { params: { docType } })
+  const resp = await client.get(`/bureau/cases/${id.value}/documents/render`, { params: { docType } })
   const d = resp.data.data
   documentForm.docType = d.docType
   documentForm.title = d.title
@@ -764,13 +777,14 @@ async function onRenderTpl() {
 }
 
 async function onCatalog() {
-  catalog.value = (await client.get(`/bureau/cases/${id}/archive-catalog`)).data.data
+  catalog.value = (await client.get(`/bureau/cases/${id.value}/archive-catalog`)).data.data
   dlg.catalog = true
 }
 
 async function onDownload(row: any) {
   // 带 JWT 的 blob 下载（直链 <a href> 无 Authorization 会 401）
-  const resp = await client.get(`/bureau/cases/attachments/${row.id}/download`, { responseType: 'blob' })
+  const resp = await client.get(`/bureau/cases/attachments/${row.id}/download`,
+    { responseType: 'blob', ...LARGE_TRANSFER })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(resp.data)
   a.download = row.filename
@@ -784,7 +798,8 @@ async function onUpload(e: Event) {
   const fd = new FormData()
   fd.append('file', file)
   fd.append('category', uploadCategory.value)
-  await client.post(`/bureau/cases/${id}/attachments`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+  await client.post(`/bureau/cases/${id.value}/attachments`, fd,
+    { headers: { 'Content-Type': 'multipart/form-data' }, ...LARGE_TRANSFER })
   ElMessage.success('已上传')
   ;(e.target as HTMLInputElement).value = ''
   load()
@@ -792,13 +807,13 @@ async function onUpload(e: Event) {
 
 async function onSignDoc(row: any) {
   const { value } = await ElMessageBox.prompt('签章人（办案人员/当事人/负责人）', '电子签章', { inputValue: auth.user?.realName || '', inputPattern: /\S+/, inputErrorMessage: '必填' })
-  const resp = await client.post(`/bureau/cases/${id}/documents/${row.id}/sign`, { signer: value })
+  const resp = await client.post(`/bureau/cases/${id.value}/documents/${row.id}/sign`, { signer: value })
   ElMessage.success(`已签章（${resp.data.data.provider}，摘要 ${resp.data.data.contentHash.slice(0, 12)}…）`)
   load()
 }
 
 async function onVerifyDoc(row: any) {
-  const sigs = (await client.get(`/bureau/cases/${id}/documents/${row.id}/verify`)).data.data
+  const sigs = (await client.get(`/bureau/cases/${id.value}/documents/${row.id}/verify`)).data.data
   if (!sigs.length) {
     ElMessage.info('该文书尚无签章')
     return
@@ -816,7 +831,7 @@ function onDeliverDoc(row: any) {
 }
 
 async function onDocDeliverSubmit() {
-  await client.post(`/bureau/cases/${id}/doc-deliveries`, docDeliverForm)
+  await client.post(`/bureau/cases/${id.value}/doc-deliveries`, docDeliverForm)
   ElMessage.success('文书送达已登记')
   dlg.docDeliver = false
   load()
@@ -841,7 +856,7 @@ async function onAddAgreement() {
   const { value: action } = await ElMessageBox.prompt(
     '处理类型：INTERVIEW 约谈 / SUSPEND_AGREEMENT 暂停协议 / TERMINATE_AGREEMENT 解除协议 / REFUSE_PAY 拒付 / RECOVER 追回',
     '移交经办处理', { inputValue: 'REFUSE_PAY', inputPattern: /^(INTERVIEW|SUSPEND_AGREEMENT|TERMINATE_AGREEMENT|REFUSE_PAY|RECOVER)$/, inputErrorMessage: '类型无效' })
-  await client.post(`/bureau/cases/${id}/agreement-actions`, { action, org: '医保经办机构' })
+  await client.post(`/bureau/cases/${id.value}/agreement-actions`, { action, org: '医保经办机构' })
   ElMessage.success('已移交')
   load()
 }
@@ -854,22 +869,22 @@ async function onReplyAgreement(row: any) {
 }
 
 async function onPrintArchive() {
-  const d = (await client.get(`/bureau/cases/${id}/archive-full`)).data.data
-  const cat = (await client.get(`/bureau/cases/${id}/archive-catalog`)).data.data
+  const d = (await client.get(`/bureau/cases/${id.value}/archive-full`)).data.data
+  const cat = (await client.get(`/bureau/cases/${id.value}/archive-catalog`)).data.data
   const order: Record<number, number> = {}
   cat.catalog.forEach((x: any) => { order[x.id] = x.seq })
   const docs = [...d.documents].sort((a: any, b: any) => (order[a.id] || 99) - (order[b.id] || 99))
   const sigOf = (docId: number) => d.signatures.filter((s: any) => s.document_id === docId)
-    .map((s: any) => `［电子签章］${s.signer}（${s.signed_at?.slice(0, 10)}，${s.provider}）`).join('　')
+    .map((s: any) => `［电子签章］${esc(s.signer)}（${esc(s.signed_at?.slice(0, 10))}，${esc(s.provider)}）`).join('　')
   const w = window.open('', '_blank')
   if (!w) return
   const pages = docs.map((doc: any, i: number) => `
-    <section class="page"><h2>${doc.title}</h2>
-    <pre>${doc.content}</pre>
+    <section class="page"><h2>${esc(doc.title)}</h2>
+    <pre>${esc(doc.content)}</pre>
     <p class="sig">${sigOf(doc.id)}</p>
     <p class="foot">第 ${i + 2} 页</p></section>`).join('')
-  const toc = docs.map((doc: any, i: number) => `<tr><td>${i + 1}</td><td>${doc.title}</td><td>${doc.made_at}</td><td>${i + 2}</td></tr>`).join('')
-  w.document.write(`<html><head><title>${d.caseFile.case_no} 卷宗</title><style>
+  const toc = docs.map((doc: any, i: number) => `<tr><td>${i + 1}</td><td>${esc(doc.title)}</td><td>${esc(doc.made_at)}</td><td>${i + 2}</td></tr>`).join('')
+  w.document.write(`<html><head><title>${esc(d.caseFile.case_no)} 卷宗</title><style>
     body{font-family:SimSun,serif;line-height:1.9}
     .page{page-break-after:always;padding:40px 50px;min-height:90vh;position:relative}
     h1,h2{text-align:center} pre{white-space:pre-wrap;font-family:inherit;font-size:15px}
@@ -877,9 +892,9 @@ async function onPrintArchive() {
     .sig{margin-top:24px;font-size:13px;color:#333}
     .foot{position:absolute;bottom:16px;left:0;right:0;text-align:center;font-size:12px;color:#666}
     </style></head><body>
-    <section class="page"><h1>${d.orgName}<br/>行政处罚案卷</h1>
-      <p style="text-align:center;font-size:18px">${d.caseFile.name}</p>
-      <p style="text-align:center">案号：${d.caseFile.case_no}　案卷号：${d.caseFile.archive_no || '（未结案）'}</p>
+    <section class="page"><h1>${esc(d.orgName)}<br/>行政处罚案卷</h1>
+      <p style="text-align:center;font-size:18px">${esc(d.caseFile.name)}</p>
+      <p style="text-align:center">案号：${esc(d.caseFile.case_no)}　案卷号：${esc(d.caseFile.archive_no || '（未结案）')}</p>
       <h2>卷内目录</h2>
       <table><tr><th>序号</th><th>文书名称</th><th>日期</th><th>页码</th></tr>${toc}</table>
       <p class="foot">第 1 页</p></section>
@@ -888,45 +903,53 @@ async function onPrintArchive() {
   w.print()
 }
 
+/** 文书正文/标题由用户填写，拼进打印窗口前必须转义，否则可注入脚本读取本地令牌 */
+function esc(v: any) {
+  return String(v ?? '').replace(/[&<>"']/g, (ch) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string))
+}
+
 function printDoc() {
   const w = window.open('', '_blank')
   if (!w) return
-  w.document.write(`<html><head><title>${docView.value.title}</title><style>body{font-family:SimSun,serif;padding:40px;line-height:1.9}h2{text-align:center}pre{white-space:pre-wrap;font-family:inherit;font-size:15px}</style></head><body><h2>${docView.value.title}</h2><pre>${docView.value.content}</pre></body></html>`)
+  w.document.write(`<html><head><title>${esc(docView.value.title)}</title><style>body{font-family:SimSun,serif;padding:40px;line-height:1.9}h2{text-align:center}pre{white-space:pre-wrap;font-family:inherit;font-size:15px}</style></head><body><h2>${esc(docView.value.title)}</h2><pre>${esc(docView.value.content)}</pre></body></html>`)
   w.document.close()
   w.print()
 }
 
 /** 通用子表提交：POST /bureau/cases/{id}/{path} 后关弹窗刷新 */
 async function submit(path: string, body: any, dlgKey: string) {
-  await client.post(`/bureau/cases/${id}/${path}`, body)
+  await client.post(`/bureau/cases/${id.value}/${path}`, body)
   ElMessage.success('已保存')
   dlg[dlgKey] = false
+  // 复用弹窗提交后清空，避免下次打开预填上一条并被误重复保存
+  if (dlgKey === 'officer') Object.assign(officerForm, { name: '', certNo: '', duty: 'MEMBER' })
   load()
 }
 
 async function onAvoid(row: any) {
   const { value } = await ElMessageBox.prompt('回避事由（第5条）', '申请回避', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/officers/${row.id}/avoid`, { reason: value })
+  await client.post(`/bureau/cases/${id.value}/officers/${row.id}/avoid`, { reason: value })
   ElMessage.success('已回避')
   load()
 }
 
 async function onCrossExam(row: any) {
   const { value } = await ElMessageBox.prompt('当事人对该证据的意见（无异议也须注明，辽24条）', '证据质证', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/evidences/${row.id}/cross-exam`, { opinion: value })
+  await client.post(`/bureau/cases/${id.value}/evidences/${row.id}/cross-exam`, { opinion: value })
   ElMessage.success('已记录质证')
   load()
 }
 
 async function onPublish() {
-  await client.post(`/bureau/cases/${id}/publish`)
+  await client.post(`/bureau/cases/${id.value}/publish`)
   ElMessage.success('处罚决定已公开')
   load()
 }
 
 async function onGovRecord() {
   const { value } = await ElMessageBox.prompt('政府备案文号（重大处罚决定报本级政府备案，辽54条）', '备案登记', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/gov-record`, { recordNo: value })
+  await client.post(`/bureau/cases/${id.value}/gov-record`, { recordNo: value })
   ElMessage.success('已登记备案')
   load()
 }
@@ -937,19 +960,19 @@ async function onHoldDispose(row: any) {
     confirmButtonText: '证据保全', cancelButtonText: '转封存',
   }).then(() => 'PRESERVE').catch((a) => (a === 'cancel' ? 'SEAL' : null))
   if (!disposal) return
-  await client.post(`/bureau/cases/${id}/evidences/${row.id}/hold-disposal`, { disposal })
+  await client.post(`/bureau/cases/${id.value}/evidences/${row.id}/hold-disposal`, { disposal })
   ElMessage.success('已处理')
   load()
 }
 
 async function onSeal(row: any, extend: boolean) {
-  await client.post(`/bureau/cases/${id}/evidences/${row.id}/seal?extend=${extend}`)
+  await client.post(`/bureau/cases/${id.value}/evidences/${row.id}/seal?extend=${extend}`)
   ElMessage.success(extend ? '已延长30日' : '已解除封存')
   load()
 }
 
 function viewDoc(row: any) {
-  client.get(`/bureau/cases/${id}/documents/${row.id}`).then((resp) => {
+  client.get(`/bureau/cases/${id.value}/documents/${row.id}`).then((resp) => {
     docView.value = resp.data.data
     dlg.doc = true
   })
@@ -957,26 +980,26 @@ function viewDoc(row: any) {
 
 async function onSuspend() {
   const { value } = await ElMessageBox.prompt('中止情形（第42条：需以裁判结果为依据/送请解释确认/不可抗力/当事人下落不明等）', '中止调查', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/suspend`, { reason: value })
+  await client.post(`/bureau/cases/${id.value}/suspend`, { reason: value })
   load()
 }
 
 async function onResume() {
-  await client.post(`/bureau/cases/${id}/resume`)
+  await client.post(`/bureau/cases/${id.value}/resume`)
   ElMessage.success('已恢复调查，办案期限已顺延中止天数')
   load()
 }
 
 async function onTerminate() {
   const { value } = await ElMessageBox.prompt('终止情形（第47条：当事人死亡或组织终止无承受人/移送司法/其他）', '终止调查', { inputPattern: /\S+/, inputErrorMessage: '必填', type: 'warning' })
-  await client.post(`/bureau/cases/${id}/terminate`, { reason: value })
+  await client.post(`/bureau/cases/${id.value}/terminate`, { reason: value })
   load()
 }
 
 async function onExtendCase() {
   const { value: days } = await ElMessageBox.prompt('延长天数（首次≤30日；继续延期须先有集体讨论记录，累计≤90日）', '延长办案期限', { inputPattern: /^\d+$/, inputErrorMessage: '请输入天数' })
   const { value: reason } = await ElMessageBox.prompt('延期理由', '延长办案期限', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/extend`, { days: Number(days), reason })
+  await client.post(`/bureau/cases/${id.value}/extend`, { days: Number(days), reason })
   ElMessage.success('已延长')
   load()
 }
@@ -986,7 +1009,7 @@ async function onReport() {
     ElMessage.warning('请填写报告内容')
     return
   }
-  await client.post(`/bureau/cases/${id}/report`, { content: reportContent.value })
+  await client.post(`/bureau/cases/${id.value}/report`, { content: reportContent.value })
   ElMessage.success('调查终结')
   dlg.report = false
   load()
@@ -994,13 +1017,14 @@ async function onReport() {
 
 async function onSubmitReview() {
   const { value } = await ElMessageBox.prompt('审核触发情形（第37条：罚款数额较大/听证案件/疑难复杂/重大公共利益等）', '提交法制审核', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/reviews`, { requiredReason: value })
+  await client.post(`/bureau/cases/${id.value}/reviews`, { requiredReason: value })
   ElMessage.success('已提交法制审核（10个工作日内审核完毕）')
   load()
 }
 
 function openReviewDialog(row: any) {
-  reviewForm.reviewId = row.id
+  // 不重置会串单：上一份审核单的审核人与意见残留到下一份
+  Object.assign(reviewForm, { reviewId: row.id, reviewer: auth.user?.realName || '', opinionType: 'AGREE', opinion: '' })
   dlg.review = true
 }
 
@@ -1020,14 +1044,14 @@ async function onNotify() {
     ElMessage.warning('请填写告知内容')
     return
   }
-  await client.post(`/bureau/cases/${id}/notice`, noticeForm)
+  await client.post(`/bureau/cases/${id.value}/notice`, noticeForm)
   ElMessage.success('已告知当事人')
   dlg.notice = false
   load()
 }
 
 async function onStatement() {
-  await client.post(`/bureau/cases/${id}/statement`, statementForm)
+  await client.post(`/bureau/cases/${id.value}/statement`, statementForm)
   ElMessage.success('已保存')
   dlg.statement = false
   load()
@@ -1047,21 +1071,21 @@ async function onDecide() {
     ElMessage.warning('请填写决定内容')
     return
   }
-  await client.post(`/bureau/cases/${id}/decide`, decisionForm)
+  await client.post(`/bureau/cases/${id.value}/decide`, decisionForm)
   ElMessage.success('决定已作出')
   dlg.decide = false
   load()
 }
 
 async function onDeliver() {
-  await client.post(`/bureau/cases/${id}/deliver`, deliveryForm)
+  await client.post(`/bureau/cases/${id.value}/deliver`, deliveryForm)
   ElMessage.success('已送达')
   dlg.deliver = false
   load()
 }
 
 async function onLateFee() {
-  const resp = await client.get(`/bureau/cases/${id}/late-fee-quote`)
+  const resp = await client.get(`/bureau/cases/${id.value}/late-fee-quote`)
   const q = resp.data.data
   ElMessageBox.alert(
     `缴款期限：${q.payDeadline}；逾期 ${q.overdueDays} 天；按日3%累计 ${q.accrued} 元；封顶后应加处 ${q.capped} 元（不超过罚款本金 ${q.fineAmount} 元）`,
@@ -1070,13 +1094,13 @@ async function onLateFee() {
 }
 
 async function onApproveDefer() {
-  await client.post(`/bureau/cases/${id}/approve-defer`)
+  await client.post(`/bureau/cases/${id.value}/approve-defer`)
   ElMessage.success('已批准暂缓/分期缴纳')
   load()
 }
 
 async function onCourtEnforce() {
-  await client.post(`/bureau/cases/${id}/court-enforce`)
+  await client.post(`/bureau/cases/${id.value}/court-enforce`)
   ElMessage.success('已登记申请法院强制执行')
   load()
 }
@@ -1086,7 +1110,7 @@ async function onScheduleHearing() {
     ElMessage.warning('举行日期与主持人必填')
     return
   }
-  await client.post(`/bureau/cases/${id}/hearings`, hearingForm)
+  await client.post(`/bureau/cases/${id.value}/hearings`, hearingForm)
   ElMessage.success('已安排听证')
   dlg.hearing = false
   load()
@@ -1094,14 +1118,14 @@ async function onScheduleHearing() {
 
 async function onHoldHearing(row: any) {
   const { value } = await ElMessageBox.prompt('听证笔录（当场阅读并签字确认，辽50条）', '举行听证', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/hearings/${row.id}/hold`, { record: value })
+  await client.post(`/bureau/cases/${id.value}/hearings/${row.id}/hold`, { record: value })
   ElMessage.success('听证已举行')
   load()
 }
 
 async function onHearingOpinion(row: any) {
   const { value } = await ElMessageBox.prompt('听证意见（结束2日内提出，报负责人）', '听证意见', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/hearings/${row.id}/opinion`, { opinion: value })
+  await client.post(`/bureau/cases/${id.value}/hearings/${row.id}/opinion`, { opinion: value })
   ElMessage.success('已出具听证意见')
   load()
 }
@@ -1109,7 +1133,7 @@ async function onHearingOpinion(row: any) {
 async function onAddAssist() {
   const { value: org } = await ElMessageBox.prompt('协查机关', '发出协查函', { inputPattern: /\S+/, inputErrorMessage: '必填' })
   const { value: content } = await ElMessageBox.prompt('协查事项', '发出协查函', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/assists`, { direction: 'OUT', org, content })
+  await client.post(`/bureau/cases/${id.value}/assists`, { direction: 'OUT', org, content })
   ElMessage.success('已登记（15日内应复函）')
   load()
 }
@@ -1117,7 +1141,7 @@ async function onAddAssist() {
 async function onReplyAssist(row: any) {
   const { value } = await ElMessageBox.prompt('复函结果（拒绝协助请以"拒绝："开头并说明理由）', '协查办理', { inputPattern: /\S+/, inputErrorMessage: '必填' })
   const refused = value.startsWith('拒绝')
-  await client.post(`/bureau/cases/${id}/assists/${row.id}/reply`,
+  await client.post(`/bureau/cases/${id.value}/assists/${row.id}/reply`,
     { result: value, refused, refuseReason: refused ? value : null })
   ElMessage.success('已办结')
   load()
@@ -1125,25 +1149,31 @@ async function onReplyAssist(row: any) {
 
 async function onSignMeeting(row: any) {
   const { value } = await ElMessageBox.prompt('确认签字的参加人员名单（局令44条：讨论记录经参加人员确认签字存入案卷）', '签字确认', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/meetings/${row.id}/sign`, { signNames: value })
+  await client.post(`/bureau/cases/${id.value}/meetings/${row.id}/sign`, { signNames: value })
   ElMessage.success('已确认')
   load()
 }
 
 async function onDiscretionSuggest() {
-  const resp = await client.get(`/bureau/cases/${id}/discretion-suggest`)
+  const resp = await client.get(`/bureau/cases/${id.value}/discretion-suggest`)
   const d = resp.data.data
   const lines = (d.tiers as any[]).map((t) =>
     `【${t.tier === 'LIGHT' ? '从轻' : t.tier === 'HEAVY' ? '从重' : '一般'}】${t.condition_desc}：${t.multiplier_min}-${t.multiplier_max}倍 → 建议 ${t.suggestMin}-${t.suggestMax} 元（${t.note}）`)
   ElMessageBox.alert(lines.join('\n\n') || '该案由暂无裁量基准，请按上位法幅度裁量', `裁量基准建议（涉案金额 ${d.amountInvolved} 元）`, { customStyle: { whiteSpace: 'pre-wrap' } as any })
 }
 
+function openInstallment() {
+  installmentForm.dueAt = ''
+  installmentForm.amount = 0
+  dlg.installment = true
+}
+
 async function onAddInstallment() {
   if (!installmentForm.dueAt || !installmentForm.amount) {
-    dlg.installment = true
+    ElMessage.warning('请填写到期日与金额')
     return
   }
-  await client.post(`/bureau/cases/${id}/installments`, installmentForm)
+  await client.post(`/bureau/cases/${id.value}/installments`, installmentForm)
   ElMessage.success('已添加')
   dlg.installment = false
   installmentForm.seq += 1
@@ -1153,14 +1183,14 @@ async function onAddInstallment() {
 
 async function onStartExpert(row?: any) {
   const { value } = await ElMessageBox.prompt('评审专家（顿号分隔）', '启动专家评审', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/expert-reviews`, { experts: value })
+  await client.post(`/bureau/cases/${id.value}/expert-reviews`, { experts: value })
   ElMessage.success('评审已启动')
   load()
 }
 
 async function onEndExpert(row: any) {
   const { value } = await ElMessageBox.prompt('评审意见', '结束专家评审', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/expert-reviews/${row.id}/end`, { opinion: value })
+  await client.post(`/bureau/cases/${id.value}/expert-reviews/${row.id}/end`, { opinion: value })
   ElMessage.success('评审结束，期间已计入期限扣除')
   load()
 }
@@ -1172,32 +1202,33 @@ async function onPayInstallment(row: any) {
 }
 
 async function onSummaryRecord() {
-  await client.post(`/bureau/cases/${id}/summary-record`)
+  await client.post(`/bureau/cases/${id.value}/summary-record`)
   ElMessage.success('已备案（第51条）')
   load()
 }
 
 async function onEConsent() {
-  await client.post(`/bureau/cases/${id}/e-delivery-consent`)
+  await client.post(`/bureau/cases/${id.value}/e-delivery-consent`)
   ElMessage.success('已登记电子送达确认书')
   load()
 }
 
 async function onTransferOwner() {
   const { value } = await ElMessageBox.prompt('接收人登录账号（承办人变更，负责人权限）', '案件移交', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/transfer-owner`, { newOwner: value })
+  await client.post(`/bureau/cases/${id.value}/transfer-owner`, { newOwner: value })
   ElMessage.success('已移交')
   load()
 }
 
 async function onCloseCase() {
   const { value } = await ElMessageBox.prompt('结案报告（经负责人批准后结案归档，一案一卷）', '结案', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id}/close`, { closeReport: value })
+  await client.post(`/bureau/cases/${id.value}/close`, { closeReport: value })
   ElMessage.success('已结案归档')
   load()
 }
 
 onMounted(load)
+watch(() => route.params.id, (nv, ov) => { if (nv && nv !== ov) load() })
 </script>
 
 <style scoped>

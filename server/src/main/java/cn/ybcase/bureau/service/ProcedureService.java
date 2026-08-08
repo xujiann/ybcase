@@ -41,6 +41,9 @@ public class ProcedureService {
             throw new BizException(2055, "执法证 " + certNo + " 已停用");
         if (!name.equals(r.get("name")))
             throw new BizException(2055, "执法证 " + certNo + " 与姓名不符（台账：" + r.get("name") + "）");
+        // 台账允许有效期为空（历史数据/录入遗漏）：此处直接 toLocalDate 会 NPE→500，且立案事务回滚而看不到原因
+        if (r.get("cert_expire_at") == null)
+            throw new BizException(2055, "执法证 " + certNo + " 未登记有效期，请先在执法证台账补录（第16条）");
         LocalDate expire = ((java.sql.Date) r.get("cert_expire_at")).toLocalDate();
         if (expire.isBefore(LocalDate.now()))
             throw new BizException(2055, "执法证 " + certNo + " 已于 " + expire + " 过期");
@@ -107,6 +110,9 @@ public class ProcedureService {
         CaseFile c = caseFile(caseId);
         if (!"SUMMARY".equals(c.getProcedureType())) throw new BizException(2058, "仅简易程序案件需备案（第51条）");
         if (c.getDecidedAt() == null) throw new BizException(2058, "尚未作出当场处罚决定");
+        // 幂等：重复调用会把备案日期刷成当天，掩盖"是否两日内备案"的监督证据
+        if (c.getSummaryRecordAt() != null)
+            throw new BizException(2058, "该案已于 " + c.getSummaryRecordAt() + " 备案，不可重复备案");
         c.setSummaryRecordAt(LocalDate.now());
         return caseRepository.save(c);
     }
@@ -179,10 +185,22 @@ public class ProcedureService {
     // ---------- 电子送达确认（第59条） ----------
 
     @Transactional
-    public CaseFile eDeliveryConsent(Long caseId) {
+    /** 登记电子送达确认书（第59条）：这是电子送达的唯一闸门，须留下确认书本身的痕迹 */
+    public CaseFile eDeliveryConsent(Long caseId, String receiver, String channel, String docNo) {
         CaseFile c = caseFile(caseId);
+        if (receiver == null || receiver.isBlank())
+            throw new BizException(2054, "须填写签署电子送达确认书的当事人/受送达人");
+        if (channel == null || channel.isBlank())
+            throw new BizException(2054, "须填写当事人确认的电子送达地址（手机号/邮箱等）");
         c.setEDeliveryConsent(true);
-        return caseRepository.save(c);
+        caseRepository.save(c);
+        jdbc.update("""
+                insert into case_document (case_id, doc_type, title, content, made_at, maker, signed)
+                values (?, 'E_DELIVERY_CONSENT', ?, ?, ?, ?, true)""",
+                caseId, "电子送达确认书", "受送达人：" + receiver + "；确认的电子送达地址：" + channel
+                        + (docNo == null || docNo.isBlank() ? "" : "；确认书编号：" + docNo),
+                LocalDate.now(), receiver);
+        return c;
     }
 
     public List<Map<String, Object>> hearings(Long caseId) {

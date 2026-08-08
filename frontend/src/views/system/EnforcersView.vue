@@ -50,7 +50,11 @@ import client from '../../api/client'
 const rows = ref<any[]>([])
 const loading = ref(false)
 const dlg = ref(false)
-const today = new Date().toISOString().slice(0, 10)
+function todayLocal() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+const today = todayLocal()
 const form = reactive({ name: '', certNo: '', dept: '', certExpireAt: '', legalQualified: false, enabled: true })
 
 async function load() {

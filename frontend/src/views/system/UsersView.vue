@@ -129,7 +129,7 @@ async function load() {
 }
 
 function openCreate() {
-  Object.assign(form, { id: null, username: '', password: '', realName: '', title: null, deptId: null, phone: null, roleCodes: [] })
+  Object.assign(form, { id: null, username: '', password: '', realName: '', title: null, deptId: null, phone: null, enabled: true, roleCodes: [] })
   dialogVisible.value = true
 }
 

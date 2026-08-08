@@ -14,16 +14,19 @@ spring:
     locations: classpath:db/migration
   servlet:
     multipart:
-      max-file-size: 10MB
-      max-request-size: 12MB
+      # 执法音像（AV_RECORD）在 FILE 外置存储下允许到 200MB，容器上限须放到其之上，
+      # 否则 AttachmentController 的分类限额永远走不到（此前一律卡在 10MB）
+      max-file-size: ${YBCASE_MAX_FILE_SIZE:210MB}
+      max-request-size: ${YBCASE_MAX_REQUEST_SIZE:220MB}
 
 server:
   port: 8090
 
 ybcase:
   security:
-    # 生产环境务必通过环境变量 HIP_SECURITY_JWT_SECRET 覆盖
-    jwt-secret: dev-only-secret-change-me-bureau-case-0123456789
+    # 生产/联网环境必须用环境变量 YBCASE_SECURITY_JWT_SECRET 覆盖（32 位以上随机串）；
+    # 该默认值公开在代码仓库中，pilot profile 下使用它会拒绝启动
+    jwt-secret: ${YBCASE_SECURITY_JWT_SECRET:dev-only-secret-change-me-bureau-case-0123456789}
     jwt-expiry-hours: 12
 
 management:

@@ -87,6 +87,8 @@ public class SysUserController {
         if (u == null) return R.fail(1103, "用户不存在");
         if ("admin".equals(u.getUsername()) && !enabled) return R.fail(1104, "不能停用内置管理员");
         u.setEnabled(enabled);
+        // 停用须立即断开在线会话，否则对方手中的令牌可继续使用至过期
+        if (!enabled) u.setTokenVersion(u.getTokenVersion() + 1);
         userRepository.save(u);
         return R.ok();
     }

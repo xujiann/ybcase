@@ -64,7 +64,13 @@ const loading = ref(false)
 const isLeader = computed(() => auth.user?.roles?.some((r) => ['LEADER', 'ADMIN'].includes(r)))
 
 function daysLeft(deadline: string) {
-  return Math.floor((new Date(deadline).getTime() - Date.now()) / 86400000) + 1
+  // 'YYYY-MM-DD' 被 Date 当作 UTC 零点解析，与本地 now 相减会在 UTC+8 的同一天内漂移一天，
+  // 故两端都取本地零点后再算整日差
+  const [y, m, d] = deadline.split('-').map(Number)
+  const end = new Date(y, m - 1, d).getTime()
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  return Math.round((end - today) / 86400000)
 }
 
 onMounted(async () => {

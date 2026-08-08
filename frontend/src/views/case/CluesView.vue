@@ -92,7 +92,11 @@ const records = ref<any[]>([])
 const loading = ref(false)
 const statusFilter = ref('')
 const createVisible = ref(false)
-const today = new Date().toISOString().slice(0, 10)
+function todayLocal() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+const today = todayLocal()
 const form = reactive({ source: 'COMPLAINT', suspectName: '', suspectType: 'PROVIDER', receivedAt: today, content: '', handler: '' })
 
 async function load() {
@@ -136,7 +140,17 @@ async function onImport() {
   const { value } = await ElMessageBox.prompt(
     '粘贴智能监控疑点 JSON 数组：[{"suspectName":"…","suspectType":"PROVIDER","content":"…"}]',
     '批量导入线索', { inputType: 'textarea', inputPattern: /^\s*\[/, inputErrorMessage: '须为 JSON 数组' })
-  const rows = JSON.parse(value)
+  let rows: any
+  try {
+    rows = JSON.parse(value)
+  } catch {
+    ElMessage.error('JSON 格式有误，请检查括号与逗号后重试')
+    return
+  }
+  if (!Array.isArray(rows) || !rows.length) {
+    ElMessage.warning('请粘贴非空的线索数组')
+    return
+  }
   const resp = await client.post('/bureau/clues/import', rows)
   ElMessage.success(`已导入 ${resp.data.data.imported} 条线索`)
   load()

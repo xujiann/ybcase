@@ -7,6 +7,7 @@ import cn.ybcase.bureau.service.ClueService;
 import cn.ybcase.bureau.spi.MonitorFeedAdapter;
 import cn.ybcase.bureau.spi.SignatureProvider;
 import cn.ybcase.core.common.R;
+import static cn.ybcase.bureau.common.ReqValues.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -143,6 +144,14 @@ public class FormalizationController {
         String method = (String) body.get("method");
         if (!List.of("DIRECT", "MAIL", "LEFT", "ELECTRONIC", "ANNOUNCE").contains(method))
             throw new BizException(2041, "送达方式无效");
+        Integer caseExists = jdbc.queryForObject("select count(*) from case_file where id = ?", Integer.class, caseId);
+        if (caseExists == null || caseExists == 0) throw new BizException(2043, "案件不存在");
+        Long documentId = optLong(body, "documentId");
+        if (documentId != null) {
+            Integer own = jdbc.queryForObject(
+                    "select count(*) from case_document where id = ? and case_id = ?", Integer.class, documentId, caseId);
+            if (own == null || own == 0) throw new BizException(2041, "所选文书不属于本案");
+        }
         if ("ELECTRONIC".equals(method)) {
             Boolean consent = jdbc.queryForObject(
                     "select e_delivery_consent from case_file where id = ?", Boolean.class, caseId);
@@ -154,11 +163,10 @@ public class FormalizationController {
                                            receipt_signed_at, doc_kind, document_id)
                 values (?,?,?,?,?,?,?,?,?)""",
                 caseId, method,
-                body.get("deliveredAt") == null ? LocalDate.now() : LocalDate.parse((String) body.get("deliveredAt")),
+                dateOrToday(body, "deliveredAt", "送达日期"),
                 body.get("receiver"), body.get("note"), body.get("receiptNo"),
-                body.get("receiptSignedAt") == null ? null : LocalDate.parse((String) body.get("receiptSignedAt")),
-                body.getOrDefault("docKind", "OTHER"),
-                body.get("documentId") == null ? null : ((Number) body.get("documentId")).longValue());
+                optDate(body, "receiptSignedAt", "回证签收日期"),
+                body.getOrDefault("docKind", "OTHER"), documentId);
         return R.ok();
     }
 
@@ -173,7 +181,7 @@ public class FormalizationController {
                 insert into agreement_action (case_id, action, org, sent_at, note)
                 values (?,?,?,?,?)""",
                 caseId, body.get("action"), body.getOrDefault("org", "医保经办机构"),
-                body.get("sentAt") == null ? LocalDate.now() : LocalDate.parse(body.get("sentAt")),
+                dateOrToday(body, "sentAt", "发出日期"),
                 body.get("note"));
         return R.ok();
     }
@@ -192,9 +200,11 @@ public class FormalizationController {
     public R<Void> transferReceipt(@PathVariable Long id, @RequestBody Map<String, String> body) {
         if (body.get("receiptNo") == null || body.get("receiptNo").isBlank())
             throw new BizException(2059, "须填写受案回执文号");
-        int n = jdbc.update("update case_transfer set receipt_no = ?, receipt_at = ? where id = ?",
+        int n = jdbc.update("""
+                update case_transfer set receipt_no = ?, receipt_at = ?
+                where id = ? and receipt_no is null""",
                 body.get("receiptNo"), LocalDate.now(), id);
-        if (n == 0) throw new BizException(2059, "移送记录不存在");
+        if (n == 0) throw new BizException(2059, "移送记录不存在或已登记受案回执（不可覆盖）");
         return R.ok();
     }
 

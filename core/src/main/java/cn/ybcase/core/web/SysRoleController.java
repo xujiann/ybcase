@@ -21,6 +21,7 @@ public class SysRoleController {
     private final SysRoleRepository roleRepository;
     private final SysMenuRepository menuRepository;
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasRole('ADMIN')")
     @GetMapping
     public R<List<Map<String, Object>>> list() {
         return R.ok(roleRepository.findAll().stream()

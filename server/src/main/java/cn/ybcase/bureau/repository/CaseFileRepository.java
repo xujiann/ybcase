@@ -9,6 +9,7 @@ public interface CaseFileRepository extends JpaRepository<CaseFile, Long> {
 
     List<CaseFile> findTop200ByOrderByIdDesc();
 
-    List<CaseFile> findByStatusOrderByIdDesc(String status);
+    /** 无 limit 会把归档多年的全部案件（含大文本）一次载入，故与 findTop200 对齐 */
+    List<CaseFile> findTop200ByStatusOrderByIdDesc(String status);
 
 }

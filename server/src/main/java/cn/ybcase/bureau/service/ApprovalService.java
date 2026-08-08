@@ -58,17 +58,19 @@ public class ApprovalService {
     /** 负责人裁决：批准即执行对应动作（同事务，失败则整单回滚） */
     @Transactional
     public Map<String, Object> decide(long approvalId, boolean approve, String opinion, String approver) {
-        var rows = jdbc.queryForList("select * from biz_approval where id = ? and status = 'PENDING'", approvalId);
-        if (rows.isEmpty()) throw new BizException(2072, "审批单不存在或已办结");
+        // 先抢占单据（带状态条件的原子 update）：先查后改会被双击/并发裁决执行两次，
+        // EXTEND 会把期限顺延两倍、FILE_CASE 会建出两个案件
+        int claimed = jdbc.update("""
+                update biz_approval set status = ?, approver = ?, decided_at = now(), opinion = ?
+                where id = ? and status = 'PENDING'""",
+                approve ? "APPROVED" : "REJECTED", approver, opinion, approvalId);
+        if (claimed == 0) throw new BizException(2072, "审批单不存在或已办结");
+        var rows = jdbc.queryForList("select * from biz_approval where id = ?", approvalId);
         var a = rows.get(0);
         Object executed = null;
         if (approve) {
             executed = execute((String) a.get("kind"), a, approver);
         }
-        jdbc.update("""
-                update biz_approval set status = ?, approver = ?, decided_at = now(), opinion = ?
-                where id = ?""",
-                approve ? "APPROVED" : "REJECTED", approver, opinion, approvalId);
         // 即时通知申请人
         messageService.send((String) a.get("applicant"), "APPROVAL",
                 "审批单 #" + approvalId + "（" + KIND_NAMES.getOrDefault((String) a.get("kind"), "") + "）"

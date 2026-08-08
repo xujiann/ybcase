@@ -64,7 +64,11 @@ const rows = ref<any[]>([])
 const items = ref<any[]>([])
 const loading = ref(false)
 const dlg = ref(false)
-const form = reactive<any>({ itemId: null, objectName: '', objectType: 'PROVIDER', officers: '', plannedAt: new Date().toISOString().slice(0, 10) })
+function todayLocal() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+const form = reactive<any>({ itemId: null, objectName: '', objectType: 'PROVIDER', officers: '', plannedAt: todayLocal() })
 
 async function load() {
   loading.value = true

@@ -4,6 +4,7 @@ import cn.ybcase.bureau.entity.CaseClue;
 import cn.ybcase.bureau.repository.CaseClueRepository;
 import cn.ybcase.bureau.service.ClueService;
 import cn.ybcase.core.common.R;
+import static cn.ybcase.bureau.common.ReqValues.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
@@ -43,7 +44,7 @@ public class ClueController {
     /** 核查期限扣除（鉴定/检验时间不计入，辽15条） */
     @PostMapping("/{id}/exclusions")
     public R<CaseClue> addExclusion(@PathVariable Long id, @RequestBody Map<String, Object> body) {
-        return R.ok(clueService.addExclusion(id, ((Number) body.get("days")).intValue(),
+        return R.ok(clueService.addExclusion(id, reqInt(body, "days", "不计入核查期限的天数"),
                 (String) body.get("reason")));
     }
 }

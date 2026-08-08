@@ -86,7 +86,7 @@ async function load() {
 }
 
 function openCreate() {
-  Object.assign(form, { id: null, name: '', code: '', type: 'CLINICAL', sortNo: 0 })
+  Object.assign(form, { id: null, name: '', code: '', type: 'CLINICAL', sortNo: 0, enabled: true })
   dialogVisible.value = true
 }
 

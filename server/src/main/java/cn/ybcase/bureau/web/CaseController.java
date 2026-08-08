@@ -4,6 +4,7 @@ import cn.ybcase.bureau.entity.*;
 import cn.ybcase.bureau.repository.CaseFileRepository;
 import cn.ybcase.bureau.service.CaseService;
 import cn.ybcase.core.common.R;
+import static cn.ybcase.bureau.common.ReqValues.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
@@ -39,7 +40,7 @@ public class CaseController {
         // 未传 page 且未开数据范围时保持旧契约（E2E/既有前端）；否则走分页（含范围过滤）
         if (page == null && q == null && !caseService.scopedSelf(privileged(auth))) {
             return R.ok(status == null ? caseRepository.findTop200ByOrderByIdDesc()
-                    : caseRepository.findByStatusOrderByIdDesc(status));
+                    : caseRepository.findTop200ByStatusOrderByIdDesc(status));
         }
         return R.ok(caseService.pageList(status, q, page == null ? 1 : page, Math.min(size, 100),
                 auth.getName(), privileged(auth)));
@@ -172,10 +173,10 @@ public class CaseController {
     @PostMapping("/{id}/extend")
     public R<CaseFile> extend(@PathVariable Long id, @RequestBody Map<String, Object> body,
                               Authentication auth) {
-        CaseFile r = caseService.extend(id, ((Number) body.get("days")).intValue(),
-                (String) body.get("reason"));
+        int days = reqInt(body, "days", "延长天数");
+        CaseFile r = caseService.extend(id, days, (String) body.get("reason"));
         approvalService.recordDirect("EXTEND", id,
-                "延长" + body.get("days") + "日：" + body.get("reason"), auth.getName());
+                "延长" + days + "日：" + body.get("reason"), auth.getName());
         return R.ok(r);
     }
 

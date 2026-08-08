@@ -159,8 +159,13 @@ async function load() {
   }
 }
 
-function openCreate() {
+function openCreate(fromClue = false) {
   form.officers = emptyOfficers()
+  // 从线索跳转以外的入口必须清掉线索关联，否则新案会把上次那条线索标记为已立案
+  if (!fromClue) {
+    form.clueId = null
+    form.clueVerifyResult = null
+  }
   createVisible.value = true
 }
 
@@ -188,7 +193,7 @@ onMounted(async () => {
     form.clueId = Number(route.query.clueId)
     form.partyName = String(route.query.suspectName || '')
     form.partyType = String(route.query.suspectType || 'PROVIDER')
-    openCreate()
+    openCreate(true)
   }
   load()
 })

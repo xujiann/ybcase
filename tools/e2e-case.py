@@ -30,13 +30,13 @@ def ok(cond, msg):
 
 
 class Api:
-    def __init__(self, username):
+    def __init__(self, username, password="admin123"):
         # 健康检查通过 ≠ 初始化器已建好默认账号（ApplicationRunner 晚于 Web 就绪）——登录重试消除时序 flake
         import time
         last = None
         for _ in range(30):
             r = requests.post(f"{BASE}/auth/login",
-                              json={"username": username, "password": "admin123"}, timeout=10)
+                              json={"username": username, "password": password}, timeout=10)
             last = r.json()
             if last.get("code") == 0:
                 self.token = last["data"]["token"]
@@ -418,6 +418,11 @@ def main():
     admin.post(f"/bureau/cases/{d_case['id']}/report", json={"content": "调查终结"})
     admin.post(f"/bureau/cases/{d_case['id']}/notice", json={
         "content": "拟罚5000", "proposedFine": 5000, "proposedRecoup": 4000})
+    # 陈述申辩期未届满且未放弃 → 2076（第三轮整改新守卫）
+    admin.post(f"/bureau/cases/{d_case['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 5000, "recoupAmount": 4000,
+        "discretionReason": "x", "content": "x"}, expect_code=2076)
+    admin.post(f"/bureau/cases/{d_case['id']}/statement", json={"statementWaived": True})
     admin.post(f"/bureau/cases/{d_case['id']}/decide", json={
         "decisionType": "PUNISH", "fineAmount": 5000, "recoupAmount": 4000,
         "content": "x"}, expect_code=2062)
@@ -439,16 +444,25 @@ def main():
     admin.post(f"/bureau/installments/{inst[0]['id']}/pay")
     ok(admin.get(f"/bureau/cases/{d_case['id']}/installments")[0]["paid_at"], "第1期已缴")
 
-    step("专家评审：结束自动登记期限扣除（第25/45条）")
-    e_case_before = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
+    step("专家评审：结束自动登记期限扣除（第25/45条）；起始日不得由结束请求倒填")
+    # 起始日只在启动时登记且受校验（不得早于立案日、不得晚于今天）
+    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews",
+               json={"experts": "临床专家A、医保专家B", "startedAt": str(today - datetime.timedelta(days=4))},
+               expect_code=2066)  # 案件今日立案，评审不可能 4 日前开始
+    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews",
+               json={"experts": "临床专家A、医保专家B", "startedAt": str(today + datetime.timedelta(days=1))},
+               expect_code=2066)  # 未来日期
     admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews", json={"experts": "临床专家A、医保专家B"})
-    er_start = str(today - datetime.timedelta(days=4))
     er_id = admin.get(f"/bureau/cases/{d_case['id']}")["expertReviews"][-1]["id"]  # 用本次创建的真实 id，非全新库也可跑
+    e_case_before = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
+    # 结束时倒填一个很早的开始日：应被忽略，扣除仍按库内登记的今天计
     admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews/{er_id}/end", json={
-        "opinion": "病历评审意见：过度诊疗成立", "startedAt": er_start, "endedAt": str(today)})
+        "opinion": "病历评审意见：过度诊疗成立",
+        "startedAt": str(today - datetime.timedelta(days=300)), "endedAt": str(today)})
     e_case_after = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
-    ok(datetime.date.fromisoformat(e_case_after) - datetime.date.fromisoformat(e_case_before)
-       == datetime.timedelta(days=4), "评审4日已计入期限扣除")
+    ok(e_case_after == e_case_before, "结束请求中的倒填起始日被忽略，期限未被凭空延长")
+    er_done = admin.get(f"/bureau/cases/{d_case['id']}")["expertReviews"][-1]
+    ok(er_done["ended_at"] == str(today) and er_done["started_at"] == str(today), "评审起止以库内登记为准")
 
     step("公示导出：自然人姓名脱敏")
     export = admin.get("/bureau/decisions/publish-export")
@@ -515,7 +529,8 @@ def main():
         "discretionReason": "listed", "content": "罚款12万元"})
     admin.post(f"/bureau/cases/{hid}/deliver",
                json={"method": "ELECTRONIC", "receiver": "法人"}, expect_code=2054)
-    admin.post(f"/bureau/cases/{hid}/e-delivery-consent")
+    admin.post(f"/bureau/cases/{hid}/e-delivery-consent",
+               json={"receiver": "听证医院", "channel": "13900000000"})
     delivered_h = admin.post(f"/bureau/cases/{hid}/deliver", json={
         "method": "ELECTRONIC", "receiver": "法人", "note": "已签电子送达确认书"})
     ok(delivered_h["status"] == "DELIVERED", "签确认书后电子送达成功（国家局令59条口径）")
@@ -654,6 +669,11 @@ def main():
                          json={"oldPassword": "Fix2026pwd", "newPassword": "admin123"},
                          timeout=10, headers={"Authorization": f"Bearer {tok}"}).json()
     ok(back["code"] == 0, "改密闭环并复位")
+    # 改密即吊销旧令牌：banban 手里改密前的令牌此刻已失效，须重新登录
+    r_stale = requests.get(f"{BASE}/bureau/my/workbench", timeout=10,
+                           headers={"Authorization": f"Bearer {banban.token}"})
+    ok(r_stale.status_code in (401, 403), f"改密前的旧令牌已失效（HTTP {r_stale.status_code}）")
+    banban = Api("banban")
 
     step("专家评审列表进入案件详情（含UI数据源）")
     ok("expertReviews" in admin.get(f"/bureau/cases/{d_case['id']}"), "expertReviews 已在详情聚合")
@@ -816,6 +836,16 @@ def main():
         banban.get(f"/bureau/cases/{scope_case['id']}/installments", expect_code=2080)
         banban.get(f"/bureau/cases/{scope_case['id']}/discretion-suggest", expect_code=2080)
         print("    PASS: 大事记/卷宗/附件/分期/裁量侧门全部 2080")
+        # 写操作此前全线敞开：可对看不见的他人案件加证据/文书/送达
+        banban.post(f"/bureau/cases/{scope_case['id']}/evidences", json={
+            "type": "DOCUMENT", "name": "越权证据", "obtainedAt": str(today)}, expect_code=2080)
+        banban.post(f"/bureau/cases/{scope_case['id']}/documents", json={
+            "docType": "OTHER", "title": "越权文书"}, expect_code=2080)
+        banban.post(f"/bureau/cases/{scope_case['id']}/notice", json={
+            "content": "越权告知", "proposedFine": 1}, expect_code=2080)
+        banban.get(f"/bureau/cases/{scope_case['id']}/documents/render",
+                   params={"docType": "DECISION"}, expect_code=2080)
+        print("    PASS: 写操作与文书渲染侧门一并 2080")
         sr_bb = banban.get("/bureau/search", params={"q": "范围隔离"})
         ok(all(c_["id"] != scope_case["id"] for c_ in sr_bb["cases"]), "SELF 下全局搜索不含隔离案")
         sr_ju = juzhang.get("/bureau/search", params={"q": "范围隔离"})
@@ -840,6 +870,87 @@ def main():
     ok(any(a["id"] == ap_pf["id"] for a in juzhang.get("/bureau/approvals/pending")), "负责人全量可见")
     juzhang.post(f"/bureau/approvals/{ap_pf['id']}/decide", json={"approve": False, "opinion": "回归清理"})
 
+    step("听证未举行不得决定（2075）；重复告知加重须载明变更理由（2077）")
+    hg = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "听证守卫医院", "partyType": "PROVIDER",
+        "amountInvolved": 200000,
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    admin.post(f"/bureau/cases/{hg['id']}/report", json={"content": "调查终结"})
+    admin.post(f"/bureau/cases/{hg['id']}/notice", json={
+        "content": "拟罚15万", "proposedFine": 150000, "proposedRecoup": 0})
+    admin.post(f"/bureau/cases/{hg['id']}/statement", json={"hearingRequested": True})
+    admin.post(f"/bureau/cases/{hg['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 150000, "discretionReason": "x",
+        "content": "x"}, expect_code=2075)
+    print("    PASS: 申请听证未举行即决定被拒")
+    # 再次告知抬高金额且不说明理由 → 2077
+    admin.post(f"/bureau/cases/{hg['id']}/notice", json={
+        "content": "改拟罚30万", "proposedFine": 300000, "proposedRecoup": 0}, expect_code=2077)
+    admin.post(f"/bureau/cases/{hg['id']}/notice", json={
+        "content": "改拟罚30万", "proposedFine": 300000, "proposedRecoup": 0,
+        "changeReason": "复核发现新增两家分院同类违法事实，依据与认定金额变更"})
+    print("    PASS: 加重再告知须载明变更理由")
+
+    step("决定金额以历次告知最低额为上限（防重新告知绕过 2007）")
+    admin.post(f"/bureau/cases/{hg['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 300000, "discretionReason": "x",
+        "content": "x"}, expect_code=2007)
+    print("    PASS: 按最低告知额 15 万卡住 30 万决定")
+
+    step("执法人员按证号去重（2002）；重复添加同证号拒")
+    admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "重复执法人员医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "王办案", "certNo": "YB001"}]},
+        expect_code=2002)
+    admin.post(f"/bureau/cases/{hg['id']}/officers",
+               json={"name": "王办案", "certNo": "YB001", "duty": "MEMBER"}, expect_code=2002)
+    print("    PASS: 同一执法证不能凑够两人")
+
+    step("期限扣除区间校验：越界/倒挂/重叠/超上限均拒（2032）")
+    ex_case = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "扣除校验医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]})
+    exid = ex_case["id"]
+    admin.post(f"/bureau/cases/{exid}/exclusions",
+               json={"reason": "APPRAISE", "startAt": "2000-01-01", "endAt": str(today)}, expect_code=2032)
+    admin.post(f"/bureau/cases/{exid}/exclusions",
+               json={"reason": "APPRAISE", "endAt": str(today)}, expect_code=2032)
+    admin.post(f"/bureau/cases/{exid}/exclusions", json={
+        "reason": "APPRAISE", "startAt": str(today),
+        "endAt": str(today - datetime.timedelta(days=1))}, expect_code=2032)
+    admin.post(f"/bureau/cases/{exid}/exclusions", json={
+        "reason": "APPRAISE", "startAt": str(today),
+        "endAt": str(today + datetime.timedelta(days=400))}, expect_code=2032)
+    admin.post(f"/bureau/cases/{exid}/exclusions", json={
+        "reason": "APPRAISE", "startAt": str(today), "endAt": str(today + datetime.timedelta(days=5))})
+    admin.post(f"/bureau/cases/{exid}/exclusions", json={
+        "reason": "TEST", "startAt": str(today), "endAt": str(today + datetime.timedelta(days=2))},
+        expect_code=2032)
+    print("    PASS: 立案前/缺起始/倒挂/超上限/重叠 全部拒绝")
+
+    step("审批单裁决幂等：同一单二次裁决拒（防双击双执行）")
+    ap_dup = banban.post("/bureau/approvals", json={
+        "kind": "EXTEND", "caseId": exid, "payload": {"days": 5}, "reason": "幂等回归"})
+    juzhang.post(f"/bureau/approvals/{ap_dup['id']}/decide", json={"approve": True, "opinion": "同意"})
+    juzhang.post(f"/bureau/approvals/{ap_dup['id']}/decide",
+                 json={"approve": True, "opinion": "重复点击"}, expect_code=2072)
+    print("    PASS: 期限只顺延一次")
+
+    step("参数不合法返回业务码而非 500（延期天数/日期格式）")
+    juzhang.post(f"/bureau/cases/{exid}/extend", json={"reason": "漏传天数"}, expect_code=2100)
+    juzhang.post(f"/bureau/cases/{exid}/extend", json={"days": "三十", "reason": "非数字"}, expect_code=2100)
+    admin.post(f"/bureau/cases/{exid}/doc-deliveries",
+               json={"method": "DIRECT", "deliveredAt": "2026/01/01"}, expect_code=2100)
+    print("    PASS: 2100 参数提示替代 500")
+
+    step("电子送达确认书须留痕（受送达人+电子地址）")
+    admin.post(f"/bureau/cases/{exid}/e-delivery-consent", json={}, expect_code=2054)
+    admin.post(f"/bureau/cases/{exid}/e-delivery-consent",
+               json={"receiver": "扣除校验医院", "channel": "13800000000", "docNo": "DZSD-2026-001"})
+    consent_docs = [d for d in admin.get(f"/bureau/cases/{exid}")["documents"]
+                    if d.get("doc_type", d.get("docType")) == "E_DELIVERY_CONSENT"]
+    ok(len(consent_docs) == 1, "确认书已入卷")
+
     step("案件移交：负责人变更承办人后归属生效")
     own_case = next(r for r in banban.get("/bureau/cases", params={"page": 1, "size": 50, "q": "审批立案医院"})["rows"])
     banban.post(f"/bureau/cases/{own_case['id']}/transfer-owner", json={"newOwner": "fazhi"}, expect_code=403)
@@ -847,6 +958,31 @@ def main():
     moved_own = juzhang.post(f"/bureau/cases/{own_case['id']}/transfer-owner", json={"newOwner": "fazhi"})
     ok(moved_own["ownerUser"] == "fazhi", "承办人已移交 fazhi")
     ok(fazhi.get("/bureau/messages/unread-count") > fz_unread0, "接收人收到移交消息")
+
+    step("改密即吊销旧令牌（令牌版本戳）")
+    admin.post("/system/users", json={
+        "username": "tokentest", "password": "Init12345", "realName": "令牌测试",
+        "roleCodes": ["HANDLER"]})
+    tt = Api("tokentest", password="Init12345")
+    tt.get("/auth/me")
+    tt.post("/auth/change-password", json={"oldPassword": "Init12345", "newPassword": "Next12345"})
+    r_old = requests.get(f"{BASE}/auth/me", timeout=10,
+                         headers={"Authorization": f"Bearer {tt.token}"})
+    ok(r_old.status_code in (401, 403), f"旧令牌已失效（HTTP {r_old.status_code}）")
+    tt2 = Api("tokentest", password="Next12345")
+    ok(tt2.get("/auth/me")["username"] == "tokentest", "新口令可登录")
+
+    step("停用账号即断开在线会话")
+    uid = next(u["id"] for u in admin.get("/system/users", params={"size": 200})["records"]
+               if u["username"] == "tokentest")
+    admin.call("PUT", f"/system/users/{uid}/enabled?enabled=false")
+    r_dis = requests.get(f"{BASE}/auth/me", timeout=10,
+                         headers={"Authorization": f"Bearer {tt2.token}"})
+    ok(r_dis.status_code in (401, 403), f"停用后令牌立即失效（HTTP {r_dis.status_code}）")
+
+    step("角色授权矩阵仅管理员可读")
+    banban.get("/system/roles", expect_code=403)
+    ok(len(admin.get("/system/roles")) >= 4, "管理员可读角色矩阵")
 
     step("OpenAPI 文档可用（对接厂商契约）")
     docs_r = requests.get(f"{BASE.replace('/api','')}/v3/api-docs", timeout=15,
@@ -1025,6 +1161,9 @@ def main():
             "content": "拟处罚款1500元", "proposedFine": 1500, "proposedRecoup": 3000})
         ok(ln_notice["hearingEntitled"] is True, "自然人1000元档已告知听证权利")
         ok(ln_notice["statementDeadline"] == str(today + datetime.timedelta(days=3)), "陈述申辩期限=告知+3日（辽44条）")
+        # 期限内决定须先留痕当事人已陈述申辩或明确放弃（2076）
+        admin.post(f"/bureau/cases/{lnid}/statement",
+                   json={"statement": "承认冒名购药", "statementReview": "属实，维持拟处罚"})
 
         step("辽·全案法制审核：小额案件未审核也不得决定（2005，辽40条）")
         admin.post(f"/bureau/cases/{lnid}/decide", json={

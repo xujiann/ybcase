@@ -95,3 +95,40 @@ jobs:
 
       - name: 运行 E2E 回归
         run: python3 tools/e2e-case.py
+
+      # E2E 跑的是默认 profile，而生产/公网演示跑 pilot：
+      # pilot 的占位符拼错、键名写错这类问题此前 CI 全绿、部署当场炸
+      - name: pilot profile 启动校验（生产同构配置）
+        run: |
+          kill $(jps -l | grep ybcase-server | cut -d' ' -f1) 2>/dev/null || true
+          sleep 3
+          export YBCASE_DB_URL=jdbc:postgresql://localhost:5432/ybcase
+          export YBCASE_DB_USER=hip
+          export YBCASE_DB_PASSWORD=hip123456
+          export YBCASE_JWT_SECRET=ci-only-pilot-secret-0123456789abcdefghijklmnop
+          nohup java -jar server/target/ybcase-server-*.jar \
+            --spring.profiles.active=pilot --server.port=8091 > pilot.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8091/actuator/health && break
+            sleep 2
+          done
+          curl -sf http://localhost:8091/actuator/health || { tail -60 pilot.log; exit 1; }
+          # pilot 下 Swagger 必须关闭
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8091/v3/api-docs)
+          test "$code" != "200" || { echo "pilot 下 OpenAPI 文档未关闭（HTTP $code）"; exit 1; }
+          echo "pilot 启动校验通过（Swagger 已关闭，HTTP $code）"
+
+      - name: 拒绝默认密钥启动 pilot（安全门禁）
+        run: |
+          export YBCASE_DB_URL=jdbc:postgresql://localhost:5432/ybcase
+          export YBCASE_DB_USER=hip
+          export YBCASE_DB_PASSWORD=hip123456
+          # 显式喂入仓库里的开发默认密钥，验证 pilot 会拒绝启动
+          export YBCASE_JWT_SECRET=dev-only-secret-change-me-bureau-case-0123456789
+          if java -jar server/target/ybcase-server-*.jar \
+               --spring.profiles.active=pilot --server.port=8092 > insecure.log 2>&1; then
+            echo "预期启动失败但成功了：默认 JWT 密钥竟可用于 pilot"; exit 1
+          fi
+          grep -q "拒绝以开发默认 JWT 密钥启动" insecure.log \
+            || { echo "启动失败原因不是密钥门禁："; tail -30 insecure.log; exit 1; }
+          echo "默认密钥已被正确拒绝"

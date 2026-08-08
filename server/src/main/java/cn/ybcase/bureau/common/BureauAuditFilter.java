@@ -23,6 +23,9 @@ public class BureauAuditFilter extends OncePerRequestFilter {
 
     private static final Set<String> WRITE_METHODS = Set.of("POST", "PUT", "DELETE", "PATCH");
 
+    /** 异常处理器把业务错误码放到这里，供审计记录真实结果 */
+    public static final String BIZ_CODE_ATTR = "ybcaseBizCode";
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
@@ -39,11 +42,15 @@ public class BureauAuditFilter extends OncePerRequestFilter {
                     && !uri.equals("/api/auth/login")) {
                 try {
                     Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+                    // 业务异常统一以 HTTP 200 + 业务码返回，若只记 http_status，
+                    // 越权尝试在审计里与成功操作完全同形；故把业务码并入状态列
+                    Object bizCode = request.getAttribute(BIZ_CODE_ATTR);
+                    int status = bizCode instanceof Integer c && c != 0 ? c : response.getStatus();
                     jdbc.update("""
                             insert into sys_audit_log (username, method, path, http_status, client_ip, request_id)
                             values (?,?,?,?,?,?)""",
                             auth == null ? null : auth.getName(), request.getMethod(),
-                            uri, response.getStatus(), request.getRemoteAddr(),
+                            uri, status, request.getRemoteAddr(),
                             request.getAttribute(RequestIdFilter.ATTR));
                 } catch (Exception ignore) {
                     // 审计失败不影响业务

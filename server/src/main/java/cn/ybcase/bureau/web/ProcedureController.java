@@ -47,10 +47,11 @@ public class ProcedureController {
         return R.ok(procedureService.summaryRecord(id));
     }
 
-    // 电子送达确认书
+    // 电子送达确认书（第59条：须当事人签署，登记时同步生成确认书文书留痕）
     @PostMapping("/cases/{id}/e-delivery-consent")
-    public R<CaseFile> eDeliveryConsent(@PathVariable Long id) {
-        return R.ok(procedureService.eDeliveryConsent(id));
+    public R<CaseFile> eDeliveryConsent(@PathVariable Long id, @RequestBody(required = false) Map<String, String> body) {
+        Map<String, String> b = body == null ? Map.of() : body;
+        return R.ok(procedureService.eDeliveryConsent(id, b.get("receiver"), b.get("channel"), b.get("docNo")));
     }
 
     // 移送台账

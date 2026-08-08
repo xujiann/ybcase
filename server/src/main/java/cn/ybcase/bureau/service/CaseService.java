@@ -53,8 +53,11 @@ public class CaseService {
 
     @Transactional
     public CaseFile create(CaseCreateReq req, String username) {
-        if (req.officers() == null || req.officers().size() < 2)
-            throw new BizException(2002, "执法人员不得少于两人（第16条）");
+        // 按执法证号去重计数：重复填同一人不算两人（第16条）
+        if (req.officers() == null
+                || req.officers().stream().map(OfficerReq::certNo).filter(java.util.Objects::nonNull)
+                       .map(String::trim).distinct().count() < 2)
+            throw new BizException(2002, "执法人员不得少于两人（第16条），且须为不同执法证号");
         CaseCause cause = causeRepository.findById(req.causeId())
                 .orElseThrow(() -> new BizException(2026, "案由不存在"));
         if (!cause.getSubjectType().equals(req.partyType()))
@@ -111,6 +114,10 @@ public class CaseService {
     public void addOfficer(Long caseId, OfficerReq req) {
         requireActive(get(caseId));
         procedureService.validateEnforcer(req.name(), req.certNo());
+        Integer dup = jdbc.queryForObject(
+                "select count(*) from case_officer where case_id = ? and cert_no = ? and avoided = false",
+                Integer.class, caseId, req.certNo());
+        if (dup != null && dup > 0) throw new BizException(2002, "该执法证号已在本案办案人员名单中");
         jdbc.update("insert into case_officer (case_id, name, cert_no, duty) values (?,?,?,?)",
                 caseId, req.name(), req.certNo(), req.duty() == null ? "MEMBER" : req.duty());
     }
@@ -120,16 +127,17 @@ public class CaseService {
     public void avoidOfficer(Long caseId, Long officerId, String reason, String applicant, String decidedBy) {
         requireActive(get(caseId));
         Integer active = jdbc.queryForObject(
-                "select count(*) from case_officer where case_id = ? and avoided = false and id <> ?",
+                "select count(distinct cert_no) from case_officer where case_id = ? and avoided = false and id <> ?",
                 Integer.class, caseId, officerId);
         if (active == null || active < 2)
             throw new BizException(2002, "回避后执法人员将少于两人，请先补充办案人员（第16条）");
         if ("PARTY".equals(applicant) && (decidedBy == null || decidedBy.isBlank()))
             throw new BizException(2061, "当事人申请回避须经负责人审查决定并记录批准人（第5条）");
-        jdbc.update("""
+        int n = jdbc.update("""
                 update case_officer set avoided = true, avoid_reason = ?, avoid_applicant = ?, avoid_decided_by = ?
-                where id = ? and case_id = ?""",
+                where id = ? and case_id = ? and avoided = false""",
                 reason, applicant == null ? "SELF" : applicant, decidedBy, officerId, caseId);
+        if (n == 0) throw new BizException(2061, "办案人员不存在于本案或已回避");
     }
 
     // ---------- 文书 ----------
@@ -155,9 +163,31 @@ public class CaseService {
 
     @Transactional
     public void addExclusion(Long caseId, ExclusionReq req) {
-        requireActive(get(caseId));
+        CaseFile c = get(caseId);
+        requireActive(c);
         if (!List.of("TEST", "APPRAISE", "HEARING", "ANNOUNCE", "EXPERT").contains(req.reason()))
             throw new BizException(2032, "不计入期限的情形限于检测检验/鉴定/听证/公告/专家评审（第45条）");
+        // 期限扣除会直接推后办案期限，是绕开"延期须负责人批准且累计≤上限"的口子——须严格校验区间
+        if (req.startAt() == null) throw new BizException(2032, "须填写不计入期限的起始日期");
+        if (req.startAt().isBefore(c.getFiledAt()))
+            throw new BizException(2032, "起始日期不得早于立案日期（" + c.getFiledAt() + "）");
+        if (req.startAt().isAfter(LocalDate.now()))
+            throw new BizException(2032, "起始日期不得晚于今天");
+        if (req.endAt() != null) {
+            if (req.endAt().isBefore(req.startAt()))
+                throw new BizException(2032, "结束日期不得早于起始日期");
+            long span = ChronoUnit.DAYS.between(req.startAt(), req.endAt()) + 1;
+            int max = config.intVal("exclusion_max_days", 180);
+            if (span > max)
+                throw new BizException(2032, "单次不计入期限的天数（" + span + "日）超过上限 " + max + " 日，请核实起止日期");
+        }
+        // 区间重叠会被重复扣除，等于凭空延长期限
+        Integer overlap = jdbc.queryForObject("""
+                select count(*) from case_period_exclusion
+                where case_id = ? and coalesce(end_at, current_date) >= ? and start_at <= ?""",
+                Integer.class, caseId, req.startAt(), req.endAt() == null ? LocalDate.now() : req.endAt());
+        if (overlap != null && overlap > 0)
+            throw new BizException(2032, "该时间段与已登记的不计入期限区间重叠，不得重复扣除");
         jdbc.update("insert into case_period_exclusion (case_id, reason, start_at, end_at, note) values (?,?,?,?,?)",
                 caseId, req.reason(), req.startAt(), req.endAt(), req.note());
     }
@@ -288,7 +318,8 @@ public class CaseService {
 
     // ---------- 处罚告知/陈述申辩/听证（第41条） ----------
 
-    public record NoticeReq(String content, BigDecimal proposedFine, BigDecimal proposedRecoup) {}
+    public record NoticeReq(String content, BigDecimal proposedFine, BigDecimal proposedRecoup,
+                            String changeReason) {}
 
     @Transactional
     public CaseNotice notify(Long caseId, NoticeReq req) {
@@ -296,7 +327,16 @@ public class CaseService {
         // REPORTED 首次告知；NOTIFIED 允许再次告知（辽52条：改变原认定的事实/证据/依据须重新履行告知程序）
         if (!List.of("REPORTED", "NOTIFIED").contains(c.getStatus()))
             throw new BizException(2004, "调查终结后方可作出处罚告知（第36/41条）");
+        // 再次告知且金额高于此前：须载明改变原认定事实/证据/依据的理由，避免借重新告知规避"不得因申辩加重"
+        CaseNotice prev = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+        if (prev != null
+                && (nz(req.proposedFine()).compareTo(nz(prev.getProposedFine())) > 0
+                    || nz(req.proposedRecoup()).compareTo(nz(prev.getProposedRecoup())) > 0)
+                && (req.changeReason() == null || req.changeReason().isBlank()))
+            throw new BizException(2077, "再次告知的拟处罚金额高于前次，须载明改变原认定事实、证据或依据的理由（辽52条）；"
+                    + "不得因当事人陈述申辩而加重处罚（第41条）");
         CaseNotice n = new CaseNotice();
+        n.setChangeReason(req.changeReason());
         n.setCaseId(caseId);
         n.setNotifiedAt(LocalDate.now());
         n.setContent(req.content());
@@ -315,7 +355,8 @@ public class CaseService {
     }
 
     public record StatementReq(String statement, String statementReview,
-                               Boolean hearingRequested, LocalDate hearingHeldAt) {}
+                               Boolean hearingRequested, LocalDate hearingHeldAt,
+                               Boolean statementWaived) {}
 
     @Transactional
     public CaseNotice recordStatement(Long caseId, StatementReq req) {
@@ -327,6 +368,8 @@ public class CaseService {
             throw new BizException(2046, "已超过陈述申辩期限（" + n.getStatementDeadline() + "），视为放弃权利（辽44条）");
         if (req.statement() != null) n.setStatement(req.statement());
         if (req.statementReview() != null) n.setStatementReview(req.statementReview());
+        // 当事人明确放弃陈述申辩：留痕后方可在期限届满前决定（第41条）
+        if (Boolean.TRUE.equals(req.statementWaived())) n.setStatementWaived(true);
         if (req.hearingRequested() != null) {
             if (Boolean.TRUE.equals(req.hearingRequested()) && !Boolean.TRUE.equals(n.getHearingEntitled()))
                 throw new BizException(2039, "该案未达听证标准，无听证权利告知记录");
@@ -390,9 +433,31 @@ public class CaseService {
                 throw new BizException(2006, "作出处罚决定前应当书面告知当事人并听取陈述申辩（第41条）");
             CaseNotice notice = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
                     .orElseThrow(() -> new BizException(2006, "缺少处罚告知记录（第41条）"));
-            // 第41条：不得因陈述、申辩或申请听证而加重处罚
-            if (fine.compareTo(notice.getProposedFine()) > 0 || recoup.compareTo(notice.getProposedRecoup()) > 0)
-                throw new BizException(2007, "决定金额不得高于告知金额——不得因陈述申辩而加重处罚（第41条）");
+            // 第41条：不得因陈述、申辩或申请听证而加重处罚。
+            // 比对全部告知中的最低拟处罚额：仅比最新一条会被"再告知一个更高金额"绕过（辽52条的重新告知
+            // 只允许在事实/证据/依据改变时进行，notify 已要求载明变更理由并重新起算陈述申辩期）。
+            List<CaseNotice> allNotices = noticeRepository.findByCaseIdOrderByIdDesc(caseId);
+            BigDecimal minFine = allNotices.stream()
+                    .map(CaseNotice::getProposedFine).filter(java.util.Objects::nonNull)
+                    .min(BigDecimal::compareTo).orElse(notice.getProposedFine());
+            BigDecimal minRecoup = allNotices.stream()
+                    .map(CaseNotice::getProposedRecoup).filter(java.util.Objects::nonNull)
+                    .min(BigDecimal::compareTo).orElse(notice.getProposedRecoup());
+            if (fine.compareTo(minFine) > 0 || recoup.compareTo(minRecoup) > 0)
+                throw new BizException(2007, "决定金额不得高于告知金额（已告知最低 罚款" + minFine + "元/追回"
+                        + minRecoup + "元）——不得因陈述申辩而加重处罚（第41条）");
+            // 第41条：当事人申请听证的，应当组织听证后再决定
+            if (Boolean.TRUE.equals(notice.getHearingRequested()) && notice.getHearingHeldAt() == null)
+                throw new BizException(2075, "当事人已申请听证，应当组织听证并制作笔录后方可作出决定（第41条）");
+            // 陈述申辩期届满前不得决定；当事人已陈述申辩或书面放弃的除外（参数开关）
+            // 已举行听证的，当事人已充分陈述申辩，不再受该期限约束
+            if ("PUNISH".equals(req.decisionType()) && config.bool("statement_wait_required", true)
+                    && notice.getStatementDeadline() != null
+                    && LocalDate.now().isBefore(notice.getStatementDeadline())
+                    && notice.getStatement() == null && !Boolean.TRUE.equals(notice.getStatementWaived())
+                    && notice.getHearingHeldAt() == null)
+                throw new BizException(2076, "陈述申辩期至 " + notice.getStatementDeadline()
+                        + " 届满前不得作出处罚决定（第41条）；当事人已陈述申辩或明确放弃的，请先录入陈述申辩记录");
             // 法制审核：THRESHOLD=数额较大或经听证必审（国家37条）；ALL=全案必审（辽40条）
             boolean needReview = "ALL".equalsIgnoreCase(config.str("legal_review_mode", "THRESHOLD"))
                     || fine.compareTo(cfgDecimal("legal_review_fine_threshold")) >= 0
@@ -686,6 +751,10 @@ public class CaseService {
             throw new BizException(2044, "案件当前状态（" + c.getStatus() + "）不允许该操作");
     }
 
+    /**
+     * 不计入办案期限的天数。口径：end - start（与 resume() 的中止顺延、MessageService 的提醒查询一致），
+     * 即"停表"模型，同日起止记 0 日。若当地要求含头含尾（同日记 1 日），三处须一并改。
+     */
     private long totalExclusionDays(Long caseId) {
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "select start_at, end_at from case_period_exclusion where case_id = ? and end_at is not null", caseId);

@@ -10,6 +10,9 @@ export interface R<T = unknown> {
 
 const client = axios.create({ baseURL: '/api', timeout: 15000 })
 
+/** 附件上传/下载走大文件通道：默认 15s 会把执法音像（最大 200MB）传到一半掐断 */
+export const LARGE_TRANSFER = { timeout: 0 }
+
 // 最近 API 错误环形缓存（反馈提交时自动附带，含 request-id 供服务端对账定位）
 export interface ApiErrorSnap {
   time: string

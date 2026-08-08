@@ -61,7 +61,8 @@ public class AuthController {
             u.setLockedUntil(null);
             userRepository.save(u);
         });
-        String token = jwtService.issue(req.username());
+        String token = jwtService.issue(req.username(),
+                userOpt.map(SysUser::getTokenVersion).orElse(0));
         // 等保：口令使用时长与定期更换提醒（超过 90 天提示）
         long pwdAgeDays = userOpt
                 .map(u -> java.time.Duration.between(u.getPasswordUpdatedAt(), java.time.Instant.now()).toDays())
@@ -89,6 +90,8 @@ public class AuthController {
         }
         user.setPassword(passwordEncoder.encode(req.newPassword()));
         user.setPasswordUpdatedAt(java.time.Instant.now());
+        // 改密即吊销全部旧令牌（含已泄露的），用户须重新登录
+        user.setTokenVersion(user.getTokenVersion() + 1);
         userRepository.save(user);
         return R.ok();
     }
