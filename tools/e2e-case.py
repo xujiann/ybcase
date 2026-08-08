@@ -826,6 +826,56 @@ def main():
     ok(docs_r.status_code == 200 and len(spec.get("paths", {})) > 60,
        f"OpenAPI paths={len(spec.get('paths', {}))}")
 
+    # ============ 用户反馈直报（bug/需求）+ request-id 定位闭环 ============
+    step("request-id：响应头返回并落审计日志")
+    r_rid = requests.get(f"{BASE}/bureau/stats/overview", timeout=10,
+                         headers={"Authorization": f"Bearer {admin.token}"})
+    rid = r_rid.headers.get("X-Request-Id")
+    ok(rid and len(rid) >= 12, f"X-Request-Id={rid}")
+    banban.post("/bureau/clues", json={"source": "COMPLAINT", "content": "为审计写入一条",
+                "suspectName": "审计对象", "suspectType": "PROVIDER", "receivedAt": str(today)})
+    logs_rid = admin.get("/audit/logs")
+    ok(any(l.get("request_id") for l in logs_rid), "审计日志已带 request_id")
+
+    step("提交反馈（自动上下文+截图）→ 管理员收消息")
+    admin_unread0 = admin.get("/bureau/messages/unread-count")
+    png_1px = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    fb = banban.post("/bureau/feedback", json={
+        "kind": "BUG", "title": "决定页偶发报错", "content": "点作出决定偶发系统内部错误",
+        "pageRoute": "/case/detail/1", "caseRef": "1", "appVersion": "1.2.0",
+        "userAgent": "E2E", "requestId": rid,
+        "recentErrors": '[{"path":"/bureau/cases/1/decide","httpStatus":200,"bizCode":500}]',
+        "screenshotBase64": png_1px})
+    ok(fb["id"], f"反馈 #{fb['id']}")
+    ok(admin.get("/bureau/messages/unread-count") > admin_unread0, "管理员收到新反馈消息")
+    banban.post("/bureau/feedback", json={"kind": "GUESS", "title": "x", "content": "x"}, expect_code=2090)
+
+    step("管理员列表/统计/截图/处理回复 → 提交人收消息")
+    fl = admin.get("/bureau/feedback")
+    row = next(r for r in fl["rows"] if r["id"] == fb["id"])
+    ok(row["has_screenshot"] is True and row["request_id"] == rid, "上下文完整")
+    ok(any(s["status"] == "NEW" for s in fl["byStatus"]), "状态统计")
+    shot = requests.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
+                        headers={"Authorization": f"Bearer {admin.token}"})
+    ok(shot.status_code == 200 and shot.content[1:4] == b"PNG", "截图可取")
+    admin.post(f"/bureau/feedback/{fb['id']}/handle",
+               json={"status": "RESOLVED"}, expect_code=2091)  # 解决须回复
+    bb_unread_fb = banban.get("/bureau/messages/unread-count")
+    admin.post(f"/bureau/feedback/{fb['id']}/handle",
+               json={"status": "RESOLVED", "reply": "已修复：决定接口空指针，随 v1.2.1 发布"})
+    ok(banban.get("/bureau/messages/unread-count") > bb_unread_fb, "提交人收到处理回复")
+
+    step("提交人确认关闭闭环 + 越权关闭拒")
+    juzhang.post(f"/bureau/feedback/{fb['id']}/close", expect_code=2091)  # 非本人
+    banban.post(f"/bureau/feedback/{fb['id']}/close")
+    mine = banban.get("/bureau/feedback/mine")
+    ok(any(m["id"] == fb["id"] and m["status"] == "CLOSED" for m in mine), "反馈 CLOSED 闭环")
+
+    step("反馈导出 CSV")
+    r_fcsv = requests.get(f"{BASE}/bureau/feedback/export", timeout=10,
+                          headers={"Authorization": f"Bearer {admin.token}"})
+    ok(r_fcsv.status_code == 200 and "决定页偶发报错".encode("utf-8") in r_fcsv.content, "CSV 含反馈内容")
+
     # ============ 五期：协同与上线 ============
     step("智能监控线索批量导入（source=MONITOR）")
     imp = admin.post("/bureau/clues/import", json=[

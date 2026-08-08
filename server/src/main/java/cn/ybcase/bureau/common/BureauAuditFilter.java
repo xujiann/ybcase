@@ -39,10 +39,11 @@ public class BureauAuditFilter extends OncePerRequestFilter {
                 try {
                     Authentication auth = SecurityContextHolder.getContext().getAuthentication();
                     jdbc.update("""
-                            insert into sys_audit_log (username, method, path, http_status, client_ip)
-                            values (?,?,?,?,?)""",
+                            insert into sys_audit_log (username, method, path, http_status, client_ip, request_id)
+                            values (?,?,?,?,?,?)""",
                             auth == null ? null : auth.getName(), request.getMethod(),
-                            uri, response.getStatus(), request.getRemoteAddr());
+                            uri, response.getStatus(), request.getRemoteAddr(),
+                            request.getAttribute(RequestIdFilter.ATTR));
                 } catch (Exception ignore) {
                     // 审计失败不影响业务
                 }

@@ -3,7 +3,13 @@ import vue from '@vitejs/plugin-vue'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 
+import pkg from './package.json'
+
 export default defineConfig({
+  define: {
+    // 反馈自动上下文：前端构建版本
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
   plugins: [
     vue(),
     // element-plus 按需引入（同 shell：不可手动归并单 chunk，交给自动分包摇树）

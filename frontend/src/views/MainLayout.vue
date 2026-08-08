@@ -22,6 +22,9 @@
                   style="width: 320px" @keyup.enter="onSearch">
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
+        <el-tooltip content="反馈问题或需求" placement="bottom">
+          <el-icon style="cursor: pointer; font-size: 20px; margin-right: 20px" @click="openFeedback"><ChatDotRound /></el-icon>
+        </el-tooltip>
         <el-badge :value="unread" :hidden="!unread" style="margin-right: 20px">
           <el-icon style="cursor: pointer; font-size: 20px" @click="openMessages"><Bell /></el-icon>
         </el-badge>
@@ -49,6 +52,38 @@
           <el-button type="primary" @click="onChangePassword">保存</el-button>
         </template>
       </el-dialog>
+      <el-dialog v-model="fbVisible" title="反馈问题或需求（10 秒提交，上下文自动附带）" width="560px">
+        <el-form label-width="70px">
+          <el-form-item label="类型">
+            <el-radio-group v-model="fb.kind">
+              <el-radio value="BUG">问题缺陷</el-radio>
+              <el-radio value="FEATURE">功能需求</el-radio>
+              <el-radio value="QUESTION">使用咨询</el-radio>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="标题"><el-input v-model="fb.title" maxlength="100" /></el-form-item>
+          <el-form-item label="描述">
+            <el-input v-model="fb.content" type="textarea" :rows="4"
+                      :placeholder="fb.kind === 'BUG' ? '做了什么操作、预期与实际结果' : '希望增加/改进什么，解决什么场景'" />
+          </el-form-item>
+          <el-form-item label="截图">
+            <div class="paste-box" tabindex="0" @paste="onPasteShot">
+              <img v-if="fb.screenshotBase64" :src="fb.screenshotBase64" style="max-width: 100%; max-height: 120px" />
+              <span v-else class="hint">点击此处后 Ctrl+V 粘贴截图（可选）</span>
+            </div>
+          </el-form-item>
+        </el-form>
+        <div class="hint">
+          自动附带：页面 {{ $route.path }} · 版本 {{ appVersion }} · 最近错误 {{ recentErrors.length }} 条
+          <span v-if="recentErrors.length">（含 request-id，开发可直接定位服务端日志）</span>
+        </div>
+        <template #footer>
+          <el-button text @click="fbVisible = false; router.push('/my/feedback')">我的反馈</el-button>
+          <el-button @click="fbVisible = false">取消</el-button>
+          <el-button type="primary" @click="onSubmitFeedback">提交</el-button>
+        </template>
+      </el-dialog>
+
       <el-drawer v-model="msgVisible" title="站内消息" size="420px">
         <div class="mb" style="text-align: right">
           <el-button size="small" @click="onReadAll">全部已读</el-button>
@@ -87,11 +122,14 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { useRouter } from 'vue-router'
-import client from '../api/client'
+import { useRoute, useRouter } from 'vue-router'
+import client, { recentErrors } from '../api/client'
 import { useAuthStore } from '../stores/auth'
+
+const route = useRoute()
+const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -140,10 +178,58 @@ async function onSearch() {
   searchVisible.value = true
 }
 
+const fbVisible = ref(false)
+const fb = reactive<any>({ kind: 'BUG', title: '', content: '', screenshotBase64: '' })
+
+function openFeedback() {
+  fbVisible.value = true
+}
+
+function onPasteShot(e: ClipboardEvent) {
+  const item = Array.from(e.clipboardData?.items || []).find((i) => i.type.startsWith('image/'))
+  if (!item) return
+  const reader = new FileReader()
+  reader.onload = () => { fb.screenshotBase64 = reader.result as string }
+  reader.readAsDataURL(item.getAsFile()!)
+}
+
+async function onSubmitFeedback() {
+  if (!fb.title.trim() || !fb.content.trim()) {
+    ElMessage.warning('标题与描述必填')
+    return
+  }
+  const lastErr = recentErrors[recentErrors.length - 1]
+  await client.post('/bureau/feedback', {
+    kind: fb.kind, title: fb.title, content: fb.content,
+    pageRoute: route.path,
+    caseRef: route.path.startsWith('/case/detail/') ? route.path.split('/').pop() : null,
+    appVersion, userAgent: navigator.userAgent.slice(0, 250),
+    requestId: lastErr?.requestId || null,
+    recentErrors: recentErrors.length ? JSON.stringify(recentErrors) : null,
+    screenshotBase64: fb.screenshotBase64 || null,
+  })
+  ElMessage.success('已提交，处理进展会通过站内消息通知您')
+  fbVisible.value = false
+  fb.title = ''
+  fb.content = ''
+  fb.screenshotBase64 = ''
+}
+
+let unreadTimer: number | undefined
+const on500 = () => { fb.kind = 'BUG'; fbVisible.value = true }
+
 onMounted(() => {
   if (!auth.user) auth.fetchMe().catch(() => {})
   refreshUnread()
-  setInterval(refreshUnread, 60000)  // 轻量轮询未读数
+  unreadTimer = window.setInterval(refreshUnread, 60000)  // 轻量轮询未读数
+  // 系统级错误发生时自动弹反馈框（预填 BUG 类型）
+  window.addEventListener('ybcase-api-500', on500)
+})
+
+onUnmounted(() => {
+  // 登出/卸载须清理，否则轮询累积并在登出后持续打 401
+  if (unreadTimer) window.clearInterval(unreadTimer)
+  window.removeEventListener('ybcase-api-500', on500)
 })
 
 function onCommand(cmd: string) {
@@ -198,6 +284,8 @@ async function onChangePassword() {
 .main { background: #f5f7fa; }
 .mb { margin-bottom: 12px; }
 h4 { margin: 6px 0; }
+.paste-box { width: 100%; min-height: 60px; border: 1px dashed #ccc; border-radius: 4px; padding: 8px; outline: none; }
+.paste-box:focus { border-color: #409eff; }
 .msg { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
 .msg:hover { background: #f5f7fa; }
 .unreadMsg { background: #fdf6ec; }
