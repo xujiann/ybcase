@@ -17,10 +17,43 @@ public class BureauConfig {
 
     private final JdbcTemplate jdbc;
 
+    /**
+     * 参数与节假日表整表缓存：单次 decide() 要读七八个参数，逐个查库等于七八次往返。
+     * 改参数走 PUT /api/config/{key} 时由事件立即失效；TTL 兜底直接改库的场景。
+     */
+    private static final long TTL_MS = 30_000;
+    private volatile Map<String, String> cache;
+    private volatile long cacheAt;
+    private volatile Holidays holidayCache;
+    private volatile long holidayAt;
+
+    private record Holidays(java.util.Set<LocalDate> off, java.util.Set<LocalDate> shiftWork) {}
+
+    @org.springframework.context.event.EventListener
+    public void onConfigChanged(cn.ybcase.core.common.ConfigChangedEvent e) {
+        cache = null;
+        holidayCache = null;
+    }
+
+    /** 节假日表变更后由调用方显式失效（新增/删除节假日） */
+    public void evictHolidays() {
+        holidayCache = null;
+    }
+
+    private Map<String, String> snapshot() {
+        Map<String, String> c = cache;
+        if (c != null && System.currentTimeMillis() - cacheAt < TTL_MS) return c;
+        Map<String, String> loaded = new java.util.HashMap<>();
+        for (var r : jdbc.queryForList("select cfg_key, cfg_value from sys_config"))
+            loaded.put((String) r.get("cfg_key"), (String) r.get("cfg_value"));
+        cache = loaded;
+        cacheAt = System.currentTimeMillis();
+        return loaded;
+    }
+
     public String str(String key, String def) {
-        List<Map<String, Object>> rows = jdbc.queryForList(
-                "select cfg_value from sys_config where cfg_key = ?", key);
-        return rows.isEmpty() ? def : (String) rows.get(0).get("cfg_value");
+        String v = snapshot().get(key);
+        return v == null ? def : v;
     }
 
     public int intVal(String key, int def) {
@@ -51,14 +84,19 @@ public class BureauConfig {
 
     /** 工作日推算（第58条：期间届满遇法定节假日顺延；sys_holiday：HOLIDAY 放假 / SHIFT_WORK 调休上班） */
     public LocalDate plusWorkdays(LocalDate from, int n) {
-        var rows = jdbc.queryForList("select day, kind from sys_holiday");
-        var holidays = new java.util.HashSet<LocalDate>();
-        var shiftWork = new java.util.HashSet<LocalDate>();
-        for (var r : rows) {
-            LocalDate d = ((java.sql.Date) r.get("day")).toLocalDate();
-            if ("SHIFT_WORK".equals(r.get("kind"))) shiftWork.add(d); else holidays.add(d);
+        Holidays h = holidayCache;
+        if (h == null || System.currentTimeMillis() - holidayAt >= TTL_MS) {
+            var off = new java.util.HashSet<LocalDate>();
+            var shiftWork = new java.util.HashSet<LocalDate>();
+            for (var r : jdbc.queryForList("select day, kind from sys_holiday")) {
+                LocalDate d = ((java.sql.Date) r.get("day")).toLocalDate();
+                if ("SHIFT_WORK".equals(r.get("kind"))) shiftWork.add(d); else off.add(d);
+            }
+            h = new Holidays(off, shiftWork);
+            holidayCache = h;
+            holidayAt = System.currentTimeMillis();
         }
-        return Workdays.plus(from, n, holidays, shiftWork);
+        return Workdays.plus(from, n, h.off(), h.shiftWork());
     }
 
     /** 按当事人类型取阈值（自然人 / 单位：经办机构、定点医药机构、其他主体） */

@@ -17,6 +17,7 @@ public class ClueService {
     private final CaseClueRepository clueRepository;
     private final BureauConfig cfg;
     private final BizSeqService seq;
+    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
 
     public record ClueCreateReq(String source, String content, String suspectName,
                                 String suspectType, LocalDate receivedAt, String handler) {}
@@ -79,11 +80,16 @@ public class ClueService {
     /** 立案时由 CaseService 回调标记 */
     @Transactional
     public void markFiled(Long id, String verifyResult) {
-        CaseClue clue = get(id);
-        if (!"PENDING".equals(clue.getStatus())) throw new BizException(2021, "线索已办结，不可重复立案");
-        clue.setStatus("FILED");
-        if (verifyResult != null && !verifyResult.isBlank()) clue.setVerifyResult(verifyResult);
-        clueRepository.save(clue);
+        // 原子占用：读已提交下"先查 PENDING 再改"会让同一线索被两个并发立案同时通过，生成两个案件
+        int n = jdbc.update("""
+                update case_clue set status = 'FILED',
+                       verify_result = coalesce(?, verify_result)
+                where id = ? and status = 'PENDING'""",
+                verifyResult == null || verifyResult.isBlank() ? null : verifyResult, id);
+        if (n == 0) {
+            get(id);  // 不存在则抛 2025，存在则说明已办结
+            throw new BizException(2021, "线索已办结，不可重复立案");
+        }
     }
 
     public CaseClue get(Long id) {

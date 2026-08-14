@@ -568,6 +568,9 @@ public class CaseService {
     public CaseDecision publish(Long caseId) {
         CaseDecision d = decisionRepository.findByCaseId(caseId)
                 .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
+        // 幂等：重复调用会把公开日期刷成当天，把"7日内公开"的超期证据洗白（第56条监督链）
+        if (Boolean.TRUE.equals(d.getPublished()) && d.getPublishedAt() != null)
+            throw new BizException(2042, "该决定已于 " + d.getPublishedAt() + " 公开，不可重复登记");
         d.setPublished(true);
         d.setPublishedAt(LocalDate.now());
         return decisionRepository.save(d);

@@ -17,6 +17,7 @@ import java.util.Map;
 public class BureauLawController {
 
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.bureau.service.BureauConfig config;
 
     @GetMapping("/enforce-items")
     public R<List<Map<String, Object>>> enforceItems() {
@@ -43,6 +44,7 @@ public class BureauLawController {
                 insert into sys_holiday (day, kind, name) values (?, ?, ?)
                 on conflict (day) do update set kind = excluded.kind, name = excluded.name""",
                 reqDate(body, "day", "日期"), body.getOrDefault("kind", "HOLIDAY"), body.get("name"));
+        config.evictHolidays();  // 工作日推算缓存须立即反映新节假日
         return R.ok();
     }
 
@@ -50,6 +52,7 @@ public class BureauLawController {
     @PreAuthorize("hasRole('ADMIN')")
     public R<Void> deleteHoliday(@PathVariable String day) {
         jdbc.update("delete from sys_holiday where day = ?", reqDate(Map.of("day", day), "day", "日期"));
+        config.evictHolidays();
         return R.ok();
     }
 }

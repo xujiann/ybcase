@@ -98,7 +98,9 @@ public class AttachmentController {
         byte[] body = row.get("file_path") != null
                 ? java.nio.file.Files.readAllBytes(java.nio.file.Path.of((String) row.get("file_path")))
                 : (byte[]) row.get("data");
-        String fn = URLEncoder.encode((String) row.get("filename"), StandardCharsets.UTF_8).replace("+", "%20");
+        String rawName = (String) row.get("filename");  // multipart 可不带文件名，入库即为 null
+        String fn = URLEncoder.encode(rawName == null || rawName.isBlank() ? "attachment" : rawName,
+                StandardCharsets.UTF_8).replace("+", "%20");
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + fn)
                 .contentType(row.get("content_type") == null ? MediaType.APPLICATION_OCTET_STREAM

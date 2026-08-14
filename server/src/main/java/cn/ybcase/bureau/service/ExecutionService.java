@@ -9,7 +9,6 @@ import cn.ybcase.bureau.repository.CaseFileRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -51,9 +50,18 @@ public class ExecutionService {
             throw new BizException(2010, "当场收缴必须出具财政统一票据并登记票据号（第52条）");
         // 第55条：加处罚款不得超出罚款数额
         if ("LATE_FEE".equals(req.kind())) {
-            BigDecimal paidLateFee = sum(caseId, "LATE_FEE");
-            if (paidLateFee.add(amount).compareTo(d.getFineAmount()) > 0)
-                throw new BizException(2012, "加处罚款累计不得超出罚款数额（第55条）");
+            // 先 sum 再 insert 在并发下两笔都能过检、落库后累计超本金；
+            // 改为把封顶写进 insert 的 where，由数据库一次性判定
+            int n = jdbc.update("""
+                    insert into case_execution (case_id, kind, amount, paid_at, method, note, receipt_no)
+                    select ?,?,?,?,?,?,?
+                    where (select coalesce(sum(amount), 0) from case_execution
+                           where case_id = ? and kind = 'LATE_FEE') + ? <= ?""",
+                    caseId, req.kind(), amount, req.paidAt() != null ? req.paidAt() : LocalDate.now(),
+                    req.method(), req.note(), req.receiptNo(),
+                    caseId, amount, d.getFineAmount());
+            if (n == 0) throw new BizException(2012, "加处罚款累计不得超出罚款数额（第55条）");
+            return;
         }
         jdbc.update("insert into case_execution (case_id, kind, amount, paid_at, method, note, receipt_no) values (?,?,?,?,?,?,?)",
                 caseId, req.kind(), amount, req.paidAt() != null ? req.paidAt() : LocalDate.now(),

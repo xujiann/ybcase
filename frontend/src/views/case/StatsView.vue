@@ -105,22 +105,16 @@ function onReportExport() {
     [r.month, r.filed, r.closed, r.fine_decided, r.recoup_decided, r.collected].map(q).join(','))
   lines.push(`合计,${t.filed_total},${t.closed_total},,,`)
   lines.push(`线索${t.clue_total}件；听证${t.hearing_total}次；移送${t.transfer_total}件；检查${t.inspection_total}次；举报奖励发放${t.reward_paid}元`)
-  const blob = new Blob(['﻿' + [header, ...lines].join('\n')], { type: 'text/csv;charset=utf-8' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = `医保执法统计上报-${reportYear}.csv`
-  a.click()
+  download(new Blob(['﻿' + [header, ...lines].join('\n')], { type: 'text/csv;charset=utf-8' }),
+    `医保执法统计上报-${reportYear}.csv`)
 }
 
 function onExport() {
   const header = '当事人,案由,决定书文号,罚款,追回基金,决定日期,公开日期'
   const lines = published.value.map((r) =>
     [r.party_name, r.cause, r.decision_no, r.fine_amount, r.recoup_amount, r.decided_at, r.published_at].map(q).join(','))
-  const blob = new Blob(['﻿' + [header, ...lines].join('\n')], { type: 'text/csv;charset=utf-8' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = '处罚决定公示.csv'
-  a.click()
+  download(new Blob(['﻿' + [header, ...lines].join('\n')], { type: 'text/csv;charset=utf-8' }),
+    '处罚决定公示.csv')
 }
 
 const cards = computed(() => [

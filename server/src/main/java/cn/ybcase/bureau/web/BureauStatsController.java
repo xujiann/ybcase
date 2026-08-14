@@ -45,7 +45,12 @@ public class BureauStatsController {
         return R.ok(m);
     }
 
-    /** 督办看板：各环节超期/临期预警（第14/40/45/59条时限） */
+    /**
+     * 督办看板：各环节超期/临期预警（第14/40/45/59条时限）。
+     * 逐条列出全局案号、案件名称（含当事人）与金额，绕过 case_view_scope=SELF，
+     * 故限监督岗位；办案员看本人在办事项走 /bureau/my/workbench。
+     */
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','LEGAL','ADMIN')")
     @GetMapping("/supervision")
     public R<Map<String, Object>> supervision() {
         Map<String, Object> m = new java.util.LinkedHashMap<>();

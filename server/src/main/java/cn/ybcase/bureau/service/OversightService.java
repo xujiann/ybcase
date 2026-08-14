@@ -61,12 +61,14 @@ public class OversightService {
         if (!Boolean.TRUE.equals(insp.get("violation_found")))
             throw new BizException(2063, "该检查未发现违法行为，无需转线索");
         if (insp.get("clue_id") != null) throw new BizException(2063, "该检查已转线索");
+        // 原子占位：并发双击会生成两条线索挂同一检查（下方 update 带 clue_id is null 兜底）
         CaseClue clue = clueService.create(new ClueService.ClueCreateReq(
                 "INSPECTION",
                 "行政检查发现（" + insp.get("insp_no") + "）：" + insp.get("result"),
                 (String) insp.get("object_name"), (String) insp.get("object_type"),
                 LocalDate.now(), (String) insp.get("officers")), username);
-        jdbc.update("update inspection set clue_id = ? where id = ?", clue.getId(), id);
+        int n = jdbc.update("update inspection set clue_id = ? where id = ? and clue_id is null", clue.getId(), id);
+        if (n == 0) throw new BizException(2063, "该检查已转线索（请勿重复提交）");
         return clue;
     }
 

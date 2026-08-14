@@ -16,6 +16,7 @@ import java.util.Map;
 public class SysConfigController {
 
     private final JdbcTemplate jdbc;
+    private final org.springframework.context.ApplicationEventPublisher events;
 
     /** 公开配置白名单：仅登录页所需的机构信息，其余参数一律须登录（防口径参数匿名泄露） */
     private static final java.util.Set<String> PUBLIC_KEYS =
@@ -35,6 +36,8 @@ public class SysConfigController {
     @PreAuthorize("hasRole('ADMIN')")
     public R<Void> update(@PathVariable String key, @RequestParam String value) {
         int n = jdbc.update("update sys_config set cfg_value = ?, updated_at = now() where cfg_key = ?", value, key);
-        return n == 0 ? R.fail(1401, "配置项不存在") : R.ok();
+        if (n == 0) return R.fail(1401, "配置项不存在");
+        events.publishEvent(new cn.ybcase.core.common.ConfigChangedEvent(key));  // 参数缓存立即失效
+        return R.ok();
     }
 }
