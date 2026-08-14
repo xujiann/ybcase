@@ -39,6 +39,7 @@ public class CaseService {
     private final BizSeqService seqService;
     private final ExecutionService executionService;
     private final MessageService messageService;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     // ---------- 立案 ----------
 
@@ -101,8 +102,9 @@ public class CaseService {
 
         for (OfficerReq o : req.officers()) {
             procedureService.validateEnforcer(o.name(), o.certNo());  // 第16条：执法资格台账校验
-            jdbc.update("insert into case_officer (case_id, name, cert_no, duty) values (?,?,?,?)",
-                    c.getId(), o.name(), o.certNo(), o.duty() == null ? "MEMBER" : o.duty());
+            jdbc.update("insert into case_officer (case_id, name, cert_no, duty, user_id) values (?,?,?,?,?)",
+                    c.getId(), o.name(), o.certNo(), o.duty() == null ? "MEMBER" : o.duty(),
+                    resolveOfficerUserId(o.name(), o.certNo()));
         }
         if (req.clueId() != null) clueService.markFiled(req.clueId(), req.clueVerifyResult());
         return c;
@@ -118,8 +120,22 @@ public class CaseService {
                 "select count(*) from case_officer where case_id = ? and cert_no = ? and avoided = false",
                 Integer.class, caseId, req.certNo());
         if (dup != null && dup > 0) throw new BizException(2002, "该执法证号已在本案办案人员名单中");
-        jdbc.update("insert into case_officer (case_id, name, cert_no, duty) values (?,?,?,?)",
-                caseId, req.name(), req.certNo(), req.duty() == null ? "MEMBER" : req.duty());
+        jdbc.update("insert into case_officer (case_id, name, cert_no, duty, user_id) values (?,?,?,?,?)",
+                caseId, req.name(), req.certNo(), req.duty() == null ? "MEMBER" : req.duty(),
+                resolveOfficerUserId(req.name(), req.certNo()));
+    }
+
+    /**
+     * 办案人员 → 系统账号：优先取执法证台账里维护的映射，其次按姓名唯一匹配。
+     * 解析不到就留空——该人员看不到本案（数据范围从严），由管理员在台账补映射，
+     * 而不是退回"同名即同人"的旧口径。
+     */
+    private Long resolveOfficerUserId(String name, String certNo) {
+        var byCert = jdbc.queryForList(
+                "select user_id from enforcer where cert_no = ? and user_id is not null", certNo);
+        if (!byCert.isEmpty()) return ((Number) byCert.get(0).get("user_id")).longValue();
+        var byName = jdbc.queryForList("select id from sys_user where real_name = ?", name);
+        return byName.size() == 1 ? ((Number) byName.get(0).get("id")).longValue() : null;
     }
 
     /** 回避（第5条）：主动回避或当事人申请，分级批准；回避后在册执法人员仍不得少于两人 */
@@ -636,29 +652,70 @@ public class CaseService {
         return caseRepository.findById(id).orElseThrow(() -> new BizException(2043, "案件不存在"));
     }
 
+    /**
+     * 案件详情。十余张子表原先逐张查（每张一次往返），改为一条 SQL 用 json_agg 聚合：
+     * 往返 17 次 → 5 次（实体类仍走 JPA，其 JSON 字段名是驼峰，前端契约不能变）。
+     * 子表输出保持 select * 的蛇形字段名，与原 queryForList 完全一致。
+     */
+    private static final List<String> DETAIL_PARTS = List.of(
+            "officers|case_officer|id",
+            "evidences|case_evidence|id",
+            "exclusions|case_period_exclusion|id",
+            "meetings|case_meeting|id",
+            "expertReviews|expert_review|id",
+            "agreementActions|agreement_action|id",
+            "hearings|case_hearing|id",
+            "assists|case_assist|id",
+            "deliveries|case_delivery|id",
+            "executions|case_execution|id",
+            "approvals|biz_approval|id desc");
+
+    private static final String DETAIL_SQL = buildDetailSql();
+
+    private static String buildDetailSql() {
+        StringBuilder sb = new StringBuilder("select ");
+        for (String part : DETAIL_PARTS) {
+            String[] p = part.split("\\|");
+            sb.append("(select coalesce(json_agg(t order by t.").append(p[2])
+              .append("), '[]'::json) from ").append(p[1])
+              .append(" t where t.case_id = ?) as \"").append(p[0]).append("\", ");
+        }
+        // 文书只取列表所需字段（正文另有详情接口，避免把全部全文一次拉回）
+        sb.append("(select coalesce(json_agg(t order by t.id), '[]'::json) from ")
+          .append("(select id, doc_type, title, made_at, maker, signed, note from case_document ")
+          .append("where case_id = ?) t) as \"documents\", ");
+        sb.append("(select coalesce(sum(end_at - start_at), 0) from case_period_exclusion ")
+          .append("where case_id = ? and end_at is not null) as \"exclusionDays\"");
+        return sb.toString();
+    }
+
     public Map<String, Object> detail(Long id) {
         CaseFile c = get(id);
         CaseCause cause = causeRepository.findById(c.getCauseId()).orElse(null);
-        return Map.ofEntries(
-                Map.entry("caseFile", c),
-                Map.entry("cause", cause == null ? Map.of() : cause),
-                Map.entry("officers", jdbc.queryForList("select * from case_officer where case_id = ? order by id", id)),
-                Map.entry("evidences", jdbc.queryForList("select * from case_evidence where case_id = ? order by id", id)),
-                Map.entry("documents", jdbc.queryForList(
-                        "select id, doc_type, title, made_at, maker, signed, note from case_document where case_id = ? order by id", id)),
-                Map.entry("exclusions", jdbc.queryForList("select * from case_period_exclusion where case_id = ? order by id", id)),
-                Map.entry("reviews", reviewRepository.findByCaseIdOrderByIdDesc(id)),
-                Map.entry("notices", noticeRepository.findByCaseIdOrderByIdDesc(id)),
-                Map.entry("meetings", jdbc.queryForList("select * from case_meeting where case_id = ? order by id", id)),
-                Map.entry("decision", decisionRepository.findByCaseId(id).map(Object.class::cast).orElse(Map.of())),
-                Map.entry("expertReviews", jdbc.queryForList("select * from expert_review where case_id = ? order by id", id)),
-                Map.entry("agreementActions", jdbc.queryForList("select * from agreement_action where case_id = ? order by id", id)),
-                Map.entry("approvals", jdbc.queryForList("select * from biz_approval where case_id = ? order by id desc", id)),
-                Map.entry("hearings", jdbc.queryForList("select * from case_hearing where case_id = ? order by id", id)),
-                Map.entry("assists", jdbc.queryForList("select * from case_assist where case_id = ? order by id", id)),
-                Map.entry("deliveries", jdbc.queryForList("select * from case_delivery where case_id = ? order by id", id)),
-                Map.entry("executions", jdbc.queryForList("select * from case_execution where case_id = ? order by id", id)),
-                Map.entry("effectiveDeadline", c.getDeadlineAt().plusDays(totalExclusionDays(id))));
+        Object[] args = new Object[DETAIL_PARTS.size() + 2];
+        java.util.Arrays.fill(args, id);
+        Map<String, Object> agg = jdbc.queryForMap(DETAIL_SQL, args);
+
+        Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("caseFile", c);
+        m.put("cause", cause == null ? Map.of() : cause);
+        for (String part : DETAIL_PARTS) m.put(part.split("\\|")[0], readJson(agg.get(part.split("\\|")[0])));
+        m.put("documents", readJson(agg.get("documents")));
+        m.put("reviews", reviewRepository.findByCaseIdOrderByIdDesc(id));
+        m.put("notices", noticeRepository.findByCaseIdOrderByIdDesc(id));
+        m.put("decision", decisionRepository.findByCaseId(id).map(Object.class::cast).orElse(Map.of()));
+        long exclusionDays = agg.get("exclusionDays") == null ? 0 : ((Number) agg.get("exclusionDays")).longValue();
+        m.put("effectiveDeadline", c.getDeadlineAt().plusDays(exclusionDays));
+        return m;
+    }
+
+    private List<Map<String, Object>> readJson(Object pgJson) {
+        if (pgJson == null) return List.of();
+        try {
+            return objectMapper.readValue(String.valueOf(pgJson), new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new BizException(2043, "案件详情数据解析失败");
+        }
     }
 
     // ---------- 数据级权限（v1.2）：case_view_scope=SELF 时办案员仅见本人承办/参办案件 ----------
@@ -669,9 +726,10 @@ public class CaseService {
     }
 
     // 普通字符串拼接（文本块会剥前导空格导致 "?and" 语法错，医院项目同坑）
+    // 关联键用账号 ID：早先按 real_name 匹配会让同名执法人员互相可见，改一次姓名即可绕过隔离
     private static final String SCOPE_SQL =
             " and (case_file.owner_user = ? or exists (select 1 from case_officer o"
-            + " join sys_user su on su.real_name = o.name"
+            + " join sys_user su on su.id = o.user_id"
             + " where o.case_id = case_file.id and su.username = ?)) ";
 
     /** 越权访问单案（2080） */

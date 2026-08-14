@@ -8,7 +8,7 @@
         </el-menu-item>
         <el-sub-menu v-for="dir in auth.menuTree" :key="dir.id" :index="dir.path || String(dir.id)">
           <template #title>
-            <el-icon><component :is="dir.icon || 'Menu'" /></el-icon><span>{{ dir.name }}</span>
+            <el-icon><component :is="iconOf(dir.icon)" /></el-icon><span>{{ dir.name }}</span>
           </template>
           <el-menu-item v-for="m in dir.children" :key="m.id" :index="m.path">
             {{ m.name }}
@@ -126,6 +126,7 @@ import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import client, { recentErrors } from '../api/client'
+import { iconOf } from '../icons'
 import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()

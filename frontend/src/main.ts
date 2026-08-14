@@ -4,14 +4,13 @@ import { createPinia } from 'pinia'
 // ElMessage/ElMessageBox 为编程式调用，样式须手动引入
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
-import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import App from './App.vue'
 import router from './router'
+import { registerIcons } from './icons'
 
 const app = createApp(App)
 app.use(createPinia())
 app.use(router)
-for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
-  app.component(key, component)
-}
+// 按需注册（全量注册会把整个图标库打进入口 chunk，见 icons.ts）
+registerIcons(app)
 app.mount('#app')

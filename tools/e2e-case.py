@@ -846,6 +846,15 @@ def main():
         banban.get(f"/bureau/cases/{scope_case['id']}/documents/render",
                    params={"docType": "DECISION"}, expect_code=2080)
         print("    PASS: 写操作与文书渲染侧门一并 2080")
+        # 关联键改 user_id 后：新建一个与在册办案人员同名的账号，不再因重名而继承范围
+        admin.call("PUT", "/config/case_view_scope?value=ALL")
+        admin.post("/system/users", json={
+            "username": "tibu2", "password": "Init12345", "realName": "李替补",
+            "roleCodes": ["HANDLER"]})
+        admin.call("PUT", "/config/case_view_scope?value=SELF")
+        tibu2 = Api("tibu2", password="Init12345")
+        tibu2.get(f"/bureau/cases/{scope_case['id']}", expect_code=2080)
+        print("    PASS: 同名新账号不因重名获得参办范围（旧口径按 real_name 匹配会放行）")
         sr_bb = banban.get("/bureau/search", params={"q": "范围隔离"})
         ok(all(c_["id"] != scope_case["id"] for c_ in sr_bb["cases"]), "SELF 下全局搜索不含隔离案")
         sr_ju = juzhang.get("/bureau/search", params={"q": "范围隔离"})

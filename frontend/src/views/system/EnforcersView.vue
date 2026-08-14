@@ -16,6 +16,14 @@
       <el-table-column label="法律职业资格" width="120">
         <template #default="{ row }">{{ row.legal_qualified ? '是' : '否' }}</template>
       </el-table-column>
+      <el-table-column label="关联账号" width="150">
+        <template #default="{ row }">
+          <span v-if="row.username">{{ row.user_real_name }}（{{ row.username }}）</span>
+          <el-tooltip v-else content="未关联账号时，该执法人员在“仅本人”数据范围下看不到自己参办的案件" placement="top">
+            <span class="warnText">未关联</span>
+          </el-tooltip>
+        </template>
+      </el-table-column>
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '有效' : '停用' }}</el-tag>
@@ -30,6 +38,12 @@
         <el-form-item label="部门"><el-input v-model="form.dept" /></el-form-item>
         <el-form-item label="有效期至">
           <el-date-picker v-model="form.certExpireAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+        </el-form-item>
+        <el-form-item label="关联账号">
+          <el-select v-model="form.userId" clearable filterable placeholder="用于数据范围判定参办人" style="width: 100%">
+            <el-option v-for="u in users" :key="u.id" :label="`${u.realName}（${u.username}）`" :value="u.id" />
+          </el-select>
+          <div class="hint">数据范围按账号判定：不关联则该员在“仅本人”范围下看不到自己参办的案件</div>
         </el-form-item>
         <el-form-item label="法律职业资格"><el-switch v-model="form.legalQualified" /></el-form-item>
         <el-form-item label="有效"><el-switch v-model="form.enabled" /></el-form-item>
@@ -55,7 +69,8 @@ function todayLocal() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 const today = todayLocal()
-const form = reactive({ name: '', certNo: '', dept: '', certExpireAt: '', legalQualified: false, enabled: true })
+const users = ref<any[]>([])
+const form = reactive<any>({ name: '', certNo: '', dept: '', certExpireAt: '', legalQualified: false, enabled: true, userId: null })
 
 async function load() {
   loading.value = true
@@ -67,7 +82,7 @@ async function load() {
 }
 
 function openCreate() {
-  Object.assign(form, { name: '', certNo: '', dept: '', certExpireAt: '', legalQualified: false, enabled: true })
+  Object.assign(form, { name: '', certNo: '', dept: '', certExpireAt: '', legalQualified: false, enabled: true, userId: null })
   dlg.value = true
 }
 
@@ -82,11 +97,17 @@ async function onSave() {
   load()
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  try {
+    users.value = (await client.get('/system/users', { params: { size: 200 } })).data.data.records
+  } catch { /* 非管理员无权读用户列表，关联账号下拉留空即可 */ }
+})
 </script>
 
 <style scoped>
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .hint { font-size: 12px; color: #999; font-weight: normal; }
+.warnText { color: #e6a23c; }
 .danger { color: #c0392b; font-weight: 600; }
 </style>
