@@ -29,7 +29,12 @@ import client from '../../api/client'
 const rows = ref<{ key: string; value: string; remark: string }[]>([])
 const loading = ref(false)
 const filter = ref('')
-const auditMonth = ref(new Date().toISOString().slice(0, 7))
+// 本地时区月份：toISOString 取 UTC，中国时区月初 0-8 点会算成上个月
+function monthLocal() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+const auditMonth = ref(monthLocal())
 
 async function onAuditExport() {
   const resp = await client.get('/bureau/audit/export', { params: { month: auditMonth.value }, responseType: 'blob' })

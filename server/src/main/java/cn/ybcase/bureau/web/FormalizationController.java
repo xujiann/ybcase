@@ -187,19 +187,32 @@ public class FormalizationController {
     }
 
     @PostMapping("/agreement-actions/{id}/reply")
-    public R<Void> replyAgreementAction(@PathVariable Long id, @RequestBody Map<String, String> body) {
+    public R<Void> replyAgreementAction(@PathVariable Long id, @RequestBody Map<String, String> body,
+                                        Authentication auth) {
+        // 该路由按子表主键定位、不含 caseId，拦截器覆盖不到，此处按所属案件补范围校验
+        scopeByChild("agreement_action", id, 2073, "台账不存在", auth);
         int n = jdbc.update("update agreement_action set replied_at = ?, result = ? where id = ? and replied_at is null",
                 LocalDate.now(), body.get("result"), id);
         if (n == 0) throw new BizException(2073, "台账不存在或已办结");
         return R.ok();
     }
 
+    /** 兄弟资源路由的范围校验：从子表反查 case_id 再判 SELF 范围（case_id 为空的线索移送跳过） */
+    private void scopeByChild(String table, Long id, int code, String notFound, Authentication auth) {
+        var rows = jdbc.queryForList("select case_id from " + table + " where id = ?", id);
+        if (rows.isEmpty()) throw new BizException(code, notFound);
+        Object cid = rows.get(0).get("case_id");
+        if (cid != null) caseService.assertInScope(((Number) cid).longValue(), auth.getName(), privileged(auth));
+    }
+
     // ---------- 行刑衔接回执 ----------
 
     @PostMapping("/transfers/{id}/receipt")
-    public R<Void> transferReceipt(@PathVariable Long id, @RequestBody Map<String, String> body) {
+    public R<Void> transferReceipt(@PathVariable Long id, @RequestBody Map<String, String> body,
+                                   Authentication auth) {
         if (body.get("receiptNo") == null || body.get("receiptNo").isBlank())
             throw new BizException(2059, "须填写受案回执文号");
+        scopeByChild("case_transfer", id, 2059, "移送记录不存在", auth);
         int n = jdbc.update("""
                 update case_transfer set receipt_no = ?, receipt_at = ?
                 where id = ? and receipt_no is null""",

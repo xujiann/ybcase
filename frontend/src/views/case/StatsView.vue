@@ -84,10 +84,11 @@ const report = ref<any>({ monthly: [] })
 const reportYear = new Date().getFullYear()
 const loading = ref(false)
 
-/** CSV 字段转义：当事人/案由含逗号或引号会错列 */
+/** CSV 字段转义：逗号/引号防错列；=+-@ 开头前置单引号防 Excel 公式注入（对外报送件） */
 function q(v: any) {
-  const t = String(v ?? '')
-  return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t
+  let t = String(v ?? '')
+  if (/^[=+\-@\t\r]/.test(t)) t = "'" + t
+  return /[",\r\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t
 }
 
 function download(blob: Blob, name: string) {

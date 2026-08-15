@@ -126,16 +126,14 @@ public class CaseService {
     }
 
     /**
-     * 办案人员 → 系统账号：优先取执法证台账里维护的映射，其次按姓名唯一匹配。
-     * 解析不到就留空——该人员看不到本案（数据范围从严），由管理员在台账补映射，
-     * 而不是退回"同名即同人"的旧口径。
+     * 办案人员 → 系统账号：只认执法证台账里维护的权威映射（按证号）。
+     * 不按姓名兜底——"重名唯一"只保证 sys_user 内不重名，会把另一岗位的同名账号误绑，
+     * 凭空给它本案数据权限。解析不到就留空，由管理员在执法证台账补映射（数据范围从严）。
      */
     private Long resolveOfficerUserId(String name, String certNo) {
         var byCert = jdbc.queryForList(
                 "select user_id from enforcer where cert_no = ? and user_id is not null", certNo);
-        if (!byCert.isEmpty()) return ((Number) byCert.get(0).get("user_id")).longValue();
-        var byName = jdbc.queryForList("select id from sys_user where real_name = ?", name);
-        return byName.size() == 1 ? ((Number) byName.get(0).get("id")).longValue() : null;
+        return byCert.isEmpty() ? null : ((Number) byCert.get(0).get("user_id")).longValue();
     }
 
     /** 回避（第5条）：主动回避或当事人申请，分级批准；回避后在册执法人员仍不得少于两人 */
@@ -655,7 +653,9 @@ public class CaseService {
     /**
      * 案件详情。十余张子表原先逐张查（每张一次往返），改为一条 SQL 用 json_agg 聚合：
      * 往返 17 次 → 5 次（实体类仍走 JPA，其 JSON 字段名是驼峰，前端契约不能变）。
-     * 子表输出保持 select * 的蛇形字段名，与原 queryForList 完全一致。
+     * 子表输出保持 select * 的蛇形字段名。注意：timestamptz 列（如 biz_approval.decided_at）
+     * 经 json_agg 会带会话时区偏移（"+08:00"），与仍走 queryForList 的 /approvals/pending 的
+     * UTC 归一格式不同；前端目前只读 approvals[].status，若后续要读这些时间列须自行归一。
      */
     private static final List<String> DETAIL_PARTS = List.of(
             "officers|case_officer|id",
@@ -730,7 +730,7 @@ public class CaseService {
     private static final String SCOPE_SQL =
             " and (case_file.owner_user = ? or exists (select 1 from case_officer o"
             + " join sys_user su on su.id = o.user_id"
-            + " where o.case_id = case_file.id and su.username = ?)) ";
+            + " where o.case_id = case_file.id and o.avoided = false and su.username = ?)) ";
 
     /** 越权访问单案（2080） */
     public void assertInScope(Long caseId, String username, boolean privileged) {

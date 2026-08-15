@@ -57,6 +57,12 @@ public class BureauExceptionAdvice {
     }
 
     /** 数据库约束/取值冲突（重复键、外键、非空、非法日期字面量） */
+    /** 乐观锁冲突：同一记录被并发修改（如停用与改密同时发生），转友好提示而非 2101 */
+    @ExceptionHandler(org.springframework.dao.OptimisticLockingFailureException.class)
+    public R<Void> handleOptLock(org.springframework.dao.OptimisticLockingFailureException e) {
+        return R.fail(2102, "该记录刚被他人修改，请刷新后重试");
+    }
+
     @ExceptionHandler(org.springframework.dao.DataAccessException.class)
     public R<Void> handleData(org.springframework.dao.DataAccessException e) {
         log.warn("数据访问异常", e);

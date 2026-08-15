@@ -44,13 +44,15 @@
         <template v-if="c.status === 'REPORTED'">
           <el-button type="primary" @click="dlg.notice = true">处罚告知</el-button>
           <el-button @click="onSubmitReview">提交法制审核</el-button>
-          <el-button @click="onExtendCase">延长期限</el-button>
+          <el-button v-if="isLeader" @click="onExtendCase">延长期限</el-button>
+          <el-button v-else @click="dlg.apply = true">申请延期</el-button>
         </template>
         <template v-if="c.status === 'NOTIFIED'">
           <el-button v-if="isLeader" type="primary" @click="openDecide">作出决定</el-button>
           <el-button @click="dlg.statement = true">陈述申辩/听证</el-button>
           <el-button @click="onSubmitReview">提交法制审核</el-button>
-          <el-button @click="onExtendCase">延长期限</el-button>
+          <el-button v-if="isLeader" @click="onExtendCase">延长期限</el-button>
+          <el-button v-else @click="dlg.apply = true">申请延期</el-button>
         </template>
         <template v-if="c.status === 'DECIDED'">
           <el-button type="primary" @click="dlg.deliver = true">登记送达</el-button>
@@ -751,16 +753,32 @@ const executionForm = reactive({ kind: 'FINE', amount: 0, paidAt: today, method:
 const reportContent = ref('')
 const docView = ref<any>({})
 
+let loadSeq = 0
 async function load() {
+  const seq = ++loadSeq  // 快速切案时只有最后一次可写入，避免旧请求结果覆盖新案件
+  const cid = id.value
   loading.value = true
   try {
-    const resp = await client.get(`/bureau/cases/${id.value}`)
+    const resp = await client.get(`/bureau/cases/${cid}`)
+    const att = (await client.get(`/bureau/cases/${cid}/attachments`)).data.data
+    const tl = (await client.get(`/bureau/cases/${cid}/timeline`)).data.data
+    const inst = (await client.get(`/bureau/cases/${cid}/installments`)).data.data
+    if (seq !== loadSeq) return  // 已被更晚的 load 取代，丢弃
     detail.value = resp.data.data
-    attachments.value = (await client.get(`/bureau/cases/${id.value}/attachments`)).data.data
-    timeline.value = (await client.get(`/bureau/cases/${id.value}/timeline`)).data.data
-    installments.value = (await client.get(`/bureau/cases/${id.value}/installments`)).data.data
+    attachments.value = att
+    timeline.value = tl
+    installments.value = inst
+  } catch {
+    // 失败（无权限/已归档/网络）须清空，否则残留上一个案件的数据而按钮仍可点 → 误操作
+    if (seq === loadSeq) {
+      detail.value = {}
+      attachments.value = []
+      timeline.value = []
+      installments.value = []
+    }
+    // 不重抛：现有大量 load() 调用点（含 onMounted/watch）都不 catch，拦截器已提示用户
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
@@ -793,16 +811,22 @@ async function onDownload(row: any) {
 }
 
 async function onUpload(e: Event) {
-  const file = (e.target as HTMLInputElement).files?.[0]
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
   if (!file) return
   const fd = new FormData()
   fd.append('file', file)
   fd.append('category', uploadCategory.value)
-  await client.post(`/bureau/cases/${id.value}/attachments`, fd,
-    { headers: { 'Content-Type': 'multipart/form-data' }, ...LARGE_TRANSFER })
-  ElMessage.success('已上传')
-  ;(e.target as HTMLInputElement).value = ''
-  load()
+  const closeMsg = ElMessage({ message: `上传中：${file.name}`, type: 'info', duration: 0 })
+  try {
+    await client.post(`/bureau/cases/${id.value}/attachments`, fd,
+      { headers: { 'Content-Type': 'multipart/form-data' }, ...LARGE_TRANSFER })
+    ElMessage.success('已上传')
+    load()
+  } catch { /* 拦截器已提示 */ } finally {
+    closeMsg.close()
+    input.value = ''  // 无论成败都清空，否则重选同一文件不触发 change
+  }
 }
 
 async function onSignDoc(row: any) {
@@ -843,7 +867,7 @@ async function onApply() {
     return
   }
   await client.post('/bureau/approvals', {
-    kind: applyForm.kind, caseId: Number(id),
+    kind: applyForm.kind, caseId: Number(id.value),
     payload: applyForm.kind === 'EXTEND' ? { days: applyForm.days } : null,
     reason: applyForm.reason,
   })
@@ -918,13 +942,29 @@ function printDoc() {
 }
 
 /** 通用子表提交：POST /bureau/cases/{id}/{path} 后关弹窗刷新 */
+// 各复用录入弹窗的初值：提交成功后按 dlgKey 重置，避免下次打开预填上一条被误重复保存
+const FORM_RESETS: Record<string, () => void> = {
+  officer: () => Object.assign(officerForm, { name: '', certNo: '', duty: 'MEMBER' }),
+  evidence: () => Object.assign(evidenceForm, { type: 'DOCUMENT', name: '', source: '', obtainedAt: today, keeper: '', note: '', registerHold: false, sealed: false }),
+  document: () => Object.assign(documentForm, { docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false }),
+  exclusion: () => Object.assign(exclusionForm, { reason: 'APPRAISE', startAt: today, endAt: today, note: '' }),
+  meeting: () => Object.assign(meetingForm, { heldAt: today, attendees: '', record: '', conclusion: '' }),
+  execution: () => Object.assign(executionForm, { kind: 'FINE', amount: 0, paidAt: today, method: 'BANK', note: '', receiptNo: '' }),
+}
+
+let submitting = false
 async function submit(path: string, body: any, dlgKey: string) {
-  await client.post(`/bureau/cases/${id.value}/${path}`, body)
-  ElMessage.success('已保存')
-  dlg[dlgKey] = false
-  // 复用弹窗提交后清空，避免下次打开预填上一条并被误重复保存
-  if (dlgKey === 'officer') Object.assign(officerForm, { name: '', certNo: '', duty: 'MEMBER' })
-  load()
+  if (submitting) return  // 防双击“保存”产生两条记录
+  submitting = true
+  try {
+    await client.post(`/bureau/cases/${id.value}/${path}`, body)
+    ElMessage.success('已保存')
+    dlg[dlgKey] = false
+    FORM_RESETS[dlgKey]?.()
+    load()
+  } finally {
+    submitting = false
+  }
 }
 
 async function onAvoid(row: any) {

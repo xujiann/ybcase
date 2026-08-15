@@ -76,6 +76,8 @@ public class SysUserController {
             if (pwdError != null) return R.fail(1102, pwdError);
             u.setPassword(passwordEncoder.encode(req.password()));
             u.setPasswordUpdatedAt(java.time.Instant.now());
+            // 管理员改他人口令（账号泄露处置路径）须吊销该账号旧令牌，否则旧 JWT 仍可用满有效期
+            u.setTokenVersion(u.getTokenVersion() + 1);
         }
         return R.ok(UserDto.from(userRepository.save(u)));
     }

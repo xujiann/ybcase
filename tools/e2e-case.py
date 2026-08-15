@@ -836,6 +836,10 @@ def main():
         banban.get(f"/bureau/cases/{scope_case['id']}/installments", expect_code=2080)
         banban.get(f"/bureau/cases/{scope_case['id']}/discretion-suggest", expect_code=2080)
         print("    PASS: 大事记/卷宗/附件/分期/裁量侧门全部 2080")
+        # 拦截器绕过防护：matrix 参数使原始 URI 段非纯数字，旧实现会跳过校验而泄露；
+        # 新实现取 Spring 解析后的路径变量，仍须 2080
+        banban.get(f"/bureau/cases/{scope_case['id']};x=1/timeline", expect_code=2080)
+        print("    PASS: matrix 参数不能绕过数据范围拦截器")
         # 写操作此前全线敞开：可对看不见的他人案件加证据/文书/送达
         banban.post(f"/bureau/cases/{scope_case['id']}/evidences", json={
             "type": "DOCUMENT", "name": "越权证据", "obtainedAt": str(today)}, expect_code=2080)
@@ -981,12 +985,21 @@ def main():
     tt2 = Api("tokentest", password="Next12345")
     ok(tt2.get("/auth/me")["username"] == "tokentest", "新口令可登录")
 
-    step("停用账号即断开在线会话")
+    step("管理员改他人口令即吊销其旧令牌（账号泄露处置路径）")
     uid = next(u["id"] for u in admin.get("/system/users", params={"size": 200})["records"]
                if u["username"] == "tokentest")
+    admin.call("PUT", f"/system/users/{uid}",
+               json={"username": "tokentest", "realName": "令牌测试", "password": "Reset12345",
+                     "roleCodes": ["HANDLER"]})
+    r_reset = requests.get(f"{BASE}/auth/me", timeout=10,
+                           headers={"Authorization": f"Bearer {tt2.token}"})
+    ok(r_reset.status_code in (401, 403), f"管理员改密后旧令牌失效（HTTP {r_reset.status_code}）")
+    tt3 = Api("tokentest", password="Reset12345")
+
+    step("停用账号即断开在线会话")
     admin.call("PUT", f"/system/users/{uid}/enabled?enabled=false")
     r_dis = requests.get(f"{BASE}/auth/me", timeout=10,
-                         headers={"Authorization": f"Bearer {tt2.token}"})
+                         headers={"Authorization": f"Bearer {tt3.token}"})
     ok(r_dis.status_code in (401, 403), f"停用后令牌立即失效（HTTP {r_dis.status_code}）")
 
     step("角色授权矩阵仅管理员可读")

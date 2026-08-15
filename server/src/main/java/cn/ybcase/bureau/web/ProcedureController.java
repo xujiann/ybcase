@@ -108,7 +108,8 @@ public class ProcedureController {
                 values (?,?,?,?,?,?,?)
                 on conflict (cert_no) do update set name = excluded.name, dept = excluded.dept,
                     cert_expire_at = excluded.cert_expire_at, legal_qualified = excluded.legal_qualified,
-                    enabled = excluded.enabled, user_id = excluded.user_id""",
+                    enabled = excluded.enabled,
+                    user_id = coalesce(excluded.user_id, enforcer.user_id)""",
                 body.get("name"), body.get("certNo"), body.get("dept"),
                 optDate(body, "certExpireAt", "执法证有效期"),
                 Boolean.TRUE.equals(body.get("legalQualified")), !Boolean.FALSE.equals(body.get("enabled")),

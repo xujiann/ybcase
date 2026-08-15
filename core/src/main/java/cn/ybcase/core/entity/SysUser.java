@@ -56,6 +56,11 @@ public class SysUser {
     @Column(nullable = false)
     private Integer tokenVersion = 0;
 
+    /** 乐观锁：防止"停用"与"改密"并发时读-改-写互相覆盖（如把已停用账号改回启用） */
+    @jakarta.persistence.Version
+    @Column(nullable = false)
+    private Long rowVersion = 0L;
+
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 
