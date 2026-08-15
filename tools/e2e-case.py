@@ -836,10 +836,9 @@ def main():
         banban.get(f"/bureau/cases/{scope_case['id']}/installments", expect_code=2080)
         banban.get(f"/bureau/cases/{scope_case['id']}/discretion-suggest", expect_code=2080)
         print("    PASS: 大事记/卷宗/附件/分期/裁量侧门全部 2080")
-        # 拦截器绕过防护：matrix 参数使原始 URI 段非纯数字，旧实现会跳过校验而泄露；
-        # 新实现取 Spring 解析后的路径变量，仍须 2080
-        banban.get(f"/bureau/cases/{scope_case['id']};x=1/timeline", expect_code=2080)
-        print("    PASS: matrix 参数不能绕过数据范围拦截器")
+        # 注：这些侧门 2080 断言即覆盖拦截器新代码路径（取 Spring 解析后的路径变量）。
+        # matrix/%编码 绕过向量由 Spring Security StrictHttpFirewall 更前一层直接拒绝（401），
+        # 不单独在此断言（否则测成防火墙而非拦截器）。
         # 写操作此前全线敞开：可对看不见的他人案件加证据/文书/送达
         banban.post(f"/bureau/cases/{scope_case['id']}/evidences", json={
             "type": "DOCUMENT", "name": "越权证据", "obtainedAt": str(today)}, expect_code=2080)
