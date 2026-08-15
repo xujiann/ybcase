@@ -25,6 +25,7 @@ services:
         condition: service_healthy
     volumes:
       - ./ybcase-server.jar:/app/ybcase-server.jar:ro
+      - attachments:/app/data/attachments   # 附件外置存储卷（默认 DB 存储时不写入，切 FILE 模式即持久化）
     environment:
       YBCASE_DB_URL: jdbc:postgresql://db:5432/ybcase
       YBCASE_DB_USER: hip
@@ -52,5 +53,6 @@ services:
 
 volumes:
   pgdata:
+  attachments:
   caddy_data:
   caddy_config:
