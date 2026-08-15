@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# 【服务器上运行】拉取最新源码 → 在 Docker 里构建后端+前端 → 部署 → 重启。
+# 全程走服务器到 GitHub 的网络,本机无需上传大文件。
+# 前提:部署私钥已放在 /root/.ssh/ybcase_deploy(见 deploy/上线清单.md 服务器端构建一节)。
+# 用法:bash /opt/ybcase-src/deploy/server-build.sh
+set -euo pipefail
+
+SRC=/opt/ybcase-src
+DEPLOY=/opt/ybcase
+export GIT_SSH_COMMAND="ssh -i /root/.ssh/ybcase_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+echo "[1/5] 拉取最新源码 → $SRC"
+if [ -d "$SRC/.git" ]; then
+    git -C "$SRC" fetch --depth 1 origin main
+    git -C "$SRC" reset --hard origin/main
+else
+    git clone --depth 1 git@github.com:xujiann/ybcase.git "$SRC"
+fi
+echo "  当前提交: $(git -C "$SRC" rev-parse --short HEAD)"
+
+echo "[2/5] Docker 构建后端(Maven,缓存 .m2 加速后续)"
+docker run --rm -v "$SRC":/app -v ybcase_m2:/root/.m2 -w /app \
+    maven:3.9-eclipse-temurin-21 mvn -q clean package -DskipTests
+
+echo "[3/5] Docker 构建前端(Node,缓存 node_modules)"
+docker run --rm -v "$SRC":/app -v ybcase_npm:/app/frontend/node_modules -w /app/frontend \
+    node:22-alpine sh -c "npm ci --no-audit --no-fund && npm run build"
+
+echo "[4/5] 部署构建产物到 $DEPLOY"
+cp "$SRC"/server/target/ybcase-server-*.jar "$DEPLOY/ybcase-server.jar"
+rm -rf "$DEPLOY/dist" && cp -r "$SRC/frontend/dist" "$DEPLOY/dist"
+# 同步最新的运维脚本
+cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh
+
+echo "[5/5] 备份 + 重启 + 健康检查"
+cd "$DEPLOY" && ./upgrade.sh
