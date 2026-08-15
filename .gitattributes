@@ -1,0 +1,2 @@
+# Shell 脚本强制 LF：在 Windows 检出后 scp 到 Linux 执行，CRLF 会破坏 shebang
+*.sh text eol=lf
