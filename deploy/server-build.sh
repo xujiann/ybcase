@@ -28,7 +28,10 @@ docker run --rm -v "$SRC":/app -v ybcase_npm:/app/frontend/node_modules -w /app/
 
 echo "[4/5] 部署构建产物到 $DEPLOY"
 cp "$SRC"/server/target/ybcase-server-*.jar "$DEPLOY/ybcase-server.jar"
-rm -rf "$DEPLOY/dist" && cp -r "$SRC/frontend/dist" "$DEPLOY/dist"
+# 前端原地更新目录内容,不整体替换目录——否则换掉 inode 会让 Caddy 的 bind mount 失效(404)
+mkdir -p "$DEPLOY/dist"
+rm -rf "$DEPLOY/dist"/* "$DEPLOY/dist"/.[!.]* 2>/dev/null || true
+cp -r "$SRC/frontend/dist/." "$DEPLOY/dist/"
 # 同步最新的运维脚本
 cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh
 
