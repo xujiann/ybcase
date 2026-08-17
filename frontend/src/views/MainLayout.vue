@@ -1,8 +1,12 @@
 <template>
   <el-container class="layout">
-    <el-aside width="220px" class="aside">
+    <!-- 手机端点遮罩关闭抽屉菜单 -->
+    <div v-if="isMobile && menuOpen" class="backdrop" @click="menuOpen = false" />
+    <el-aside width="220px" class="aside" :class="{ 'aside-drawer': isMobile }"
+              :style="isMobile ? { transform: menuOpen ? 'translateX(0)' : 'translateX(-100%)' } : {}">
       <div class="logo">案件查办系统</div>
-      <el-menu router :default-active="$route.path" background-color="#1c2b45" text-color="#c7d0dc" active-text-color="#409eff">
+      <el-menu router :default-active="$route.path" background-color="#1c2b45" text-color="#c7d0dc" active-text-color="#409eff"
+               @select="onMenuSelect">
         <el-menu-item index="/dashboard">
           <el-icon><HomeFilled /></el-icon><span>工作台</span>
         </el-menu-item>
@@ -18,8 +22,9 @@
     </el-aside>
     <el-container>
       <el-header class="header">
-        <el-input v-model="searchQ" placeholder="全局搜索：案号/案名/当事人/线索" clearable
-                  style="width: 320px" @keyup.enter="onSearch">
+        <el-icon v-if="isMobile" class="hamburger" @click="menuOpen = !menuOpen"><Menu /></el-icon>
+        <el-input v-model="searchQ" :placeholder="isMobile ? '搜索案号/当事人' : '全局搜索：案号/案名/当事人/线索'" clearable
+                  class="search-box" @keyup.enter="onSearch">
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
         <el-tooltip content="反馈问题或需求" placement="bottom">
@@ -143,6 +148,17 @@ const unread = ref(0)
 const msgVisible = ref(false)
 const messages = ref<any[]>([])
 
+// 手机端（≤768px）：侧边栏收进抽屉，汉堡按钮开合
+const isMobile = ref(window.innerWidth <= 768)
+const menuOpen = ref(false)
+const onResize = () => {
+  isMobile.value = window.innerWidth <= 768
+  if (!isMobile.value) menuOpen.value = false  // 转回大屏时确保抽屉态复位
+}
+function onMenuSelect() {
+  if (isMobile.value) menuOpen.value = false  // 手机上点菜单跳转后自动收起
+}
+
 async function refreshUnread() {
   try {
     unread.value = (await client.get('/bureau/messages/unread-count')).data.data
@@ -225,12 +241,14 @@ onMounted(() => {
   unreadTimer = window.setInterval(refreshUnread, 60000)  // 轻量轮询未读数
   // 系统级错误发生时自动弹反馈框（预填 BUG 类型）
   window.addEventListener('ybcase-api-500', on500)
+  window.addEventListener('resize', onResize)
 })
 
 onUnmounted(() => {
   // 登出/卸载须清理，否则轮询累积并在登出后持续打 401
   if (unreadTimer) window.clearInterval(unreadTimer)
   window.removeEventListener('ybcase-api-500', on500)
+  window.removeEventListener('resize', onResize)
 })
 
 function onCommand(cmd: string) {
@@ -278,10 +296,37 @@ async function onChangePassword() {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   border-bottom: 1px solid #eee;
   background: #fff;
 }
+.search-box { width: 320px; }
+.hamburger { font-size: 22px; cursor: pointer; color: #333; flex-shrink: 0; }
 .user-name { cursor: pointer; color: #333; display: flex; align-items: center; gap: 4px; }
+
+/* ===== 手机端（≤768px）：侧栏变滑出抽屉 ===== */
+@media (max-width: 768px) {
+  .aside.aside-drawer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100%;
+    z-index: 2000;
+    transition: transform 0.25s ease;
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.25);
+  }
+  /* 展开/收起由内联 :style 的 transform 驱动（内联样式必定生效，避开 scoped 优先级问题） */
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 1999;
+  }
+  .search-box { width: auto; flex: 1; min-width: 0; }
+  .header { padding: 0 10px; }
+  /* 头部图标间距在窄屏收紧 */
+  .header :deep(.el-badge), .header :deep(.el-tooltip) { margin-right: 12px !important; }
+}
 .main { background: #f5f7fa; }
 .mb { margin-bottom: 12px; }
 h4 { margin: 6px 0; }
