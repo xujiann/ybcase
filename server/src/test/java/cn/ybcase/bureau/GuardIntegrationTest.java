@@ -25,6 +25,9 @@ class GuardIntegrationTest {
     @Autowired CaseService caseService;
     @Autowired ApprovalService approvalService;
     @Autowired CaseCauseRepository causeRepository;
+    @Autowired cn.ybcase.bureau.service.OversightService oversightService;
+    @Autowired cn.ybcase.core.repository.SysUserRepository sysUserRepository;
+    @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
 
     private CaseCause providerCause() {
         return causeRepository.findAll().stream()
@@ -157,6 +160,55 @@ class GuardIntegrationTest {
                 "立案审批表"), "banban");
         var result = approvalService.decide(id, true, "同意立案", "juzhang");
         assertTrue((Boolean) result.get("approved"));
+    }
+
+    @Test
+    void 账号并发修改触发乐观锁冲突() {
+        // 停用与改密并发时后写覆盖先写（已停用账号被改回启用）——@Version 兜底；
+        // 本测试保证该注解或 2102 映射被回退时 CI 变红
+        var u1 = sysUserRepository.findByUsername("banban").orElseThrow();
+        var u2 = sysUserRepository.findByUsername("banban").orElseThrow();  // 两个独立事务 → 两份游离实体
+        u1.setPhone("13800000001");
+        sysUserRepository.save(u1);  // rowVersion +1
+        u2.setPhone("13800000002");  // 携带过期版本
+        assertThrows(org.springframework.dao.OptimisticLockingFailureException.class,
+                () -> sysUserRepository.save(u2));
+    }
+
+    @Test
+    void 专家评审扣除与既有区间重叠时只记净增部分() {
+        java.time.LocalDate today = java.time.LocalDate.now();
+        CaseFile c = caseService.create(req("IT-评审重叠" + System.nanoTime(), TWO), "it");
+        // 回拨立案日，使能构造历史区间（服务层校验起始日不得早于立案日）
+        jdbc.update("update case_file set filed_at = ? where id = ?", today.minusDays(20), c.getId());
+        // 既有鉴定扣除 [today-10, today)
+        caseService.addExclusion(c.getId(), new CaseService.ExclusionReq(
+                "APPRAISE", today.minusDays(10), today, "鉴定"));
+        // 专家评审 [today-15, today)：与鉴定重叠 [today-10, today)，净增只应是 [today-15, today-10)
+        oversightService.startExpertReview(c.getId(), "专家甲", today.minusDays(15));
+        Long reviewId = jdbc.queryForObject(
+                "select max(id) from expert_review where case_id = ?", Long.class, c.getId());
+        oversightService.endExpertReview(c.getId(), reviewId, "意见", null, today);
+        var expertRows = jdbc.queryForList(
+                "select start_at, end_at from case_period_exclusion where case_id = ? and reason = 'EXPERT'",
+                c.getId());
+        assertEquals(1, expertRows.size(), "重叠部分应被剔除，只落一条净增区间");
+        assertEquals(today.minusDays(15), ((java.sql.Date) expertRows.get(0).get("start_at")).toLocalDate());
+        assertEquals(today.minusDays(10), ((java.sql.Date) expertRows.get(0).get("end_at")).toLocalDate());
+        // 总扣除 = 鉴定10日 + 评审净增5日（重叠不双算）
+        Integer total = jdbc.queryForObject(
+                "select coalesce(sum(end_at - start_at), 0) from case_period_exclusion where case_id = ?",
+                Integer.class, c.getId());
+        assertEquals(15, total);
+    }
+
+    @Test
+    void 同案不允许并行第二条专家评审() {
+        CaseFile c = caseService.create(req("IT-并行评审" + System.nanoTime(), TWO), "it");
+        oversightService.startExpertReview(c.getId(), "专家甲", null);
+        var e = assertThrows(BizException.class,
+                () -> oversightService.startExpertReview(c.getId(), "专家乙", null));
+        assertEquals(2066, e.code);
     }
 
     @Test

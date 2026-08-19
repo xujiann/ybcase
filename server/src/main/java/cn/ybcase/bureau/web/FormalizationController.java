@@ -1,5 +1,6 @@
 package cn.ybcase.bureau.web;
 
+import static cn.ybcase.bureau.common.CaseScopeInterceptor.privileged;
 import cn.ybcase.bureau.common.BizException;
 import cn.ybcase.bureau.service.ApprovalService;
 import cn.ybcase.bureau.service.BureauConfig;
@@ -37,11 +38,6 @@ public class FormalizationController {
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.CaseService caseService;
 
-    private static boolean privileged(Authentication auth) {
-        return auth.getAuthorities().stream().anyMatch(a ->
-                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
-                        || a.getAuthority().equals("ROLE_ADMIN"));
-    }
 
     // ---------- 电子签章 ----------
 
@@ -240,9 +236,15 @@ public class FormalizationController {
     @PreAuthorize("hasRole('ADMIN')")
     @GetMapping("/audit/export")
     public ResponseEntity<byte[]> auditExport(@RequestParam String month) {
+        // 审计表只增不删、月导出是等保例行操作：to_char 包住列会使 idx_audit_created 失效而全表扫描，
+        // 改月初区间谓词命中索引；月份格式在此显式校验（yyyy-MM）
+        if (month == null || !month.matches("\\d{4}-\\d{2}"))
+            throw new BizException(2100, "月份格式须为 yyyy-MM（收到：" + month + "）");
+        LocalDate monthStart = LocalDate.parse(month + "-01");
         var rows = jdbc.queryForList("""
                 select id, username, method, path, http_status, client_ip, created_at
-                from sys_audit_log where to_char(created_at, 'YYYY-MM') = ? order by id""", month);
+                from sys_audit_log where created_at >= ? and created_at < ? order by id""",
+                monthStart, monthStart.plusMonths(1));
         StringBuilder sb = new StringBuilder("﻿id,用户,方法,路径,状态码,IP,时间\n");
         for (var r : rows) {
             sb.append(r.get("id")).append(',').append(nv(r.get("username"))).append(',')

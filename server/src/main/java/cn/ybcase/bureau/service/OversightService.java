@@ -158,6 +158,11 @@ public class OversightService {
         LocalDate start = startedAt == null ? LocalDate.now() : startedAt;
         if (start.isBefore(filedAt)) throw new BizException(2066, "评审开始日期不得早于立案日期（" + filedAt + "）");
         if (start.isAfter(LocalDate.now())) throw new BizException(2066, "评审开始日期不得晚于今天");
+        // 同案只允许一条进行中评审：并行多条区间可完全重合，结束时会重复扣除期限
+        Integer running = jdbc.queryForObject(
+                "select count(*) from expert_review where case_id = ? and ended_at is null", Integer.class, caseId);
+        if (running != null && running > 0)
+            throw new BizException(2066, "本案已有进行中的专家评审，请先结束后再启动新评审");
         jdbc.update("insert into expert_review (case_id, experts, started_at) values (?,?,?)",
                 caseId, experts, start);
     }
@@ -174,8 +179,28 @@ public class OversightService {
         if (end.isBefore(start)) throw new BizException(2066, "评审结束日期不得早于开始日期（" + start + "）");
         if (end.isAfter(LocalDate.now())) throw new BizException(2066, "评审结束日期不得晚于今天");
         jdbc.update("update expert_review set ended_at = ?, opinion = ? where id = ?", end, opinion, reviewId);
-        // 第45条：专家评审时间不计入办案期限——自动登记期限扣除
-        jdbc.update("insert into case_period_exclusion (case_id, reason, start_at, end_at, note) values (?,?,?,?,?)",
-                caseId, "EXPERT", start, end, "专家评审（自动登记）");
+        // 第45条：专家评审时间不计入办案期限——自动登记期限扣除。
+        // 与既有扣除区间（鉴定/听证等）裁剪去重后再落库：重叠部分会被 sum(end_at-start_at)
+        // 双算而凭空延长办案期限，等于绕开"延期须负责人批准"（addExclusion 对手工登记已硬拒重叠，
+        // 此处是自动登记，硬拒会卡住评审结束，故改为剔除重叠只记净增部分）
+        var existing = jdbc.queryForList(
+                "select start_at, coalesce(end_at, current_date) as end_at from case_period_exclusion where case_id = ?",
+                caseId);
+        java.util.Set<LocalDate> covered = new java.util.HashSet<>();
+        for (var r : existing) {
+            LocalDate s = ((java.sql.Date) r.get("start_at")).toLocalDate();
+            LocalDate e = ((java.sql.Date) r.get("end_at")).toLocalDate();
+            for (LocalDate d = s; d.isBefore(e); d = d.plusDays(1)) covered.add(d);
+        }
+        LocalDate runStart = null;
+        for (LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) {
+            boolean slotFree = d.isBefore(end) && !covered.contains(d);
+            if (slotFree && runStart == null) runStart = d;
+            if (!slotFree && runStart != null) {
+                jdbc.update("insert into case_period_exclusion (case_id, reason, start_at, end_at, note) values (?,?,?,?,?)",
+                        caseId, "EXPERT", runStart, d, "专家评审（自动登记，已剔除与既有扣除重叠的部分）");
+                runStart = null;
+            }
+        }
     }
 }

@@ -53,7 +53,8 @@ public class CaseScopeInterceptor implements HandlerInterceptor {
         }
     }
 
-    private static boolean privileged(Authentication auth) {
+    /** 可越过 case_view_scope=SELF 的角色（负责人/法制/管理员）——数据范围口径的唯一权威实现，勿在控制器另拷 */
+    public static boolean privileged(Authentication auth) {
         return auth.getAuthorities().stream().anyMatch(a ->
                 a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
                         || a.getAuthority().equals("ROLE_ADMIN"));

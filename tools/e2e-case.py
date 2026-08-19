@@ -453,6 +453,9 @@ def main():
                json={"experts": "临床专家A、医保专家B", "startedAt": str(today + datetime.timedelta(days=1))},
                expect_code=2066)  # 未来日期
     admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews", json={"experts": "临床专家A、医保专家B"})
+    # 同案不允许并行第二条评审（并行区间重合会重复扣除期限，第五轮新守卫）
+    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews",
+               json={"experts": "专家C"}, expect_code=2066)
     er_id = admin.get(f"/bureau/cases/{d_case['id']}")["expertReviews"][-1]["id"]  # 用本次创建的真实 id，非全新库也可跑
     e_case_before = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
     # 结束时倒填一个很早的开始日：应被忽略，扣除仍按库内登记的今天计
@@ -858,6 +861,27 @@ def main():
         tibu2 = Api("tibu2", password="Init12345")
         tibu2.get(f"/bureau/cases/{scope_case['id']}", expect_code=2080)
         print("    PASS: 同名新账号不因重名获得参办范围（旧口径按 real_name 匹配会放行）")
+        # 回避后失去参办数据范围（SCOPE_SQL 的 o.avoided=false 过滤兜底，第五轮补测）
+        admin.post("/system/users", json={
+            "username": "tibu3", "password": "Init12345", "realName": "李替补",
+            "roleCodes": ["HANDLER"]})
+        uid3 = next(u["id"] for u in admin.get("/system/users", params={"size": 200})["records"]
+                    if u["username"] == "tibu3")
+        admin.post("/bureau/enforcers", json={
+            "name": "李替补", "certNo": "YB003", "dept": "基金监督管理处",
+            "certExpireAt": "2027-06-30", "userId": uid3})
+        av_case = admin.post("/bureau/cases", json={
+            "causeId": cause13["id"], "partyName": "回避范围医院", "partyType": "PROVIDER",
+            "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"},
+                          {"name": "李替补", "certNo": "YB003", "duty": "MEMBER"}]})
+        tibu3 = Api("tibu3", password="Init12345")
+        tibu3.get(f"/bureau/cases/{av_case['id']}")  # 参办可见
+        off3 = next(o for o in admin.get(f"/bureau/cases/{av_case['id']}")["officers"]
+                    if o["cert_no"] == "YB003")
+        admin.post(f"/bureau/cases/{av_case['id']}/officers/{off3['id']}/avoid",
+                   json={"reason": "与当事人有利害关系"})
+        tibu3.get(f"/bureau/cases/{av_case['id']}", expect_code=2080)
+        print("    PASS: 被回避办案人员失去本案数据范围（回避制度要隔离的正是此人）")
         sr_bb = banban.get("/bureau/search", params={"q": "范围隔离"})
         ok(all(c_["id"] != scope_case["id"] for c_ in sr_bb["cases"]), "SELF 下全局搜索不含隔离案")
         sr_ju = juzhang.get("/bureau/search", params={"q": "范围隔离"})

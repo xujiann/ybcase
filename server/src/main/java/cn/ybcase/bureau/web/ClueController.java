@@ -23,7 +23,7 @@ public class ClueController {
     @GetMapping
     public R<List<CaseClue>> list(@RequestParam(required = false) String status) {
         return R.ok(status == null ? clueRepository.findTop200ByOrderByIdDesc()
-                : clueRepository.findByStatusOrderByIdDesc(status));
+                : clueRepository.findTop200ByStatusOrderByIdDesc(status));
     }
 
     @PostMapping

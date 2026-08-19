@@ -418,6 +418,10 @@
         <el-form-item label="标题"><el-input v-model="documentForm.title" /></el-form-item>
         <el-form-item label="内容"><el-input v-model="documentForm.content" type="textarea" :rows="6" /></el-form-item>
         <el-form-item label="制作人"><el-input v-model="documentForm.maker" /></el-form-item>
+        <el-form-item v-if="documentForm.docType === 'ORDER_CORRECT'" label="改正期限">
+          <el-date-picker v-model="documentForm.dueAt" type="date" value-format="YYYY-MM-DD" style="width: 100%"
+                          placeholder="责令改正的截止日期（督办按此预警逾期未改正）" />
+        </el-form-item>
         <el-form-item label="已签名确认"><el-switch v-model="documentForm.signed" /></el-form-item>
       </el-form>
       <template #footer>
@@ -742,7 +746,7 @@ const fileInput = ref<HTMLInputElement>()
 const today = todayLocal()
 const officerForm = reactive({ name: '', certNo: '', duty: 'MEMBER' })
 const evidenceForm = reactive({ type: 'DOCUMENT', name: '', source: '', obtainedAt: today, keeper: '', note: '', registerHold: false, sealed: false })
-const documentForm = reactive({ docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false })
+const documentForm = reactive<any>({ docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false, dueAt: null })
 const exclusionForm = reactive({ reason: 'APPRAISE', startAt: today, endAt: today, note: '' })
 const noticeForm = reactive({ content: '', proposedFine: 0, proposedRecoup: 0 })
 const statementForm = reactive<any>({ statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null })
@@ -946,7 +950,7 @@ function printDoc() {
 const FORM_RESETS: Record<string, () => void> = {
   officer: () => Object.assign(officerForm, { name: '', certNo: '', duty: 'MEMBER' }),
   evidence: () => Object.assign(evidenceForm, { type: 'DOCUMENT', name: '', source: '', obtainedAt: today, keeper: '', note: '', registerHold: false, sealed: false }),
-  document: () => Object.assign(documentForm, { docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false }),
+  document: () => Object.assign(documentForm, { docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false, dueAt: null }),
   exclusion: () => Object.assign(exclusionForm, { reason: 'APPRAISE', startAt: today, endAt: today, note: '' }),
   meeting: () => Object.assign(meetingForm, { heldAt: today, attendees: '', record: '', conclusion: '' }),
   execution: () => Object.assign(executionForm, { kind: 'FINE', amount: 0, paidAt: today, method: 'BANK', note: '', receiptNo: '' }),
@@ -1268,7 +1272,28 @@ async function onCloseCase() {
 }
 
 onMounted(load)
-watch(() => route.params.id, (nv, ov) => { if (nv && nv !== ov) load() })
+/** 切换案件时把流程表单一并复位：A 案填了一半的告知/决定/送达/申辩若残留到 B 案，一次误提交就是错案 */
+function resetCaseLocalForms() {
+  Object.values(FORM_RESETS).forEach((reset) => reset())
+  Object.assign(noticeForm, { content: '', proposedFine: 0, proposedRecoup: 0 })
+  Object.assign(statementForm, { statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null })
+  Object.assign(decisionForm, { decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
+  Object.assign(deliveryForm, { method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null })
+  Object.assign(reviewForm, { reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
+  Object.assign(installmentForm, { seq: 1, dueAt: '', amount: 0 })
+  Object.assign(hearingForm, { announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
+  Object.assign(applyForm, { kind: 'EXTEND', days: 30, reason: '' })
+  Object.assign(docDeliverForm, { documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', receiver: '', receiptNo: '' })
+  reportContent.value = ''
+  Object.keys(dlg).forEach((k) => { dlg[k] = false })  // 打开着的弹窗一并关掉
+}
+
+watch(() => route.params.id, (nv, ov) => {
+  if (nv && nv !== ov) {
+    resetCaseLocalForms()
+    load()
+  }
+})
 </script>
 
 <style scoped>

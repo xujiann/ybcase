@@ -39,6 +39,9 @@ client.interceptors.request.use((config) => {
 
 client.interceptors.response.use(
   (resp) => {
+    // 文件下载（附件/审计CSV/反馈截图等）返回的是原始字节，没有 R 包装——
+    // 不放行会把 Blob 的 code=undefined 误判为失败，所有下载 100% 报"操作失败"
+    if (resp.config.responseType === 'blob') return resp
     const r = resp.data as R
     if (r.code !== 0) {
       recordError({

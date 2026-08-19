@@ -64,7 +64,9 @@ public class DocumentService {
         vars.put("proposedRecoup", notice == null ? "" : notice.getProposedRecoup().toPlainString());
         vars.put("decisionNo", decision == null || decision.getDecisionNo() == null ? "（决定后生成）" : decision.getDecisionNo());
         vars.put("decisionContent", decision == null ? "" : nv(decision.getContent()));
-        vars.put("dueAt", "");
+        // 责令改正通知书的改正期限须承办人填写：替换成空串会渲染出"并于前将…"这种缺法定要素
+        // 且无任何待填痕迹的文书，故保留醒目占位提示（与 basisText 缺失时的自身约定一致）
+        vars.put("dueAt", "（请填写改正期限）");
 
         String title = cn.ybcase.bureau.common.TemplateUtil.fill((String) rows.get(0).get("title_tpl"), vars);
         String content = cn.ybcase.bureau.common.TemplateUtil.fill((String) rows.get(0).get("content_tpl"), vars);

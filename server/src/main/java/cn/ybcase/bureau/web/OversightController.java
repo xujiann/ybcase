@@ -1,5 +1,6 @@
 package cn.ybcase.bureau.web;
 
+import static cn.ybcase.bureau.common.CaseScopeInterceptor.privileged;
 import cn.ybcase.bureau.entity.CaseClue;
 import cn.ybcase.bureau.service.OversightService;
 import cn.ybcase.core.common.R;
@@ -23,11 +24,6 @@ public class OversightController {
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.CaseService caseService;
 
-    private static boolean privileged(Authentication auth) {
-        return auth.getAuthorities().stream().anyMatch(a ->
-                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
-                        || a.getAuthority().equals("ROLE_ADMIN"));
-    }
 
     // 行政检查
     @GetMapping("/inspections")

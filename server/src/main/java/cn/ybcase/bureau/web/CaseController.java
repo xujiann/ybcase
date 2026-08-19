@@ -1,5 +1,6 @@
 package cn.ybcase.bureau.web;
 
+import static cn.ybcase.bureau.common.CaseScopeInterceptor.privileged;
 import cn.ybcase.bureau.entity.*;
 import cn.ybcase.bureau.repository.CaseFileRepository;
 import cn.ybcase.bureau.service.CaseService;
@@ -25,11 +26,6 @@ public class CaseController {
     private final cn.ybcase.bureau.service.DocumentService documentService;
     private final CaseFileRepository caseRepository;
 
-    private static boolean privileged(Authentication auth) {
-        return auth.getAuthorities().stream().anyMatch(a ->
-                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_LEGAL")
-                        || a.getAuthority().equals("ROLE_ADMIN"));
-    }
 
     @GetMapping
     public R<?> list(@RequestParam(required = false) String status,
