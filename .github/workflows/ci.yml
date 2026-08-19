@@ -3,8 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
+    # 纯文档/部署脚本/记忆类改动不消耗 Actions 分钟（近期多轮全量 CI 因这类提交白跑）
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'deploy/**'
+      - '.devcontainer/**'
   pull_request:
     branches: [main]
+
+# 连续 push 时只保留最新一轮：上一轮未跑完直接取消（免费额度 2000 分钟/月，省着用）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend:
