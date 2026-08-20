@@ -58,7 +58,11 @@ public class CaseController {
 
     @PostMapping
     public R<CaseFile> create(@RequestBody CaseService.CaseCreateReq req, Authentication auth) {
-        return R.ok(caseService.create(req, auth.getName()));
+        CaseFile c = caseService.create(req, auth.getName());
+        // 第17条"凡批准必有单"：直接立案（不走 /approvals FILE_CASE 流程）同样补记立案审批表单据
+        approvalService.recordDirect("FILE_CASE", c.getId(),
+                "直接立案：" + c.getPartyName(), auth.getName());
+        return R.ok(c);
     }
 
     @PostMapping("/{id}/officers")

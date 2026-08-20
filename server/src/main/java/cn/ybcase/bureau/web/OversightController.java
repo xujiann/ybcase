@@ -51,12 +51,21 @@ public class OversightController {
         return R.ok(oversightService.inspectionToClue(id, auth.getName()));
     }
 
-    // 举报奖励
+    // 举报奖励（举报人信息严格保密，条例35条：仅监督岗可见明文）
     @GetMapping("/rewards")
-    public R<List<Map<String, Object>>> rewards() {
-        return R.ok(jdbc.queryForList("""
+    public R<List<Map<String, Object>>> rewards(Authentication auth) {
+        List<Map<String, Object>> rows = jdbc.queryForList("""
                 select r.*, c.clue_no, c.suspect_name from reward r
-                join case_clue c on c.id = r.clue_id order by r.id desc limit 200"""));
+                join case_clue c on c.id = r.clue_id order by r.id desc limit 200""");
+        if (!privileged(auth)) {
+            // 非监督岗一律脱敏：举报人姓名保留首字、联系方式隐去
+            for (var r : rows) {
+                String nm = (String) r.get("reporter_name");
+                r.put("reporter_name", nm == null || nm.isEmpty() ? nm : nm.charAt(0) + "**");
+                r.put("reporter_contact", r.get("reporter_contact") == null ? null : "***");
+            }
+        }
+        return R.ok(rows);
     }
 
     @PostMapping("/rewards")

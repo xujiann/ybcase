@@ -24,9 +24,10 @@ public class DocumentService {
 
     /** 案卷装订顺序（一案一卷，按文书类型排序，第57条） */
     private static final List<String> ARCHIVE_ORDER = List.of(
-            "OTHER", "SCENE_RECORD", "INQUIRY_RECORD", "ASSIST_LETTER", "SUSPEND_DECISION",
-            "RESUME_NOTICE", "FINAL_REPORT", "NOTICE", "HEARING_RECORD", "MEETING_RECORD",
-            "DECISION", "DELIVERY_RECEIPT", "ORDER_CORRECT", "TERMINATE_DECISION", "CLOSE_REPORT");
+            "OTHER", "SCENE_RECORD", "INQUIRY_RECORD", "PRESERVE_DECISION", "SEAL_DECISION",
+            "ASSIST_LETTER", "SUSPEND_DECISION", "RESUME_NOTICE", "FINAL_REPORT", "NOTICE",
+            "HEARING_RECORD", "MEETING_RECORD", "DECISION", "DELIVERY_RECEIPT", "ORDER_CORRECT",
+            "URGE_LETTER", "TERMINATE_DECISION", "CLOSE_REPORT");
 
     /** 普通程序处罚案件必备文书（齐全性检查） */
     private static final List<String> REQUIRED_NORMAL_PUNISH = List.of(

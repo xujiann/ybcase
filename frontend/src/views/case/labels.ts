@@ -26,6 +26,7 @@ export const EVIDENCE_TYPE: Record<string, string> = {
 export const DOC_TYPE: Record<string, string> = {
   SCENE_RECORD: '现场笔录', INQUIRY_RECORD: '询问笔录', ASSIST_LETTER: '协查函',
   FINAL_REPORT: '调查终结报告', SUSPEND_DECISION: '中止决定书', RESUME_NOTICE: '恢复通知',
+  PRESERVE_DECISION: '先行登记保存决定书', SEAL_DECISION: '封存决定书', URGE_LETTER: '催告书',
   TERMINATE_DECISION: '终止决定', NOTICE: '告知书', HEARING_RECORD: '听证笔录',
   MEETING_RECORD: '集体讨论记录', DECISION: '决定书', DELIVERY_RECEIPT: '送达回证',
   CLOSE_REPORT: '结案报告', OTHER: '其他',

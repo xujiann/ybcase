@@ -192,6 +192,10 @@ def main():
     admin.post(f"/bureau/cases/{cid}/meetings", json={
         "heldAt": str(today), "attendees": "局长、分管副局长、基金监督处长、法规处长",
         "record": "一致同意处罚意见", "conclusion": "同意罚款15万元并责令退回基金8万元"})
+    # 决定前集体讨论须签字确认（第五轮矩阵整改：空壳讨论记录不再能放行 2047）
+    _mt = admin.get(f"/bureau/cases/{cid}")["meetings"][-1]
+    admin.post(f"/bureau/cases/{cid}/meetings/{_mt['id']}/sign",
+               json={"signNames": "局长、分管副局长、基金监督处长、法规处长"})
 
     step("作出处罚决定：文号生成、案件名称去'涉嫌'、状态 DECIDED")
     decision = admin.post(f"/bureau/cases/{cid}/decide", json={
@@ -268,6 +272,9 @@ def main():
     admin.post(f"/bureau/cases/{case4['id']}/meetings", json={
         "heldAt": str(today), "attendees": "局长、分管副局长、基金监督处长、法规处长",
         "record": "经讨论一致同意继续延期30日", "conclusion": "同意延期30日"})
+    _mt4 = admin.get(f"/bureau/cases/{case4['id']}")["meetings"][-1]
+    admin.post(f"/bureau/cases/{case4['id']}/meetings/{_mt4['id']}/sign",
+               json={"signNames": "局长、分管副局长"})
     ext = admin.post(f"/bureau/cases/{case4['id']}/extend", json={"days": 30, "reason": "涉及多个法律关系"})
     ok(ext["deadlineAt"] == str(today + datetime.timedelta(days=150)), "期限 90+30+30 日")
 
@@ -508,9 +515,11 @@ def main():
     admin.post(f"/bureau/cases/{hid}/hearings", json={
         "noticeSentAt": str(today), "scheduledAt": str(today + datetime.timedelta(days=8)),
         "host": "王办案"}, expect_code=2056)
+    # 通知日回拨 8 天使计划举行日恰为今天：现实中不可能"今天通知、今天开听证"
     admin.post(f"/bureau/cases/{hid}/hearings", json={
-        "announcedAt": str(today), "noticeSentAt": str(today),
-        "scheduledAt": str(today + datetime.timedelta(days=8)),
+        "announcedAt": str(today - datetime.timedelta(days=8)),
+        "noticeSentAt": str(today - datetime.timedelta(days=8)),
+        "scheduledAt": str(today),
         "host": "李法制", "hostDept": "政策法规处", "recorder": "书记员小周"})
     print("    PASS: 听证已安排")
 
@@ -527,6 +536,8 @@ def main():
                json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "程序合法"})
     admin.post(f"/bureau/cases/{hid}/meetings", json={
         "heldAt": str(today), "attendees": "局领导班子", "record": "讨论一致", "conclusion": "同意处罚"})
+    _mth = admin.get(f"/bureau/cases/{hid}")["meetings"][-1]
+    admin.post(f"/bureau/cases/{hid}/meetings/{_mth['id']}/sign", json={"signNames": "局领导班子"})
     admin.post(f"/bureau/cases/{hid}/decide", json={
         "decisionType": "PUNISH", "fineAmount": 120000, "recoupAmount": 60000,
         "discretionReason": "listed", "content": "罚款12万元"})

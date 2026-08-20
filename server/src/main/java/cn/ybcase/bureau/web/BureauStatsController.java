@@ -74,10 +74,14 @@ public class BureauStatsController {
                 select r.id, r.case_id, cf.case_no, r.submitted_at, r.deadline_at
                 from case_review r join case_file cf on cf.id = r.case_id
                 where r.reviewed_at is null and r.deadline_at < current_date order by r.deadline_at"""));
-        // 送达超期（第59条：决定后7个工作日，此处按自然日9天近似预警）
+        // 送达超期（第59条：决定后7个工作日，按节假日表精确计算，不再用自然日近似）
+        int deliverDays = cfg.intVal("delivery_days", 7);
         m.put("deliveryOverdue", jdbc.queryForList("""
                 select id, case_no, name, decided_at from case_file
-                where status = 'DECIDED' and decided_at < current_date - 9 order by decided_at"""));
+                where status = 'DECIDED' and decided_at is not null order by decided_at""").stream()
+                .filter(r -> cfg.plusWorkdays(((java.sql.Date) r.get("decided_at")).toLocalDate(),
+                        deliverDays).isBefore(java.time.LocalDate.now()))
+                .toList());
         // 先行登记保存超期未处理（第26条：7个工作日）
         m.put("holdOverdue", jdbc.queryForList("""
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.hold_expire_at
@@ -100,7 +104,8 @@ public class BureauStatsController {
         m.put("hearingOpinionOverdue", jdbc.queryForList("""
                 select h.id, h.case_id, cf.case_no, h.held_at
                 from case_hearing h join case_file cf on cf.id = h.case_id
-                where h.status = 'HELD' and h.held_at + 2 < current_date order by h.held_at"""));
+                where h.status = 'HELD' and h.held_at + ?::int < current_date order by h.held_at""",
+                cfg.intVal("hearing_opinion_days", 2)));
         // 简易程序备案超期（第51条：决定后7个工作日，节假日表精确计算）
         int recordDays = cfg.intVal("summary_record_days", 7);
         m.put("summaryRecordOverdue", jdbc.queryForList("""

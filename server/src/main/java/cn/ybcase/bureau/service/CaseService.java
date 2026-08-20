@@ -67,6 +67,9 @@ public class CaseService {
         CaseFile c = new CaseFile();
         LocalDate today = LocalDate.now();
         // 第6条：追责时效——违法行为终了起2年（涉生命健康且有危害后果5年）未被发现不再处罚
+        // 不填终了日即完全绕过时效检查，故提供强制开关（默认开启，历史数据迁移期可关）
+        if (req.violationEndDate() == null && config.bool("violation_end_date_required", false))
+            throw new BizException(2051, "须填写违法行为终了日期，用于追责时效判定（第6条）；确无法确定的，请由管理员关闭该校验开关");
         if (req.violationEndDate() != null) {
             int years = Boolean.TRUE.equals(req.healthHarm())
                     ? config.intVal("liability_years_health", 5) : config.intVal("liability_years", 2);
@@ -145,8 +148,16 @@ public class CaseService {
                 Integer.class, caseId, officerId);
         if (active == null || active < 2)
             throw new BizException(2002, "回避后执法人员将少于两人，请先补充办案人员（第16条）");
+        // 第5条分级批准：当事人申请回避由本机关负责人审查决定，须记录批准人；
+        // 主办（LEAD）人员回避影响办案组织，同样须经批准——主动回避（SELF）报告即可，不强求批准人
         if ("PARTY".equals(applicant) && (decidedBy == null || decidedBy.isBlank()))
             throw new BizException(2061, "当事人申请回避须经负责人审查决定并记录批准人（第5条）");
+        var offRow = jdbc.queryForList("select duty from case_officer where id = ? and case_id = ?", officerId, caseId);
+        if (!offRow.isEmpty() && "LEAD".equals(offRow.get(0).get("duty"))
+                && (decidedBy == null || decidedBy.isBlank()))
+            throw new BizException(2061, "主办人员回避须经负责人批准并记录批准人（第5条）");
+        if (reason == null || reason.isBlank())
+            throw new BizException(2061, "回避须载明事由（第5条）");
         int n = jdbc.update("""
                 update case_officer set avoided = true, avoid_reason = ?, avoid_applicant = ?, avoid_decided_by = ?
                 where id = ? and case_id = ? and avoided = false""",
@@ -350,6 +361,12 @@ public class CaseService {
             throw new BizException(2077, "再次告知的拟处罚金额高于前次，须载明改变原认定事实、证据或依据的理由（辽52条）；"
                     + "不得因当事人陈述申辩而加重处罚（第41条）");
         CaseNotice n = new CaseNotice();
+        // 听证申请随案而非随单：再次告知不得清空前次的听证申请，
+        // 否则当事人申请听证后只要以同额再告知一次，2075 守卫即失效
+        if (prev != null && Boolean.TRUE.equals(prev.getHearingRequested())) {
+            n.setHearingRequested(true);
+            n.setHearingHeldAt(prev.getHearingHeldAt());
+        }
         n.setChangeReason(req.changeReason());
         n.setCaseId(caseId);
         n.setNotifiedAt(LocalDate.now());
@@ -379,7 +396,8 @@ public class CaseService {
         // 辽44条：期限内未行使陈述权、申辩权的，视为放弃
         if (req.statement() != null && n.getStatementDeadline() != null
                 && LocalDate.now().isAfter(n.getStatementDeadline()))
-            throw new BizException(2046, "已超过陈述申辩期限（" + n.getStatementDeadline() + "），视为放弃权利（辽44条）");
+            throw new BizException(2046, "已超过陈述申辩期限（" + n.getStatementDeadline()
+                    + "），依法视为放弃陈述申辩权（辽44条）；如需继续，请按放弃留痕处理");
         if (req.statement() != null) n.setStatement(req.statement());
         if (req.statementReview() != null) n.setStatementReview(req.statementReview());
         // 当事人明确放弃陈述申辩：留痕后方可在期限届满前决定（第41条）
@@ -409,6 +427,10 @@ public class CaseService {
     @Transactional
     public void addMeeting(Long caseId, MeetingReq req) {
         get(caseId);
+        if (req.attendees() == null || req.attendees().isBlank())
+            throw new BizException(2047, "须记录集体讨论参加人员（第44条）");
+        if (req.conclusion() == null || req.conclusion().isBlank())
+            throw new BizException(2047, "须记录集体讨论结论（第44条）");
         jdbc.update("insert into case_meeting (case_id, held_at, attendees, record, conclusion) values (?,?,?,?,?)",
                 caseId, req.heldAt() != null ? req.heldAt() : LocalDate.now(),
                 req.attendees(), req.record(), req.conclusion());
@@ -463,6 +485,12 @@ public class CaseService {
             // 第41条：当事人申请听证的，应当组织听证后再决定
             if (Boolean.TRUE.equals(notice.getHearingRequested()) && notice.getHearingHeldAt() == null)
                 throw new BizException(2075, "当事人已申请听证，应当组织听证并制作笔录后方可作出决定（第41条）");
+            // 已排期未举行的听证同样拦截：notice 上的标记可能因再次告知而遗漏
+            Integer pendingHearing = jdbc.queryForObject(
+                    "select count(*) from case_hearing where case_id = ? and status = 'SCHEDULED'",
+                    Integer.class, caseId);
+            if (pendingHearing != null && pendingHearing > 0)
+                throw new BizException(2075, "本案有已排期但尚未举行的听证，应当组织听证后方可作出决定（第41条）");
             // 陈述申辩期届满前不得决定；当事人已陈述申辩或书面放弃的除外（参数开关）
             // 已举行听证的，当事人已充分陈述申辩，不再受该期限约束
             if ("PUNISH".equals(req.decisionType()) && config.bool("statement_wait_required", true)
@@ -493,7 +521,12 @@ public class CaseService {
             if ("PUNISH".equals(req.decisionType())) {
                 BigDecimal meetingThreshold = config.byPartyType(c.getPartyType(),
                         "meeting_required_fine_individual", "meeting_required_fine_org", "100000");
-                boolean hasMeeting = !jdbc.queryForList("select id from case_meeting where case_id = ?", caseId).isEmpty();
+                // 空壳讨论记录不算数：须有实质内容且经签字确认（第44条集体讨论决定）
+                boolean hasMeeting = !jdbc.queryForList("""
+                        select id from case_meeting
+                        where case_id = ? and sign_confirmed = true
+                          and coalesce(btrim(attendees), '') <> ''
+                          and coalesce(btrim(conclusion), '') <> ''""", caseId).isEmpty();
                 if (fine.compareTo(meetingThreshold) >= 0 && !hasMeeting)
                     throw new BizException(2047, "较大数额罚款（≥" + meetingThreshold + "元）应当经负责人集体讨论决定，请先录入讨论记录（辽54条/局令44条）");
             }
@@ -580,8 +613,14 @@ public class CaseService {
     /** 处罚决定公开（局令46条；辽56条：作出决定7日内公开） */
     @Transactional
     public CaseDecision publish(Long caseId) {
+        CaseFile cf = get(caseId);
         CaseDecision d = decisionRepository.findByCaseId(caseId)
                 .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
+        // 辽56条：公开的是"行政处罚决定"，且应在决定书送达后（未送达即公开会侵害当事人陈述救济权）
+        if (!"PUNISH".equals(d.getDecisionType()))
+            throw new BizException(2042, "仅行政处罚决定需要依法公开（当前决定类型：" + d.getDecisionType() + "）");
+        if (cf.getDeliveredAt() == null)
+            throw new BizException(2042, "处罚决定书尚未送达，不得先行公开（辽56条）");
         // 幂等：重复调用会把公开日期刷成当天，把"7日内公开"的超期证据洗白（第56条监督链）
         if (Boolean.TRUE.equals(d.getPublished()) && d.getPublishedAt() != null)
             throw new BizException(2042, "该决定已于 " + d.getPublishedAt() + " 公开，不可重复登记");

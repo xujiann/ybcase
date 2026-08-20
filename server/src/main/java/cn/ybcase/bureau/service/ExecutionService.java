@@ -101,6 +101,22 @@ public class ExecutionService {
     public CaseFile applyCourtEnforce(Long caseId) {
         CaseFile c = CaseGuards.get(caseRepository, caseId);
         if (!"DELIVERED".equals(c.getStatus())) throw new BizException(2042, "决定书送达且当事人逾期不履行方可申请强制执行");
+        // 行政强制法53/54条：须缴款期届满、经催告仍不履行，且在缴款期满起3个月内申请
+        LocalDate payDeadline = c.getDeliveredAt().plusDays(config.intVal("payment_days", 15));
+        LocalDate today = LocalDate.now();
+        if (!today.isAfter(payDeadline))
+            throw new BizException(2042, "缴款期至 " + payDeadline + " 届满前不得申请法院强制执行（行政强制法53条）");
+        int urgeDays = config.intVal("court_urge_days", 10);
+        var urged = jdbc.queryForList(
+                "select made_at from case_document where case_id = ? and doc_type = 'URGE_LETTER' order by made_at desc",
+                caseId);
+        if (urged.isEmpty())
+            throw new BizException(2042, "申请法院强制执行前应当先行催告（行政强制法54条）：请先制作催告书（文书类型 URGE_LETTER）");
+        LocalDate urgedAt = ((java.sql.Date) urged.get(0).get("made_at")).toLocalDate();
+        if (today.isBefore(urgedAt.plusDays(urgeDays)))
+            throw new BizException(2042, "催告后须满 " + urgeDays + " 日当事人仍不履行方可申请（行政强制法54条）");
+        if (today.isAfter(payDeadline.plusMonths(3)))
+            throw new BizException(2042, "已超过缴款期满起3个月的申请期限（行政强制法53条），请说明情况另行处理");
         c.setCourtEnforceApplied(true);
         return caseRepository.save(c);
     }

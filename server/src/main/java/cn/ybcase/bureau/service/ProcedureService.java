@@ -81,6 +81,19 @@ public class ProcedureService {
     @Transactional
     public void holdHearing(Long caseId, Long hearingId, String record) {
         if (record == null || record.isBlank()) throw new BizException(2057, "须制作听证笔录（辽50条）");
+        // 实际举行日同样受"通知后满 N 日"约束：此前只校验计划日，当天举行也能通过
+        var hr = jdbc.queryForList(
+                "select scheduled_at, notice_sent_at from case_hearing where id = ? and case_id = ?",
+                hearingId, caseId);
+        if (hr.isEmpty()) throw new BizException(2057, "听证不存在");
+        LocalDate today = LocalDate.now();
+        Object schedRaw = hr.get(0).get("scheduled_at");
+        if (schedRaw != null && today.isBefore(((java.sql.Date) schedRaw).toLocalDate()))
+            throw new BizException(2057, "尚未到听证计划举行日（" + schedRaw + "），不得提前登记举行");
+        Object sentRaw = hr.get(0).get("notice_sent_at");
+        int aheadDays = config.intVal("hearing_notice_ahead_days", 7);
+        if (sentRaw != null && today.isBefore(((java.sql.Date) sentRaw).toLocalDate().plusDays(aheadDays)))
+            throw new BizException(2057, "听证举行日距通知送达不足 " + aheadDays + " 日（辽48条）");
         int n = jdbc.update("""
                 update case_hearing set held_at = ?, record = ?, status = 'HELD'
                 where id = ? and case_id = ? and status = 'SCHEDULED'""",

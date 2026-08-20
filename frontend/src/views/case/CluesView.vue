@@ -35,11 +35,12 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="220">
+      <el-table-column label="操作" width="290">
         <template #default="{ row }">
           <template v-if="row.status === 'PENDING'">
             <el-button size="small" type="primary" @click="toFile(row)">立案</el-button>
             <el-button size="small" :disabled="row.extended" @click="onExtend(row)">延期</el-button>
+            <el-button size="small" @click="onExclusion(row)">期限扣除</el-button>
             <el-button size="small" type="warning" @click="onReject(row)">不予立案</el-button>
           </template>
           <span v-else class="hint">{{ row.verifyResult || '-' }}</span>
@@ -119,6 +120,18 @@ async function onCreate() {
   createVisible.value = false
   form.suspectName = ''
   form.content = ''
+  load()
+}
+
+async function onExclusion(row: any) {
+  // 鉴定/检验期间不计入核查期限（辽15条）——此前只有后端接口，UI 无入口
+  const { value: days } = await ElMessageBox.prompt(
+    '不计入核查期限的天数（鉴定、检验等，辽15条）', '期限扣除',
+    { inputPattern: /^[1-9]\d*$/, inputErrorMessage: '请填写正整数天数' })
+  const { value: reason } = await ElMessageBox.prompt('扣除事由', '期限扣除',
+    { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/clues/${row.id}/exclusions`, { days: Number(days), reason })
+  ElMessage.success('已登记扣除，核查期限相应顺延')
   load()
 }
 

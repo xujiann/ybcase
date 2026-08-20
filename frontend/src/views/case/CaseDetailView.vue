@@ -464,6 +464,10 @@
       <el-form label-width="110px">
         <el-form-item label="拟罚款金额"><el-input-number v-model="noticeForm.proposedFine" :min="0" :precision="2" style="width: 200px" /></el-form-item>
         <el-form-item label="拟追回基金"><el-input-number v-model="noticeForm.proposedRecoup" :min="0" :precision="2" style="width: 200px" /></el-form-item>
+        <el-form-item label="变更理由">
+          <el-input v-model="noticeForm.changeReason" type="textarea" :rows="2"
+                    placeholder="仅再次告知且金额高于前次时必填：说明改变原认定事实、证据或依据的理由（辽52条）" />
+        </el-form-item>
         <el-form-item label="事实理由依据"><el-input v-model="noticeForm.content" type="textarea" :rows="5" /></el-form-item>
       </el-form>
       <p class="hint">拟罚款达到听证标准将自动告知听证权利；当事人享有陈述权、申辩权。</p>
@@ -477,6 +481,10 @@
       <el-form label-width="110px">
         <el-form-item label="陈述申辩内容"><el-input v-model="statementForm.statement" type="textarea" :rows="4" /></el-form-item>
         <el-form-item label="复核意见"><el-input v-model="statementForm.statementReview" type="textarea" :rows="3" placeholder="成立的应当采纳；不得因陈述申辩加重处罚" /></el-form-item>
+        <el-form-item label="明确放弃">
+          <el-switch v-model="statementForm.statementWaived" />
+          <div class="hint">当事人明确表示放弃陈述申辩的，勾选后可在期限届满前作出决定（须另有书面/笔录佐证）</div>
+        </el-form-item>
         <el-form-item label="申请听证"><el-switch v-model="statementForm.hearingRequested" /></el-form-item>
         <el-form-item label="听证日期">
           <el-date-picker v-model="statementForm.hearingHeldAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
@@ -748,8 +756,8 @@ const officerForm = reactive({ name: '', certNo: '', duty: 'MEMBER' })
 const evidenceForm = reactive({ type: 'DOCUMENT', name: '', source: '', obtainedAt: today, keeper: '', note: '', registerHold: false, sealed: false })
 const documentForm = reactive<any>({ docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false, dueAt: null })
 const exclusionForm = reactive({ reason: 'APPRAISE', startAt: today, endAt: today, note: '' })
-const noticeForm = reactive({ content: '', proposedFine: 0, proposedRecoup: 0 })
-const statementForm = reactive<any>({ statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null })
+const noticeForm = reactive<any>({ content: '', proposedFine: 0, proposedRecoup: 0, changeReason: '' })
+const statementForm = reactive<any>({ statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null, statementWaived: false })
 const meetingForm = reactive({ heldAt: today, attendees: '', record: '', conclusion: '' })
 const decisionForm = reactive({ decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
 const deliveryForm = reactive({ method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null as string | null })
