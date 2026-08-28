@@ -17,12 +17,20 @@ public class BureauServerApplication {
         // 容器默认 UTC 时，中国 0:00-8:00 之间算出的"今天"比实际早一天——法律文书日期会记错，
         // 且事后无法从数据判断哪些是错的。部署侧已设 TZ，此处再兜一层：允许用
         // -Duser.timezone 或 YBCASE_TIMEZONE 覆盖（跨省部署时改这一处即可）。
-        String tz = System.getProperty("user.timezone");
-        if (tz == null || tz.isBlank() || "UTC".equals(tz) || "GMT".equals(tz)) {
-            String want = System.getenv().getOrDefault("YBCASE_TIMEZONE", "Asia/Shanghai");
-            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone(want));
-            System.setProperty("user.timezone", want);
-        }
+        applyBusinessTimeZone(System.getProperty("user.timezone"),
+                System.getenv().getOrDefault("YBCASE_TIMEZONE", "Asia/Shanghai"));
         SpringApplication.run(BureauServerApplication.class, args);
+    }
+
+    /**
+     * 决定业务时区并应用；返回最终生效的时区 ID（供测试断言）。
+     * current 为空或是 UTC/GMT（容器默认）时改用 want，否则尊重部署方的显式设置。
+     */
+    static String applyBusinessTimeZone(String current, String want) {
+        String effective = (current == null || current.isBlank()
+                || "UTC".equals(current) || "GMT".equals(current)) ? want : current;
+        java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone(effective));
+        System.setProperty("user.timezone", effective);
+        return effective;
     }
 }

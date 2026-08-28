@@ -78,16 +78,31 @@ class WorkdaysTest {
     }
 
     @org.junit.jupiter.api.Test
-    void 业务日期须按中国时区计算() {
-        // 容器默认 UTC 时，中国 0:00-8:00 的"今天"会早一天，导致立案日/告知日等法律日期记错。
-        // BureauServerApplication.main 已兜底设置，此处守住该约定不被改回。
-        java.time.Instant chinaEarlyMorning = java.time.ZonedDateTime
-                .of(2026, 8, 28, 2, 0, 0, 0, java.time.ZoneId.of("Asia/Shanghai")).toInstant();
-        java.time.LocalDate byChina = java.time.LocalDate.ofInstant(
-                chinaEarlyMorning, java.time.ZoneId.of("Asia/Shanghai"));
-        java.time.LocalDate byDefault = java.time.LocalDate.ofInstant(
-                chinaEarlyMorning, java.time.ZoneId.systemDefault());
-        org.junit.jupiter.api.Assertions.assertEquals(byChina, byDefault,
-                "JVM 默认时区不是东八区：中国凌晨时段的业务日期会差一天（部署须设 TZ=Asia/Shanghai）");
+    void 业务日期时区兜底逻辑() {
+        // 不断言"当前 JVM 恰好是东八区"——CI runner 是 UTC，那样测的是环境不是代码。
+        // 这里验证兜底逻辑本身：容器默认 UTC 时必须被纠正，部署方显式设定则尊重。
+        java.util.TimeZone original = java.util.TimeZone.getDefault();
+        try {
+            org.junit.jupiter.api.Assertions.assertEquals("Asia/Shanghai",
+                    BureauServerApplication.applyBusinessTimeZone("UTC", "Asia/Shanghai"),
+                    "容器默认 UTC 未被纠正：中国 0-8 点的立案日/告知日会差一天");
+            org.junit.jupiter.api.Assertions.assertEquals("Asia/Shanghai",
+                    BureauServerApplication.applyBusinessTimeZone(null, "Asia/Shanghai"),
+                    "时区未设置时未兜底");
+            org.junit.jupiter.api.Assertions.assertEquals("Asia/Urumqi",
+                    BureauServerApplication.applyBusinessTimeZone("Asia/Urumqi", "Asia/Shanghai"),
+                    "部署方显式设定的时区不应被覆盖（跨省部署）");
+            // 纠正后，中国凌晨时刻算出的业务日期必须是中国当日
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone(
+                    BureauServerApplication.applyBusinessTimeZone("UTC", "Asia/Shanghai")));
+            java.time.Instant earlyMorning = java.time.ZonedDateTime
+                    .of(2026, 8, 28, 2, 0, 0, 0, java.time.ZoneId.of("Asia/Shanghai")).toInstant();
+            org.junit.jupiter.api.Assertions.assertEquals(
+                    java.time.LocalDate.of(2026, 8, 28),
+                    java.time.LocalDate.ofInstant(earlyMorning, java.time.ZoneId.systemDefault()),
+                    "纠正后中国凌晨的业务日期仍不正确");
+        } finally {
+            java.util.TimeZone.setDefault(original);   // 不污染同批其它测试
+        }
     }
 }
