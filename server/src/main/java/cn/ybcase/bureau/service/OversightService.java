@@ -141,9 +141,25 @@ public class OversightService {
 
     @Transactional
     public void payInstallment(Long installmentId) {
+        // 取金额与所属案件：分期缴纳同时要登记为执行记录，
+        // 否则结案判定（fullyExecuted 只看 case_execution）永远认为未缴清，
+        // 批准了分期的案件全部无法结案（第56条）
+        var rows = jdbc.queryForList(
+                "select case_id, seq, amount from case_installment where id = ? and paid_at is null", installmentId);
+        if (rows.isEmpty()) throw new BizException(2065, "分期记录不存在或已缴清");
+        Long caseId = ((Number) rows.get(0).get("case_id")).longValue();
+        Integer seq = ((Number) rows.get(0).get("seq")).intValue();
+        java.math.BigDecimal amount = (java.math.BigDecimal) rows.get(0).get("amount");
+
         int n = jdbc.update("update case_installment set paid_at = ? where id = ? and paid_at is null",
                 LocalDate.now(), installmentId);
-        if (n == 0) throw new BizException(2065, "分期记录不存在或已缴清");
+        if (n == 0) throw new BizException(2065, "分期记录不存在或已缴清");   // 并发下的二次确认
+
+        // 罚款分期入账（与直接缴纳同一账目口径，供结案与统计使用）
+        jdbc.update("""
+                insert into case_execution (case_id, kind, amount, paid_at, method, note)
+                values (?, 'FINE', ?, ?, 'BANK', ?)""",
+                caseId, amount, LocalDate.now(), "分期缴纳第 " + seq + " 期（自动入账）");
     }
 
     // ---------- 专家评审（第25条，期间不计入办案期限） ----------

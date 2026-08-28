@@ -57,7 +57,7 @@
         <template v-if="c.status === 'DECIDED'">
           <el-button type="primary" @click="dlg.deliver = true">登记送达</el-button>
           <el-button v-if="c.procedureType === 'SUMMARY' && !c.summaryRecordAt" @click="onSummaryRecord">简易程序备案</el-button>
-          <el-button v-if="!c.eDeliveryConsent" @click="onEConsent">电子送达确认书</el-button>
+          <el-button v-if="!c.eDeliveryConsent" @click="dlg.eConsent = true">电子送达确认书</el-button>
           <el-button @click="dlg.execution = true">登记执行</el-button>
           <el-button v-if="isLeader" @click="onCloseCase">结案</el-button>
         </template>
@@ -254,7 +254,9 @@
               <template #default="{ row }">
                 <template v-if="row.status === 'SCHEDULED'">
                   待举行 <el-button size="small" text type="primary" @click="onHoldHearing(row)">举行并记录笔录</el-button>
+                  <el-button size="small" text type="danger" @click="onCancelHearing(row)">撤销排期</el-button>
                 </template>
+                <span v-else-if="row.status === 'CANCELLED'">已撤销</span>
                 <template v-else-if="row.status === 'HELD'">
                   已举行{{ row.held_at }} <el-button size="small" text type="primary" @click="onHearingOpinion(row)">出具听证意见</el-button>
                 </template>
@@ -659,6 +661,24 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="dlg.eConsent" title="电子送达确认书（第59条：须当事人签署并确认电子送达地址）" width="520px">
+      <el-form :model="eConsentForm" label-width="150px">
+        <el-form-item label="受送达人" required>
+          <el-input v-model="eConsentForm.receiver" placeholder="签署确认书的当事人/受送达人" />
+        </el-form-item>
+        <el-form-item label="确认的电子送达地址" required>
+          <el-input v-model="eConsentForm.channel" placeholder="当事人确认的手机号/邮箱等" />
+        </el-form-item>
+        <el-form-item label="确认书编号">
+          <el-input v-model="eConsentForm.docNo" placeholder="可留空" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dlg.eConsent = false">取消</el-button>
+        <el-button type="primary" @click="onEConsent">登记</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="dlg.hearing" title="安排听证（须在通知送达后≥7日举行；主持人不得为本案办案人员）" width="520px">
       <el-form :model="hearingForm" label-width="110px">
         <el-form-item label="公告日期">
@@ -736,8 +756,9 @@ const dlg = reactive<Record<string, boolean>>({
   officer: false, evidence: false, document: false, exclusion: false, report: false,
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
   execution: false, doc: false, catalog: false, hearing: false, review: false, installment: false,
-  apply: false, docDeliver: false,
+  apply: false, docDeliver: false, eConsent: false,
 })
+const eConsentForm = reactive<any>({ receiver: '', channel: '', docNo: '' })
 const uploadCategory = ref('DOC_SCAN')
 const applyForm = reactive<any>({ kind: 'EXTEND', days: 30, reason: '' })
 const docDeliverForm = reactive<any>({ documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', receiver: '', receiptNo: '' })
@@ -1260,8 +1281,24 @@ async function onSummaryRecord() {
 }
 
 async function onEConsent() {
-  await client.post(`/bureau/cases/${id.value}/e-delivery-consent`)
+  // 后端要求 receiver/channel（第59条：电子送达须当事人签署确认书并确认送达地址），
+  // 不收集就发空体等于按钮 100% 失败
+  if (!eConsentForm.receiver || !eConsentForm.channel) {
+    ElMessage.warning('请填写受送达人与当事人确认的电子送达地址')
+    return
+  }
+  await client.post(`/bureau/cases/${id.value}/e-delivery-consent`, { ...eConsentForm })
   ElMessage.success('已登记电子送达确认书')
+  dlg.eConsent = false
+  load()
+}
+
+/** 撤销未举行的听证排期：填错日期的排期若无法撤销，decide() 会永久拦住本案 */
+async function onCancelHearing(row: any) {
+  const { value } = await ElMessageBox.prompt('撤销理由（如：排期日期填写有误需改期／当事人撤回听证申请）',
+    '撤销听证排期', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id.value}/hearings/${row.id}/cancel`, { reason: value })
+  ElMessage.success('排期已撤销，可重新安排听证')
   load()
 }
 
@@ -1283,8 +1320,10 @@ onMounted(load)
 /** 切换案件时把流程表单一并复位：A 案填了一半的告知/决定/送达/申辩若残留到 B 案，一次误提交就是错案 */
 function resetCaseLocalForms() {
   Object.values(FORM_RESETS).forEach((reset) => reset())
-  Object.assign(noticeForm, { content: '', proposedFine: 0, proposedRecoup: 0 })
-  Object.assign(statementForm, { statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null })
+  // 复位对象必须与 759-764 行的初值逐字段对齐：漏掉 statementWaived 会把 A 案的"明确放弃陈述申辩"
+  // 带进 B 案，一次误提交就在 B 案案卷里写下当事人放弃陈述申辩的假事实并解除 2076 守卫
+  Object.assign(noticeForm, { content: '', proposedFine: 0, proposedRecoup: 0, changeReason: '' })
+  Object.assign(statementForm, { statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null, statementWaived: false })
   Object.assign(decisionForm, { decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
   Object.assign(deliveryForm, { method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null })
   Object.assign(reviewForm, { reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
@@ -1292,6 +1331,7 @@ function resetCaseLocalForms() {
   Object.assign(hearingForm, { announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
   Object.assign(applyForm, { kind: 'EXTEND', days: 30, reason: '' })
   Object.assign(docDeliverForm, { documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', receiver: '', receiptNo: '' })
+  Object.assign(eConsentForm, { receiver: '', channel: '', docNo: '' })
   reportContent.value = ''
   Object.keys(dlg).forEach((k) => { dlg[k] = false })  // 打开着的弹窗一并关掉
 }

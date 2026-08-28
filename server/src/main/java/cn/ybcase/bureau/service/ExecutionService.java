@@ -40,6 +40,9 @@ public class ExecutionService {
         if (!List.of("FINE", "RECOUP", "CONFISCATE", "LATE_FEE").contains(req.kind()))
             throw new BizException(2042, "执行类型须为 罚款/退回基金/没收违法所得/加处罚款");
         BigDecimal amount = req.amount() == null ? BigDecimal.ZERO : req.amount();
+        // 票据号空白归一为 null：前端表单默认发 receiptNo:""，而 uq_execution_receipt 只排除 null，
+        // 空串会被当成有效票据号，全库第二条不填票据的执行记录就会撞唯一索引而入不了账
+        String receiptNo = req.receiptNo() == null || req.receiptNo().isBlank() ? null : req.receiptNo().trim();
         if (amount.signum() <= 0) throw new BizException(2042, "执行金额须为正数");
         // 第52条：当场收缴限额（国家100/辽宁20，参数化）
         BigDecimal onsiteLimit = config.decimal("onsite_collect_limit", "100");
@@ -74,14 +77,14 @@ public class ExecutionService {
                     where (select coalesce(sum(amount), 0) from case_execution
                            where case_id = ? and kind = 'LATE_FEE') + ? <= ?""",
                     caseId, req.kind(), amount, req.paidAt() != null ? req.paidAt() : LocalDate.now(),
-                    req.method(), req.note(), req.receiptNo(),
+                    req.method(), req.note(), receiptNo,
                     caseId, amount, d.getFineAmount());
             if (n == 0) throw new BizException(2012, "加处罚款累计不得超出罚款数额（第55条）");
             return;
         }
         jdbc.update("insert into case_execution (case_id, kind, amount, paid_at, method, note, receipt_no) values (?,?,?,?,?,?,?)",
                 caseId, req.kind(), amount, req.paidAt() != null ? req.paidAt() : LocalDate.now(),
-                req.method(), req.note(), req.receiptNo());
+                req.method(), req.note(), receiptNo);
     }
 
     /** 加处罚款测算（第55条：每日3%，不超过罚款数额；基数按参数 FULL/UNPAID） */
@@ -90,7 +93,9 @@ public class ExecutionService {
         CaseDecision d = decisionRepository.findByCaseId(caseId)
                 .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
         if (c.getDeliveredAt() == null) throw new BizException(2042, "决定书尚未送达");
-        LocalDate payDeadline = c.getDeliveredAt().plusDays(15);
+        // 缴款期与强执分支（applyCourtEnforce）同口径：硬编码 15 会让同一案件出现两个缴款期，
+        // 参数调大后加处罚款仍按旧期起算而多收
+        LocalDate payDeadline = c.getDeliveredAt().plusDays(config.intVal("payment_days", 15));
         long overdueDays = Math.max(0, ChronoUnit.DAYS.between(payDeadline, LocalDate.now()));
         BigDecimal base = d.getFineAmount();
         if ("UNPAID".equalsIgnoreCase(config.str("late_fee_base", "FULL"))) {

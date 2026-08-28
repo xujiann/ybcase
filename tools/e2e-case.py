@@ -58,16 +58,32 @@ class Api:
         return self.call("POST", path, json=json, **kw)
 
 
+# 服务端 BureauConfig.plusWorkdays 按 sys_holiday 表推算（HOLIDAY 放假 / SHIFT_WORK 调休上班），
+# 这里若只跳周末，凡起算日落在法定节假日窗口内（2026 年约 25 天）期限断言必然假失败。
+# 先向服务端取事实再复刻 Workdays.plus 的四行逻辑，保持同一口径。
+HOLIDAYS_OFF = set()
+HOLIDAYS_SHIFT = set()
+
+
+def load_holidays(api):
+    """从服务端拉取节假日表，使 E2E 的工作日推算与服务端同口径"""
+    for r in api.get("/bureau/holidays"):
+        day = datetime.date.fromisoformat(r["day"])
+        (HOLIDAYS_SHIFT if r.get("kind") == "SHIFT_WORK" else HOLIDAYS_OFF).add(day)
+
+
 def workdays_plus(d, n):
     while n > 0:
         d += datetime.timedelta(days=1)
-        if d.weekday() < 5:
+        weekend = d.weekday() >= 5
+        if (not weekend or d in HOLIDAYS_SHIFT) and d not in HOLIDAYS_OFF:
             n -= 1
     return d
 
 
 def main():
     admin = Api("admin")
+    load_holidays(admin)   # 工作日推算与服务端同口径（见 workdays_plus）
 
     step("案由字典：35 项种子")
     causes = admin.get("/bureau/causes")
@@ -244,8 +260,14 @@ def main():
         "kind": "FINE", "amount": 100, "paidAt": str(today), "method": "ONSITE"}, expect_code=2010)  # 无票据号
     admin.post(f"/bureau/cases/{case2['id']}/executions", json={
         "kind": "FINE", "amount": 100, "paidAt": str(today), "method": "ONSITE", "receiptNo": "财票2026-0001"})
+    # 前端表单票据号留空发的是空串 ""（而非缺字段）：唯一索引若不排除空白，
+    # 全库第二条不填票据的执行记录就入不了账
     admin.post(f"/bureau/cases/{case2['id']}/executions", json={
-        "kind": "FINE", "amount": 50, "paidAt": str(today), "method": "BANK"})
+        "kind": "FINE", "amount": 30, "paidAt": str(today), "method": "BANK", "receiptNo": ""})
+    admin.post(f"/bureau/cases/{case2['id']}/executions", json={
+        "kind": "FINE", "amount": 20, "paidAt": str(today), "method": "BANK", "receiptNo": ""})
+    ok(len([e for e in admin.get(f"/bureau/cases/{case2['id']}")["executions"]
+            if e["kind"] == "FINE"]) == 3, "空票据号执行记录可多条入账")
     admin.post(f"/bureau/cases/{case2['id']}/close", json={"closeReport": "执行完毕"})
 
     step("中止/恢复：恢复后办案期限顺延；终止解除强制措施")
@@ -326,7 +348,9 @@ def main():
         "source": "INSPECTION", "content": "节假日基准", "suspectName": "基准对象",
         "suspectType": "PROVIDER", "receivedAt": str(today)})
     hol = today + datetime.timedelta(days=1)
-    while hol.weekday() >= 5:  # 选一个工作日作为临时节假日
+    # 必须选一个"当前不在 sys_holiday 表内"的工作日：POST 是 upsert，
+    # 若撞上种子里的法定节假日，finally 的 DELETE 会把那条法定节假日整行删掉（不可恢复）
+    while hol.weekday() >= 5 or hol in HOLIDAYS_OFF or hol in HOLIDAYS_SHIFT:
         hol += datetime.timedelta(days=1)
     admin.post("/bureau/holidays", json={"day": str(hol), "kind": "HOLIDAY", "name": "E2E临时节假日"})
     try:
@@ -450,6 +474,11 @@ def main():
     inst = admin.get(f"/bureau/cases/{d_case['id']}/installments")
     admin.post(f"/bureau/installments/{inst[0]['id']}/pay")
     ok(admin.get(f"/bureau/cases/{d_case['id']}/installments")[0]["paid_at"], "第1期已缴")
+    # 分期缴纳必须同时入账为执行记录：结案判定只看 case_execution，
+    # 只标 paid_at 会让批准了分期的案件永远无法结案（2011）
+    _fine_paid = [e for e in admin.get(f"/bureau/cases/{d_case['id']}")["executions"]
+                  if e["kind"] == "FINE"]
+    ok(any(float(e["amount"]) == 2500 for e in _fine_paid), "分期缴纳已自动入账为执行记录")
 
     step("专家评审：结束自动登记期限扣除（第25/45条）；起始日不得由结束请求倒填")
     # 起始日只在启动时登记且受校验（不得早于立案日、不得晚于今天）
@@ -522,12 +551,27 @@ def main():
         "scheduledAt": str(today),
         "host": "李法制", "hostDept": "政策法规处", "recorder": "书记员小周"})
     print("    PASS: 听证已安排")
+    # 已有未举行排期时不得重复排期：decide() 见 SCHEDULED 即拦，多出的旧排期会把案件锁死
+    admin.post(f"/bureau/cases/{hid}/hearings", json={
+        "noticeSentAt": str(today - datetime.timedelta(days=8)),
+        "scheduledAt": str(today + datetime.timedelta(days=10)),
+        "host": "李法制"}, expect_code=2057)
+    _h0 = admin.get(f"/bureau/cases/{hid}")["hearings"][0]
+    admin.post(f"/bureau/cases/{hid}/hearings/{_h0['id']}/cancel", json={"reason": ""}, expect_code=2057)
+    admin.post(f"/bureau/cases/{hid}/hearings/{_h0['id']}/cancel", json={"reason": "排期日期填写有误，需改期"})
+    ok(admin.get(f"/bureau/cases/{hid}")["hearings"][0]["status"] == "CANCELLED", "误排听证可撤销")
+    # 撤销后重新排到今天（通知日回拨 8 天），后续步骤沿用
+    admin.post(f"/bureau/cases/{hid}/hearings", json={
+        "announcedAt": str(today - datetime.timedelta(days=8)),
+        "noticeSentAt": str(today - datetime.timedelta(days=8)),
+        "scheduledAt": str(today),
+        "host": "李法制", "hostDept": "政策法规处", "recorder": "书记员小周"})
 
     step("听证举行→笔录→2日内听证意见")
-    hr = admin.get(f"/bureau/cases/{hid}")["hearings"][0]
+    hr = [h for h in admin.get(f"/bureau/cases/{hid}")["hearings"] if h["status"] == "SCHEDULED"][0]
     admin.post(f"/bureau/cases/{hid}/hearings/{hr['id']}/hold", json={"record": "听证笔录：双方陈述质证完毕"})
     admin.post(f"/bureau/cases/{hid}/hearings/{hr['id']}/opinion", json={"opinion": "建议维持拟处罚意见"})
-    hr2 = admin.get(f"/bureau/cases/{hid}")["hearings"][0]
+    hr2 = [h for h in admin.get(f"/bureau/cases/{hid}")["hearings"] if h["id"] == hr["id"]][0]
     ok(hr2["status"] == "OPINION_DONE" and hr2["opinion_at"], "听证意见已出")
 
     step("听证案件决定（经审核+集体讨论）→ 电子送达须确认书（2054）")
@@ -596,6 +640,22 @@ def main():
         "decisionType": "PUNISH", "fineAmount": 1, "content": "x"}, expect_code=403)
     juzhang = Api("juzhang")
     juzhang.post(f"/bureau/cases/reviews/999", json={"reviewer": "x"}, expect_code=403)  # 局长不可办审核
+    # 直接立案会补记一张"负责人直接批准"的立案审批单，办案员调用即伪造第17条批准证据 → 须 403，
+    # 办案员立案改走 FILE_CASE 审批（申请→负责人批准→建案）
+    banban.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL",
+        "partyName": "越权立案测试院", "partyType": "PROVIDER", "amountInvolved": 1000,
+        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]},
+        expect_code=403)
+    _ap_file = banban.post("/bureau/approvals", json={
+        "kind": "FILE_CASE", "reason": "立案申请：办案员提交",
+        "payload": {"causeId": cause13["id"], "procedureType": "NORMAL",
+                    "partyName": "办案员申请立案院", "partyType": "PROVIDER", "amountInvolved": 1000,
+                    "officers": [{"name": "王办案", "certNo": "YB001"},
+                                 {"name": "张协办", "certNo": "YB002"}]}})["id"]
+    _filed = juzhang.post(f"/bureau/approvals/{_ap_file}/decide",
+                          json={"approve": True, "opinion": "同意立案"})
+    ok(_filed["result"].get("caseNo"), f"办案员立案申请经负责人批准后建案 {_filed['result'].get('caseNo')}")
     print("    PASS: 批准/决定=LEADER，审核=LEGAL，服务端强制")
 
     step("审核人法律职业资格校验（2070，辽41条）")

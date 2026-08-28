@@ -9,7 +9,7 @@
                    @change="() => { page = 1; load() }">
           <el-option v-for="(v, k) in CASE_STATUS" :key="k" :label="v" :value="k" />
         </el-select>
-        <el-button type="primary" @click="openCreate()">立案</el-button>
+        <el-button type="primary" @click="openCreate()">{{ isLeader ? '立案' : '申请立案' }}</el-button>
       </div>
     </div>
     <el-table :data="records" v-loading="loading" border stripe @row-click="(r: any) => $router.push(`/case/detail/${r.id}`)">
@@ -34,7 +34,7 @@
                    layout="total, prev, pager, next" :total="total" :page-size="pageSize"
                    :current-page="page" @current-change="(p: number) => { page = p; load() }" />
 
-    <el-dialog v-model="createVisible" title="立案（执法人员不得少于两人）" width="640px">
+    <el-dialog v-model="createVisible" :title="isLeader ? '立案（执法人员不得少于两人）' : '立案申请（提交负责人批准后建案，第17条）'" width="640px">
       <el-form :model="form" label-width="110px">
         <el-form-item label="当事人名称">
           <el-input v-model="form.partyName" />
@@ -102,21 +102,26 @@
       </el-form>
       <template #footer>
         <el-button @click="createVisible = false">取消</el-button>
-        <el-button type="primary" @click="onCreate">立案</el-button>
+        <el-button type="primary" @click="onCreate">{{ isLeader ? '立案' : '提交申请' }}</el-button>
       </template>
     </el-dialog>
   </el-card>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import client from '../../api/client'
 import { CASE_STATUS, CASE_STATUS_TAG, PARTY_TYPE } from './labels'
+import { useAuthStore } from '../../stores/auth'
 
 const route = useRoute()
 const router = useRouter()
+const auth = useAuthStore()
+// 第17条：立案须负责人批准。负责人可直接立案（后端补记"负责人直接批准"审批单），
+// 办案人员则提交立案申请，由负责人在审批中心批准后建案——否则补记的就是一张 approver 为自己的假批准单
+const isLeader = computed(() => auth.user?.roles?.some((r: string) => ['LEADER', 'ADMIN'].includes(r)))
 const records = ref<any[]>([])
 const causes = ref<any[]>([])
 const loading = ref(false)
@@ -176,6 +181,17 @@ async function onCreate() {
   }
   if (form.officers.some((o: any) => !o.name || !o.certNo)) {
     ElMessage.warning('办案人员须填写姓名与执法证号')
+    return
+  }
+  if (!isLeader.value) {
+    // 办案人员：提交 FILE_CASE 审批单，负责人批准时才真正建案（ApprovalService.execute）
+    await client.post('/bureau/approvals', {
+      kind: 'FILE_CASE', clueId: form.clueId || null,
+      payload: { ...form }, reason: `立案申请：${form.partyName}`,
+    })
+    ElMessage.success('立案申请已提交，待负责人批准后自动建案')
+    createVisible.value = false
+    router.push('/case/approvals')
     return
   }
   const resp = await client.post('/bureau/cases', form)

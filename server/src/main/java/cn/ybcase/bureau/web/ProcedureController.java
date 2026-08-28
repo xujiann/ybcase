@@ -42,6 +42,14 @@ public class ProcedureController {
         return R.ok();
     }
 
+    /** 撤销未举行的听证排期（改期/当事人撤回申请）——无此通道则误排一次即锁死决定 */
+    @PostMapping("/cases/{id}/hearings/{hearingId}/cancel")
+    public R<Void> cancelHearing(@PathVariable Long id, @PathVariable Long hearingId,
+                                 @RequestBody Map<String, String> body) {
+        procedureService.cancelHearing(id, hearingId, body.get("reason"));
+        return R.ok();
+    }
+
     // 简易备案
     @PostMapping("/cases/{id}/summary-record")
     public R<CaseFile> summaryRecord(@PathVariable Long id) {

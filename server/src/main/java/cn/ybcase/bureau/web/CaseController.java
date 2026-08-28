@@ -56,6 +56,10 @@ public class CaseController {
         return R.ok(caseService.transferOwner(id, body.get("newOwner"), auth.getName()));
     }
 
+    // 直接立案会补记一张"负责人直接批准"的立案审批单（见下），故本接口必须限负责人：
+    // 办案人员直接调用会写出 approver 是自己的假批准单，伪造第17条的负责人批准证据。
+    // 办案人员立案改走 /approvals 的 FILE_CASE 申请流程（申请→负责人批准→建案），前端已相应分流。
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")
     @PostMapping
     public R<CaseFile> create(@RequestBody CaseService.CaseCreateReq req, Authentication auth) {
         CaseFile c = caseService.create(req, auth.getName());

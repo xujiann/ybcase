@@ -271,8 +271,10 @@ public class CaseService {
             if (days > firstMax) throw new BizException(2009, "首次延期经负责人批准最长" + firstMax + "日（第45条）");
         } else {
             if (already + days > totalMax) throw new BizException(2009, "继续延期须集体讨论且累计不超过" + totalMax + "日（第45条）");
-            boolean hasMeeting = !jdbc.queryForList("select id from case_meeting where case_id = ?", caseId).isEmpty();
-            if (!hasMeeting) throw new BizException(2009, "继续延期应当由负责人集体讨论决定，请先录入集体讨论记录（第45条）");
+            // 与 decide() 的 2047 同口径：只判"有行"会让一条未签字确认的记录就放行继续延期，
+            // 同一份法定的集体讨论记录不能在两处有两套有效性标准
+            if (!hasValidMeeting(caseId))
+                throw new BizException(2009, "继续延期应当由负责人集体讨论决定，请先录入并签字确认集体讨论记录（第45条）");
         }
         if (reason == null || reason.isBlank()) throw new BizException(2009, "延期须说明理由");
         c.setExtensionDays(already + days);
@@ -495,7 +497,9 @@ public class CaseService {
             // 已举行听证的，当事人已充分陈述申辩，不再受该期限约束
             if ("PUNISH".equals(req.decisionType()) && config.bool("statement_wait_required", true)
                     && notice.getStatementDeadline() != null
-                    && LocalDate.now().isBefore(notice.getStatementDeadline())
+                    // 含尾：届满日当天当事人仍可陈述申辩（recordStatement 用 isAfter 受理），
+                    // 这里若用 isBefore 就会出现"同一天既可申辩又可下决定"，先决定即剥夺申辩权
+                    && !LocalDate.now().isAfter(notice.getStatementDeadline())
                     && notice.getStatement() == null && !Boolean.TRUE.equals(notice.getStatementWaived())
                     && notice.getHearingHeldAt() == null)
                 throw new BizException(2076, "陈述申辩期至 " + notice.getStatementDeadline()
@@ -522,12 +526,7 @@ public class CaseService {
                 BigDecimal meetingThreshold = config.byPartyType(c.getPartyType(),
                         "meeting_required_fine_individual", "meeting_required_fine_org", "100000");
                 // 空壳讨论记录不算数：须有实质内容且经签字确认（第44条集体讨论决定）
-                boolean hasMeeting = !jdbc.queryForList("""
-                        select id from case_meeting
-                        where case_id = ? and sign_confirmed = true
-                          and coalesce(btrim(attendees), '') <> ''
-                          and coalesce(btrim(conclusion), '') <> ''""", caseId).isEmpty();
-                if (fine.compareTo(meetingThreshold) >= 0 && !hasMeeting)
+                if (fine.compareTo(meetingThreshold) >= 0 && !hasValidMeeting(caseId))
                     throw new BizException(2047, "较大数额罚款（≥" + meetingThreshold + "元）应当经负责人集体讨论决定，请先录入讨论记录（辽54条/局令44条）");
             }
             // 辽44条：裁量性处罚决定应说明裁量考虑因素（参数开关）
@@ -861,6 +860,15 @@ public class CaseService {
         return rows.stream().mapToLong(r -> ChronoUnit.DAYS.between(
                 ((java.sql.Date) r.get("start_at")).toLocalDate(),
                 ((java.sql.Date) r.get("end_at")).toLocalDate())).sum();
+    }
+
+    /** 法定"负责人集体讨论"记录是否成立：须签字确认且参会人/结论有实质内容（第44/45条共用口径） */
+    private boolean hasValidMeeting(Long caseId) {
+        return !jdbc.queryForList("""
+                select id from case_meeting
+                where case_id = ? and sign_confirmed = true
+                  and coalesce(btrim(attendees), '') <> ''
+                  and coalesce(btrim(conclusion), '') <> ''""", caseId).isEmpty();
     }
 
     private boolean fullyExecuted(Long caseId, CaseDecision d) {

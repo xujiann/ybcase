@@ -66,6 +66,13 @@ public class ProcedureService {
                 "select name from case_officer where case_id = ?", caseId);
         if (officers.stream().anyMatch(o -> o.get("name").equals(req.host())))
             throw new BizException(2056, "听证主持人不得为本案办案人员（辽48条）");
+        // 同案不得存在两条未举行的排期：decide() 见到任一 SCHEDULED 即拦截，
+        // 重复排期会留下一条永远无法消化的旧排期，把案件锁死在"不能决定"
+        Integer scheduled = jdbc.queryForObject(
+                "select count(*) from case_hearing where case_id = ? and status = 'SCHEDULED'",
+                Integer.class, caseId);
+        if (scheduled != null && scheduled > 0)
+            throw new BizException(2057, "本案已有未举行的听证排期，如需改期请先撤销原排期");
         // 辽47条：举行听证7日前书面通知当事人（参数化）
         int ahead = config.intVal("hearing_notice_ahead_days", 7);
         LocalDate noticeSent = req.noticeSentAt() != null ? req.noticeSentAt() : LocalDate.now();
@@ -76,6 +83,24 @@ public class ProcedureService {
                 values (?,?,?,?,?,?,?)""",
                 caseId, req.announcedAt(), noticeSent, req.scheduledAt(),
                 req.host(), req.hostDept(), req.recorder());
+    }
+
+    /**
+     * 撤销未举行的听证排期（改期/当事人撤回申请）。
+     * decide() 对 SCHEDULED 听证是硬拦截，若无此通道，一条填错日期的排期会让案件永久无法作出决定，
+     * 唯一"解法"将是对从未举行的听证编造笔录——比卡住更坏。撤销留痕、不删行。
+     */
+    @Transactional
+    public void cancelHearing(Long caseId, Long hearingId, String reason) {
+        if (reason == null || reason.isBlank())
+            throw new BizException(2057, "撤销听证排期须说明理由（排期属案卷记录，不得无痕撤销）");
+        int n = jdbc.update("""
+                update case_hearing
+                set status = 'CANCELLED',
+                    record = coalesce(record, '') || '【排期已撤销】' || ?
+                where id = ? and case_id = ? and status = 'SCHEDULED'""",
+                reason, hearingId, caseId);
+        if (n == 0) throw new BizException(2057, "听证不存在，或已举行/已撤销（仅未举行的排期可撤销）");
     }
 
     @Transactional

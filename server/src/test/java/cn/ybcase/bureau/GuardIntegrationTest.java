@@ -27,6 +27,7 @@ class GuardIntegrationTest {
     @Autowired CaseCauseRepository causeRepository;
     @Autowired cn.ybcase.bureau.service.OversightService oversightService;
     @Autowired cn.ybcase.bureau.service.ProcedureService procedureService;
+    @Autowired cn.ybcase.bureau.service.ExecutionService executionService;
     @Autowired cn.ybcase.core.repository.SysUserRepository sysUserRepository;
     @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
 
@@ -248,6 +249,34 @@ class GuardIntegrationTest {
         // 非处罚决定不需要依法公开（辽56条针对的是行政处罚决定）
         var e = assertThrows(BizException.class, () -> caseService.publish(c.getId()));
         assertEquals(2042, e.code);
+    }
+
+    @Test
+    void 分期缴清后可结案() {
+        // 分期缴纳此前只标记 case_installment.paid_at 而不写 case_execution，
+        // 而结案判定只看 case_execution → 批准了分期的案件永远无法结案（2011）。
+        CaseFile c = caseService.create(req("IT-分期结案" + System.nanoTime(), TWO), "it");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("5000"),
+                BigDecimal.ZERO, null));
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("5000"),
+                BigDecimal.ZERO, null, null, "罚款5000", null, "一般情形"));
+        caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
+                java.time.LocalDate.now(), "当事人", null, null, null));
+        executionService.approveDefer(c.getId());
+        oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
+                .InstallmentReq(1, java.time.LocalDate.now(), new BigDecimal("2500")));
+        oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
+                .InstallmentReq(2, java.time.LocalDate.now(), new BigDecimal("2500")));
+        for (var row : jdbc.queryForList(
+                "select id from case_installment where case_id = ? order by seq", c.getId())) {
+            oversightService.payInstallment(((Number) row.get("id")).longValue());
+        }
+        // 分期入账后累计应等于决定金额，结案不再被 2011 拦住
+        assertEquals(0, executionService.sum(c.getId(), "FINE").compareTo(new BigDecimal("5000")));
+        CaseFile closed = caseService.close(c.getId(), "分期缴清，执行完毕", "it");
+        assertEquals("CLOSED", closed.getStatus());
     }
 
     @Test
