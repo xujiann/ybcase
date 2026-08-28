@@ -84,23 +84,37 @@ public class AttachmentController {
     }
 
     @GetMapping("/attachments/{attachmentId}/download")
-    public ResponseEntity<byte[]> download(@PathVariable Long attachmentId, Authentication auth) throws IOException {
+    public ResponseEntity<org.springframework.core.io.Resource> download(
+            @PathVariable Long attachmentId, Authentication auth) {
         var rows = jdbc.queryForList(
-                "select case_id, filename, content_type, data, file_path from case_attachment where id = ?", attachmentId);
+                "select case_id, filename, content_type, size_bytes, data, file_path from case_attachment where id = ?", attachmentId);
         if (rows.isEmpty()) return ResponseEntity.notFound().build();
         caseService.assertInScope(((Number) rows.get(0).get("case_id")).longValue(),
                 auth.getName(), privileged(auth));
         var row = rows.get(0);
-        byte[] body = row.get("file_path") != null
-                ? java.nio.file.Files.readAllBytes(java.nio.file.Path.of((String) row.get("file_path")))
-                : (byte[]) row.get("data");
+
+        // 外置文件走流式：音像件上限 200MB，若 readAllBytes 进堆，
+        // 768MB 堆上两三个并发下载即 OOM（整个 JVM 挂掉，不只是这个请求失败）
+        org.springframework.core.io.Resource body;
+        if (row.get("file_path") != null) {
+            java.nio.file.Path path = java.nio.file.Path.of((String) row.get("file_path"));
+            if (!java.nio.file.Files.isReadable(path))
+                // 卷未挂载或只恢复了库而没恢复附件：给 404 而非 500，前端能识别
+                throw new BizException(2054, "附件文件不存在或不可读，请检查附件存储卷是否已挂载/恢复");
+            body = new org.springframework.core.io.FileSystemResource(path);
+        } else {
+            body = new org.springframework.core.io.ByteArrayResource((byte[]) row.get("data"));
+        }
+
         String rawName = (String) row.get("filename");  // multipart 可不带文件名，入库即为 null
         String fn = URLEncoder.encode(rawName == null || rawName.isBlank() ? "attachment" : rawName,
                 StandardCharsets.UTF_8).replace("+", "%20");
-        return ResponseEntity.ok()
+        var builder = ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + fn)
                 .contentType(row.get("content_type") == null ? MediaType.APPLICATION_OCTET_STREAM
-                        : MediaType.parseMediaType((String) row.get("content_type")))
-                .body(body);
+                        : MediaType.parseMediaType((String) row.get("content_type")));
+        Object size = row.get("size_bytes");
+        if (size instanceof Number n) builder = builder.contentLength(n.longValue());
+        return builder.body(body);
     }
 }

@@ -8,6 +8,8 @@ services:
       POSTGRES_DB: ybcase
       POSTGRES_USER: hip
       POSTGRES_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,18 +22,30 @@ services:
   app:
     image: eclipse-temurin:21-jre
     restart: unless-stopped
+    # 容器默认工作目录是 /，attachment_dir 的相对值 ./data/attachments 会落到 /data/attachments
+    # ——不在挂载卷上，切 FILE 模式后附件写进容器可写层，升级 --force-recreate 即全部丢失
+    working_dir: /app
     depends_on:
       db:
         condition: service_healthy
     volumes:
       - ./ybcase-server.jar:/app/ybcase-server.jar:ro
       - attachments:/app/data/attachments   # 附件外置存储卷（默认 DB 存储时不写入，切 FILE 模式即持久化）
+      - applogs:/app/data/logs              # 应用日志落盘（容器重建不丢，便于事后排查）
     environment:
       YBCASE_DB_URL: jdbc:postgresql://db:5432/ybcase
       YBCASE_DB_USER: hip
       YBCASE_DB_PASSWORD: ${DB_PASSWORD}
       YBCASE_JWT_SECRET: ${JWT_SECRET}
-    command: ["java", "-Xms256m", "-Xmx768m", "-jar", "/app/ybcase-server.jar",
+      # 业务日期（立案日/告知日/期限起算）全部用 LocalDate.now()，依赖 JVM 默认时区。
+      # 容器默认 UTC 会让中国 0-8 点记成前一天——法律文书日期出错，故双保险：TZ + JVM 参数
+      TZ: Asia/Shanghai
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }   # 容器 stdout 轮转，防止撑爆磁盘
+    command: ["java", "-Xms256m", "-Xmx768m", "-Duser.timezone=Asia/Shanghai",
+              "-XX:+ExitOnOutOfMemoryError",   # OOM 立即退出→restart 拉起，避免静默抖动而健康检查仍报 UP
+              "-jar", "/app/ybcase-server.jar",
               "--spring.profiles.active=pilot"]
     # 8090 不暴露公网，仅供 caddy 反代
 
@@ -50,9 +64,11 @@ services:
       - caddy_config:/config
     environment:
       DEMO_DOMAIN: ${DEMO_DOMAIN}
+      TZ: Asia/Shanghai
 
 volumes:
   pgdata:
   attachments:
+  applogs:
   caddy_data:
   caddy_config:

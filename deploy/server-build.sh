@@ -27,6 +27,8 @@ docker run --rm -v "$SRC":/app -v ybcase_npm:/app/frontend/node_modules -w /app/
     node:22-alpine sh -c "npm ci --no-audit --no-fund && npm run build"
 
 echo "[4/5] 部署构建产物到 $DEPLOY"
+# 回滚点必须在覆盖之前留存：upgrade.sh 里再存就已经是新 jar 了（回滚等于没回滚）
+if [ -f "$DEPLOY/ybcase-server.jar" ]; then cp -f "$DEPLOY/ybcase-server.jar" "$DEPLOY/ybcase-server.jar.prev"; fi
 cp "$SRC"/server/target/ybcase-server-*.jar "$DEPLOY/ybcase-server.jar"
 # 前端原地更新目录内容,不整体替换目录——否则换掉 inode 会让 Caddy 的 bind mount 失效(404)
 mkdir -p "$DEPLOY/dist"

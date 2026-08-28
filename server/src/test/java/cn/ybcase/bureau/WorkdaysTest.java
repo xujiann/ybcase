@@ -76,4 +76,18 @@ class WorkdaysTest {
         assertEquals("某医院：罚款1000元（{{missing}}）", out);
         assertEquals("：", TemplateUtil.fill("{{a}}：", java.util.Collections.singletonMap("a", null)));
     }
+
+    @org.junit.jupiter.api.Test
+    void 业务日期须按中国时区计算() {
+        // 容器默认 UTC 时，中国 0:00-8:00 的"今天"会早一天，导致立案日/告知日等法律日期记错。
+        // BureauServerApplication.main 已兜底设置，此处守住该约定不被改回。
+        java.time.Instant chinaEarlyMorning = java.time.ZonedDateTime
+                .of(2026, 8, 28, 2, 0, 0, 0, java.time.ZoneId.of("Asia/Shanghai")).toInstant();
+        java.time.LocalDate byChina = java.time.LocalDate.ofInstant(
+                chinaEarlyMorning, java.time.ZoneId.of("Asia/Shanghai"));
+        java.time.LocalDate byDefault = java.time.LocalDate.ofInstant(
+                chinaEarlyMorning, java.time.ZoneId.systemDefault());
+        org.junit.jupiter.api.Assertions.assertEquals(byChina, byDefault,
+                "JVM 默认时区不是东八区：中国凌晨时段的业务日期会差一天（部署须设 TZ=Asia/Shanghai）");
+    }
 }

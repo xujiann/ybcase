@@ -48,6 +48,22 @@ public class ExecutionService {
         // 第52条：当场收缴必须出具财政部门统一制发的专用票据
         if ("ONSITE".equals(req.method()) && (req.receiptNo() == null || req.receiptNo().isBlank()))
             throw new BizException(2010, "当场收缴必须出具财政统一票据并登记票据号（第52条）");
+        // 累计不得超出决定书金额：此前只校验单笔为正，重复录入或多打一个零都会让
+        // sum(amount) 超过决定额，close() 的 fullyExecuted 判定"执行完毕"而实际未足额缴纳
+        if (List.of("FINE", "RECOUP", "CONFISCATE").contains(req.kind())) {
+            BigDecimal decided = switch (req.kind()) {
+                case "FINE" -> d.getFineAmount();
+                case "RECOUP" -> d.getRecoupAmount();
+                default -> d.getConfiscateAmount();
+            };
+            decided = decided == null ? BigDecimal.ZERO : decided;
+            if (decided.signum() <= 0)
+                throw new BizException(2042, "决定书未确定该类款项金额，不能登记此类执行");
+            BigDecimal already = sum(caseId, req.kind());
+            if (already.add(amount).compareTo(decided) > 0)
+                throw new BizException(2042, "累计登记金额（" + already.add(amount)
+                        + "）超出决定书确定的金额（" + decided + "），请核对是否重复登记或金额录入有误");
+        }
         // 第55条：加处罚款不得超出罚款数额
         if ("LATE_FEE".equals(req.kind())) {
             // 先 sum 再 insert 在并发下两笔都能过检、落库后累计超本金；

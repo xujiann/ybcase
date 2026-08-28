@@ -16,7 +16,11 @@ header {
 # API 反代到后端（actuator 不对公网暴露）
 @api path /api/*
 handle @api {
-    reverse_proxy app:8090
+    reverse_proxy app:8090 {
+        # 审计留痕需要真实操作终端 IP（等保要求可溯源）；Caddy 默认会追加 X-Forwarded-For，
+        # 这里显式写明，避免将来调整反代配置时丢失
+        header_up X-Real-IP {remote_host}
+    }
 }
 
 # SPA 静态资源 + 前端路由回退

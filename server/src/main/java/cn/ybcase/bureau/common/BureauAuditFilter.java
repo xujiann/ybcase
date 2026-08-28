@@ -26,6 +26,22 @@ public class BureauAuditFilter extends OncePerRequestFilter {
     /** 异常处理器把业务错误码放到这里，供审计记录真实结果 */
     public static final String BIZ_CODE_ATTR = "ybcaseBizCode";
 
+    /**
+     * 反代后 getRemoteAddr() 拿到的是 Caddy 容器内网 IP，所有审计记录来源相同，
+     * 执法全过程记录与等保审计都无法溯源到实际操作终端。取 X-Forwarded-For 首个地址
+     * （Caddy 默认追加；该头由我们自己的反代写入，未经反代直连时回退 remoteAddr）。
+     */
+    private static String clientIp(HttpServletRequest request) {
+        String xff = request.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            String first = xff.split(",")[0].trim();
+            if (!first.isEmpty() && first.length() <= 45) return first;
+        }
+        String real = request.getHeader("X-Real-IP");
+        if (real != null && !real.isBlank() && real.length() <= 45) return real.trim();
+        return request.getRemoteAddr();
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
@@ -50,7 +66,7 @@ public class BureauAuditFilter extends OncePerRequestFilter {
                             insert into sys_audit_log (username, method, path, http_status, client_ip, request_id)
                             values (?,?,?,?,?,?)""",
                             auth == null ? null : auth.getName(), request.getMethod(),
-                            uri, status, request.getRemoteAddr(),
+                            uri, status, clientIp(request),
                             request.getAttribute(RequestIdFilter.ATTR));
                 } catch (Exception ignore) {
                     // 审计失败不影响业务

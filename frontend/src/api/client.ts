@@ -41,7 +41,28 @@ client.interceptors.response.use(
   (resp) => {
     // 文件下载（附件/审计CSV/反馈截图等）返回的是原始字节，没有 R 包装——
     // 不放行会把 Blob 的 code=undefined 误判为失败，所有下载 100% 报"操作失败"
-    if (resp.config.responseType === 'blob') return resp
+    if (resp.config.responseType === 'blob') {
+      // 后端出错时返回的是 JSON 而非文件（业务码走 HTTP 200），此时 blob 里装的是错误对象。
+      // 不识别就会把错误当文件存盘：用户拿到一个打不开的"附件"，界面还提示成功。
+      const ct = String(resp.headers['content-type'] || '')
+      if (ct.includes('application/json')) {
+        return (resp.data as Blob).text().then((txt) => {
+          let msg = '下载失败'
+          try {
+            const j = JSON.parse(txt)
+            msg = j.message || msg
+            recordError({
+              time: new Date().toISOString(), path: resp.config.url || '',
+              httpStatus: resp.status, bizCode: j.code ?? null, message: msg,
+              requestId: (resp.headers['x-request-id'] as string) || null,
+            })
+          } catch { /* 非 JSON 文本，用默认提示 */ }
+          ElMessage.error(msg)
+          return Promise.reject(new Error(msg))
+        })
+      }
+      return resp
+    }
     const r = resp.data as R
     if (r.code !== 0) {
       recordError({
@@ -71,8 +92,13 @@ client.interceptors.response.use(
     })
     if (error.response?.status === 401) {
       localStorage.removeItem('bureau_token')
-      router.push('/login')
-      ElMessage.warning('登录已过期，请重新登录')
+      // 带回跳地址：办案人员常在详情页填写长表单，重登后回首页会找不回刚才的位置。
+      // 已在登录页时不再重复跳转（并发请求同时 401 会触发多次 push）
+      const cur = router.currentRoute.value
+      if (cur.path !== '/login') {
+        router.push({ path: '/login', query: { redirect: cur.fullPath } })
+        ElMessage.warning('登录已过期，请重新登录')
+      }
     } else {
       ElMessage.error(error.response?.data?.message || '网络请求失败')
     }

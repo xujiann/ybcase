@@ -4,6 +4,41 @@ spring:
     url: ${YBCASE_DB_URL:jdbc:postgresql://127.0.0.1:5432/ybcase}
     username: ${YBCASE_DB_USER:hip}
     password: ${YBCASE_DB_PASSWORD}
+    hikari:
+      # 2C2G 单机：连接数不宜大（PG 每连接一个进程），留余量给备份/维护会话
+      maximum-pool-size: ${YBCASE_DB_POOL:10}
+      minimum-idle: 2
+      connection-timeout: 10000      # 拿不到连接快速失败，不要堆积请求
+      validation-timeout: 3000
+      leak-detection-threshold: 60000  # 连接泄漏告警（正常业务无长事务）
+  jpa:
+    open-in-view: false              # 避免整个请求期间占用连接
+
+server:
+  # 升级/重启时先停止接收新请求、让在途请求跑完，否则正在提交的决定/执行会被切断
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: ${YBCASE_TOMCAT_THREADS:50}
+  error:
+    include-message: never           # 生产不回显内部异常文本
+    include-stacktrace: never
+
+# 日志：容器 stdout 由 docker 日志轮转接管（compose 已限制大小），
+# 同时落盘一份便于事后排查；生产不打 SQL 与调试细节，避免泄露与磁盘暴涨
+logging:
+  level:
+    root: INFO
+    cn.ybcase: INFO
+    org.hibernate.SQL: WARN
+    org.springframework.web: WARN
+  file:
+    name: ${YBCASE_LOG_FILE:/app/data/logs/ybcase.log}
+  logback:
+    rollingpolicy:
+      max-file-size: 20MB
+      max-history: 14
+      total-size-cap: 500MB
 
 ybcase:
   security:
@@ -16,3 +51,6 @@ springdoc:
     enabled: ${YBCASE_SWAGGER:false}
   swagger-ui:
     enabled: ${YBCASE_SWAGGER:false}
+
+# 优雅停机等待上限（超过则强制退出，避免升级卡死）
+spring.lifecycle.timeout-per-shutdown-phase: 25s

@@ -8,8 +8,20 @@ cd /opt/ybcase
 echo "[1/4] 升级前备份(失败可回滚)"
 if [ -x ./backup.sh ]; then ./backup.sh || { echo "!! 备份失败,中止升级"; exit 1; }; else echo "  (未找到 backup.sh,跳过)"; fi
 
-echo "[2/4] 留存当前 jar 作回滚点"
-cp -f ybcase-server.jar "ybcase-server.jar.prev" 2>/dev/null || true
+echo "[2/4] 校验回滚点"
+# 注意：经 server-build.sh 调用时，新 jar 已覆盖到位，此处再 cp 会把"新 jar"存成回滚点，
+# 使回滚形同虚设——回滚点由 server-build.sh 在覆盖前留存。
+if [ -f ybcase-server.jar.prev ]; then
+    if cmp -s ybcase-server.jar ybcase-server.jar.prev; then
+        echo "  !! 回滚点与当前 jar 相同，回滚将无效（若非首次部署请检查 server-build.sh）"
+    else
+        echo "  回滚点就绪：$(stat -c%y ybcase-server.jar.prev 2>/dev/null | cut -d. -f1)"
+    fi
+else
+    # 手工直接调用 upgrade.sh（未经 server-build）时兜底留存
+    cp -f ybcase-server.jar ybcase-server.jar.prev 2>/dev/null || true
+    echo "  首次部署，已留存当前 jar 作回滚点"
+fi
 
 echo "[3/4] 重启 app 加载新 jar(Flyway 自动增量迁移)"
 sudo docker compose up -d --force-recreate app

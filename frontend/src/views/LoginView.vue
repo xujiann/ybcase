@@ -25,10 +25,11 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import axios from 'axios'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
+const route = useRoute()
 const auth = useAuthStore()
 const loading = ref(false)
 const orgName = ref('医疗保障局')
@@ -46,7 +47,9 @@ async function onLogin() {
   loading.value = true
   try {
     await auth.login(form.username, form.password)
-    router.push('/')
+    // 会话过期跳来的带 redirect：登回原页面，办案人员不必重新找回刚才的位置
+    const back = route.query.redirect
+    router.push(typeof back === 'string' && back.startsWith('/') && !back.startsWith('//') ? back : '/')
   } finally {
     loading.value = false
   }
