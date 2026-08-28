@@ -34,8 +34,13 @@ cp "$SRC"/server/target/ybcase-server-*.jar "$DEPLOY/ybcase-server.jar"
 mkdir -p "$DEPLOY/dist"
 rm -rf "$DEPLOY/dist"/* "$DEPLOY/dist"/.[!.]* 2>/dev/null || true
 cp -r "$SRC/frontend/dist/." "$DEPLOY/dist/"
-# 同步最新的运维脚本
+# 同步最新的运维脚本与编排配置。
+# 此前只同步了两个脚本，compose/Caddyfile 的改动（时区、working_dir、日志轮转、安全头）
+# 永远到不了线上——源码改了、线上还是旧配置，且从部署日志完全看不出来。
 cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh
+cp "$SRC"/deploy/docker-compose.yml "$SRC"/deploy/Caddyfile "$DEPLOY/"
 
 echo "[5/5] 备份 + 重启 + 健康检查"
 cd "$DEPLOY" && ./upgrade.sh
+# 编排配置若有变更（时区/挂载/日志），需让 db 与 caddy 也应用新配置
+sudo docker compose up -d
