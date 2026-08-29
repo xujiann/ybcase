@@ -642,20 +642,30 @@ def main():
     juzhang.post(f"/bureau/cases/reviews/999", json={"reviewer": "x"}, expect_code=403)  # 局长不可办审核
     # 直接立案会补记一张"负责人直接批准"的立案审批单，办案员调用即伪造第17条批准证据 → 须 403，
     # 办案员立案改走 FILE_CASE 审批（申请→负责人批准→建案）
-    banban.post("/bureau/cases", json={
-        "causeId": cause13["id"], "procedureType": "NORMAL",
-        "partyName": "越权立案测试院", "partyType": "PROVIDER", "amountInvolved": 1000,
-        "officers": [{"name": "王办案", "certNo": "YB001"}, {"name": "张协办", "certNo": "YB002"}]},
-        expect_code=403)
+    # payload 逐字照抄 frontend/src/views/case/CasesView.vue 的 form 初值（含空串/None/duty），
+    # 因为审批流是 objectMapper.convertValue(payload, CaseCreateReq)——真实表单形状若对不上，
+    # 会在"负责人批准"这一步才炸，而手写的精简 payload 测不出来
+    _file_form = {
+        "clueId": None, "causeId": cause13["id"], "procedureType": "NORMAL",
+        "partyName": "办案员申请立案院", "partyType": "PROVIDER", "partyCreditNo": "",
+        "partyAddress": "", "partyLegalRep": "", "partyContact": "", "summary": "",
+        "amountInvolved": 1000, "enforceItemId": None, "violationEndDate": None,
+        "healthHarm": False, "clueVerifyResult": None,
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                     {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}],
+    }
+    banban.post("/bureau/cases", json={**_file_form, "partyName": "越权立案测试院"}, expect_code=403)
     _ap_file = banban.post("/bureau/approvals", json={
-        "kind": "FILE_CASE", "reason": "立案申请：办案员提交",
-        "payload": {"causeId": cause13["id"], "procedureType": "NORMAL",
-                    "partyName": "办案员申请立案院", "partyType": "PROVIDER", "amountInvolved": 1000,
-                    "officers": [{"name": "王办案", "certNo": "YB001"},
-                                 {"name": "张协办", "certNo": "YB002"}]}})["id"]
+        "kind": "FILE_CASE", "clueId": None, "reason": "立案申请：办案员提交",
+        "payload": _file_form})["id"]
     _filed = juzhang.post(f"/bureau/approvals/{_ap_file}/decide",
                           json={"approve": True, "opinion": "同意立案"})
     ok(_filed["result"].get("caseNo"), f"办案员立案申请经负责人批准后建案 {_filed['result'].get('caseNo')}")
+    # 办案人员须随案落库：convertValue 丢了 officers 的话 2002 会拦（建不成案），
+    # 丢了 duty 则建得成但主办/协办分不清
+    _offs = juzhang.get(f"/bureau/cases/{_filed['result']['id']}")["officers"]
+    ok(len(_offs) == 2 and all(o.get("duty") for o in _offs),
+       f"审批建案办案人员与主协办职务完整（{[(o['name'], o['duty']) for o in _offs]}）")
     print("    PASS: 批准/决定=LEADER，审核=LEGAL，服务端强制")
 
     step("审核人法律职业资格校验（2070，辽41条）")
