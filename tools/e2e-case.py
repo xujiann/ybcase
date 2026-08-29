@@ -306,6 +306,14 @@ def main():
     ok(float(ov["recoupDecided"]) >= 80000, f"决定追回基金 {ov['recoupDecided']} 元")
     sup = admin.get("/bureau/stats/supervision")
     ok("caseNearDeadline" in sup and "reviewOverdue" in sup, "督办看板六项预警可用")
+    # 后端算了 16 类，前端若少绑一个 key 就等于"算了没人看见"——把 key 集合钉死，
+    # 以后后端改名/前端漏绑都会在这里断
+    _WARN_KEYS = ["clueOverdue", "caseNearDeadline", "reviewOverdue", "deliveryOverdue",
+                  "holdOverdue", "govRecordMissing", "installmentOverdue", "hearingOpinionOverdue",
+                  "summaryRecordOverdue", "assistOverdue", "correctOverdue", "publishOverdue",
+                  "sealExpiring", "paymentOverdue", "urgeLetterMissing", "courtEnforceExpiring"]
+    _missing = [k for k in _WARN_KEYS if k not in sup]
+    ok(not _missing, f"督办看板 16 类预警键齐全（缺 {_missing}）")
 
     step("线索不予立案闭环")
     clue2 = admin.post("/bureau/clues", json={
@@ -461,6 +469,48 @@ def main():
         "decisionType": "PUNISH", "fineAmount": 5000, "recoupAmount": 4000,
         "discretionReason": "属一般情形，按1.25倍幅度中值裁量", "content": "罚款5000元"})
     print("    PASS: 裁量理由守卫生效")
+
+    step("执行阶段预警：缴款逾期→该催告→强执申请期临期/失权，缴清后全部消退")
+    _ex = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "催缴预警案",
+        "partyType": "PROVIDER", "amountInvolved": 50000,
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                     {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]})
+    admin.post(f"/bureau/cases/{_ex['id']}/report", json={"content": "调查终结"})
+    admin.post(f"/bureau/cases/{_ex['id']}/notice", json={
+        "content": "拟罚", "proposedFine": 5000, "proposedRecoup": 0})
+    admin.post(f"/bureau/cases/{_ex['id']}/statement", json={"statementWaived": True})
+    admin.post(f"/bureau/cases/{_ex['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 5000, "recoupAmount": 0,
+        "content": "罚款5000", "discretionReason": "一般情形"})
+    # 送达日回拨 95 天：缴款期(15日)早已届满，且强执申请期(缴款期满+3个月)进入 30 日临期窗口
+    admin.post(f"/bureau/cases/{_ex['id']}/deliver", json={
+        "method": "DIRECT", "deliveredAt": str(today - datetime.timedelta(days=95)), "receiver": "法人"})
+
+    def _exec_warn():
+        s2 = admin.get("/bureau/stats/supervision")
+        return {k: len([x for x in s2[k] if x.get("id") == _ex["id"]])
+                for k in ("paymentOverdue", "urgeLetterMissing", "courtEnforceExpiring")}
+
+    w1 = _exec_warn()
+    ok(w1["paymentOverdue"] == 1 and w1["urgeLetterMissing"] == 1 and w1["courtEnforceExpiring"] == 1,
+       f"缴款逾期未催告：三类预警同时命中 {w1}")
+    admin.post(f"/bureau/cases/{_ex['id']}/documents", json={
+        "docType": "URGE_LETTER", "title": "催告书", "content": "限十日内履行",
+        "madeAt": str(today - datetime.timedelta(days=30))})
+    w2 = _exec_warn()
+    ok(w2["urgeLetterMissing"] == 0 and w2["courtEnforceExpiring"] == 1,
+       f"下达催告书后仅『未催告』消退，申请期仍预警 {w2}")
+    # 强执申请期是全流程唯一"错过即失权"的期限，须主动推送而非等人看看板
+    admin.post("/bureau/messages/generate-reminders")
+    _msgs = admin.get("/bureau/messages")
+    ok(any(m["kind"] == "DEADLINE" and str(_ex["id"]) in str(m.get("link", ""))
+           and "强制执行申请期" in m["title"] for m in _msgs),
+       "强执申请期临期已推送站内提醒")
+    admin.post(f"/bureau/cases/{_ex['id']}/executions", json={
+        "kind": "FINE", "amount": 5000, "paidAt": str(today), "method": "BANK"})
+    w3 = _exec_warn()
+    ok(sum(w3.values()) == 0, f"足额缴清后三类预警全部消退 {w3}")
 
     step("分期计划：未批准暂缓拒（2065）；批准后建2期计划并缴纳")
     admin.post(f"/bureau/cases/{d_case['id']}/deliver", json={"method": "DIRECT", "receiver": "负责人"})

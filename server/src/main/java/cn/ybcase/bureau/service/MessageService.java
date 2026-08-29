@@ -77,6 +77,44 @@ public class MessageService {
                     "/case/detail/" + r.get("id"), "CASE-" + r.get("id") + "-" + today);
             n++;
         }
+        // 执行阶段（第52-55条/行政强制法53-54条）→ 承办人
+        // 办案期限那段把 DELIVERED 排除在外，决定书送达后系统就不再替办案人计时；
+        // 而强执申请期是全流程唯一"错过即失权、罚没款再也追不回"的期限，必须主动推送而非等人来看看板
+        int payDays = config.intVal("payment_days", 15);
+        for (var r : jdbc.queryForList("""
+                select cf.id, cf.case_no, cf.owner_user,
+                       cf.delivered_at + ?::int as pay_deadline,
+                       ((cf.delivered_at + ?::int) + interval '3 month')::date - current_date as days_left,
+                       exists (select 1 from case_document doc
+                               where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER') as urged
+                from case_file cf join case_decision d on d.case_id = cf.id
+                where cf.status = 'DELIVERED' and cf.delivered_at is not null
+                  and cf.owner_user is not null and cf.court_enforce_applied = false
+                  and cf.delivered_at + ?::int <= current_date + ?::int
+                  and (coalesce((select sum(e.amount) from case_execution e
+                                 where e.case_id = cf.id and e.kind = 'FINE'), 0) < d.fine_amount
+                    or coalesce((select sum(e.amount) from case_execution e
+                                 where e.case_id = cf.id and e.kind = 'RECOUP'), 0) < d.recoup_amount
+                    or coalesce((select sum(e.amount) from case_execution e
+                                 where e.case_id = cf.id and e.kind = 'CONFISCATE'), 0) < d.confiscate_amount)""",
+                payDays, payDays, payDays, ahead)) {
+            long daysLeft = ((Number) r.get("days_left")).longValue();
+            boolean urged = Boolean.TRUE.equals(r.get("urged"));
+            // 只有强执申请期临期(30日内)/已过时才升级为紧急提示，否则是常规催缴
+            String title = daysLeft < 0
+                    ? "【已失权】强制执行申请期已过 " + r.get("case_no")
+                    : daysLeft <= 30
+                        ? "【紧急】强制执行申请期剩 " + daysLeft + " 天 " + r.get("case_no")
+                        : "【催缴】缴款期届满未缴清 " + r.get("case_no");
+            String body = "缴款期限 " + r.get("pay_deadline")
+                    + (urged ? "；已下达催告书" : "；尚未下达催告书（申请强执的法定前置，须先制作 URGE_LETTER 并满 "
+                        + config.intVal("court_urge_days", 10) + " 日）")
+                    + (daysLeft < 0 ? "。申请期已过，罚没款不能再通过法院强制执行追缴，请说明情况另行处理。"
+                        : "。逾期未申请将丧失强制执行权。");
+            send((String) r.get("owner_user"), "DEADLINE", title, body,
+                    "/case/detail/" + r.get("id"), "EXEC-" + r.get("id") + "-" + today);
+            n++;
+        }
         // 待批审批单 → 负责人
         Integer pending = jdbc.queryForObject(
                 "select count(*) from biz_approval where status = 'PENDING'", Integer.class);

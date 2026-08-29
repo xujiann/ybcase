@@ -133,6 +133,58 @@ public class BureauStatsController {
                 where d.decision_type = 'PUNISH' and d.published = false
                   and d.decided_at + ?::int < current_date order by d.decided_at""",
                 publishDays()));
+        // ---- 执行阶段（第52-55条 / 行政强制法53-54条）----
+        // 此前督办看板止于"送达"：决定书送达那天起系统就不再计时，缴款逾期、该催告、
+        // 强执申请期将满全靠办案人自己记台账。三个参数与 ExecutionService 同源，不另起口径。
+        int payDays = cfg.intVal("payment_days", 15);
+        int urgeDays = cfg.intVal("court_urge_days", 10);
+        // 未缴清判定与 close() 的 fullyExecuted 一致：三类款项各自累计均达决定额才算缴清
+        String unpaid = """
+                and (coalesce((select sum(e.amount) from case_execution e
+                               where e.case_id = cf.id and e.kind = 'FINE'), 0) < d.fine_amount
+                  or coalesce((select sum(e.amount) from case_execution e
+                               where e.case_id = cf.id and e.kind = 'RECOUP'), 0) < d.recoup_amount
+                  or coalesce((select sum(e.amount) from case_execution e
+                               where e.case_id = cf.id and e.kind = 'CONFISCATE'), 0) < d.confiscate_amount)""";
+        // 缴款期届满仍未缴清（第53条）
+        m.put("paymentOverdue", jdbc.queryForList("""
+                select cf.id, cf.case_no, cf.name, cf.delivered_at,
+                       cf.delivered_at + ?::int as pay_deadline,
+                       d.fine_amount, d.recoup_amount, d.confiscate_amount,
+                       coalesce((select sum(e.amount) from case_execution e
+                                 where e.case_id = cf.id and e.kind in ('FINE','RECOUP','CONFISCATE')), 0) as paid
+                from case_file cf join case_decision d on d.case_id = cf.id
+                where cf.status = 'DELIVERED' and cf.delivered_at is not null
+                  and cf.delivered_at + ?::int < current_date
+                  and cf.court_enforce_applied = false
+                """ + unpaid + """
+                order by cf.delivered_at""", payDays, payDays));
+        // 缴款期已届满未缴清但尚未催告——催告是申请强执的法定前置（行政强制法54条）
+        m.put("urgeLetterMissing", jdbc.queryForList("""
+                select cf.id, cf.case_no, cf.name, cf.delivered_at + ?::int as pay_deadline
+                from case_file cf join case_decision d on d.case_id = cf.id
+                where cf.status = 'DELIVERED' and cf.delivered_at is not null
+                  and cf.delivered_at + ?::int < current_date
+                  and cf.court_enforce_applied = false
+                  and not exists (select 1 from case_document doc
+                                  where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER')
+                """ + unpaid + """
+                order by cf.delivered_at""", payDays, payDays));
+        // 强执申请期将满/已过（行政强制法53条：缴款期满起3个月内申请，逾期即失权）
+        // 这是全流程唯一"错过即作废且标的最大"的期限，故不止报超期，提前 30 日即入清单
+        m.put("courtEnforceExpiring", jdbc.queryForList("""
+                select cf.id, cf.case_no, cf.name,
+                       cf.delivered_at + ?::int as pay_deadline,
+                       (cf.delivered_at + ?::int) + interval '3 month' as apply_deadline,
+                       ((cf.delivered_at + ?::int) + interval '3 month')::date - current_date as days_left,
+                       (select max(doc.made_at) from case_document doc
+                        where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER') as urged_at
+                from case_file cf join case_decision d on d.case_id = cf.id
+                where cf.status = 'DELIVERED' and cf.delivered_at is not null
+                  and cf.court_enforce_applied = false
+                  and ((cf.delivered_at + ?::int) + interval '3 month')::date < current_date + 30
+                """ + unpaid + """
+                order by apply_deadline""", payDays, payDays, payDays, payDays));
         // 封存到期（第31条）
         m.put("sealExpiring", jdbc.queryForList("""
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.seal_expire_at, ev.seal_extended

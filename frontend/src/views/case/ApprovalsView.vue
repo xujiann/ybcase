@@ -1,16 +1,52 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <h3>待办审批<span class="hint">（申请→负责人批准两步留痕；批准即执行对应动作）</span></h3>
+      <h3>待办审批<span class="hint">（申请→负责人批准两步留痕；批准即执行对应动作。展开左侧箭头查看申请内容再裁决）</span></h3>
       <el-button @click="load">刷新</el-button>
     </div>
     <el-table :data="rows" border stripe size="small" v-loading="loading">
+      <!-- 批准即执行（立案会真的建案、延期会真的顺延期限），负责人必须先看得见申请内容 -->
+      <el-table-column type="expand">
+        <template #default="{ row }">
+          <el-descriptions v-if="pl(row).__empty" :column="1" border size="small">
+            <el-descriptions-item label="申请内容">（本次申请无附加内容，见申请理由）</el-descriptions-item>
+          </el-descriptions>
+          <el-descriptions v-else-if="row.kind === 'FILE_CASE'" :column="2" border size="small" title="立案审批表">
+            <el-descriptions-item label="当事人">{{ pl(row).partyName }}</el-descriptions-item>
+            <el-descriptions-item label="当事人类别">{{ PARTY_TYPE[pl(row).partyType] || pl(row).partyType }}</el-descriptions-item>
+            <el-descriptions-item label="案由">{{ causeName(pl(row).causeId) }}</el-descriptions-item>
+            <el-descriptions-item label="程序">{{ pl(row).procedureType === 'SUMMARY' ? '简易程序' : '普通程序' }}</el-descriptions-item>
+            <el-descriptions-item label="涉案金额">{{ pl(row).amountInvolved }}</el-descriptions-item>
+            <el-descriptions-item label="违法行为终了日">{{ pl(row).violationEndDate || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="办案人员" :span="2">
+              {{ (pl(row).officers || []).map((o: any) => `${o.name}（${o.certNo}${o.duty === 'LEAD' ? ' 主办' : ' 协办'}）`).join('、') || '—' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="统一社会信用代码">{{ pl(row).partyCreditNo || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="法定代表人">{{ pl(row).partyLegalRep || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="地址" :span="2">{{ pl(row).partyAddress || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="案情摘要" :span="2">{{ pl(row).summary || '—' }}</el-descriptions-item>
+          </el-descriptions>
+          <el-descriptions v-else-if="row.kind === 'EXTEND'" :column="1" border size="small" title="延期申请">
+            <el-descriptions-item label="申请延长">{{ pl(row).days }} 日</el-descriptions-item>
+          </el-descriptions>
+          <el-descriptions v-else :column="1" border size="small" title="申请内容">
+            <el-descriptions-item v-for="(v, k) in pl(row)" :key="k" :label="String(k)">{{ v }}</el-descriptions-item>
+          </el-descriptions>
+        </template>
+      </el-table-column>
       <el-table-column prop="id" label="单号" width="70" />
       <el-table-column label="类型" width="90">
         <template #default="{ row }">{{ KIND[row.kind] || row.kind }}</template>
       </el-table-column>
       <el-table-column label="关联" width="180">
         <template #default="{ row }">{{ row.case_no || row.clue_no || '（立案申请）' }}</template>
+      </el-table-column>
+      <el-table-column label="要点" width="150">
+        <template #default="{ row }">
+          <template v-if="row.kind === 'FILE_CASE'">{{ pl(row).partyName || '—' }}</template>
+          <template v-else-if="row.kind === 'EXTEND'">延长 {{ pl(row).days }} 日</template>
+          <span v-else class="hint">—</span>
+        </template>
       </el-table-column>
       <el-table-column prop="reason" label="申请理由" show-overflow-tooltip />
       <el-table-column prop="applicant" label="申请人" width="90" />
@@ -34,7 +70,27 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 
+import { PARTY_TYPE } from './labels'
+
 const KIND: Record<string, string> = { FILE_CASE: '立案', EXTEND: '延期', SUSPEND: '中止', TERMINATE: '终止', DEFER: '暂缓分期' }
+const causes = ref<any[]>([])
+
+/** payload 是 jsonb 文本列，可能为 null；解析失败不能让整页白屏 */
+function pl(row: any): any {
+  if (row.__pl) return row.__pl
+  let v: any = {}
+  try {
+    v = row.payload ? (typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload) : {}
+  } catch { v = {} }
+  if (!v || Object.keys(v).length === 0) v = { __empty: true }
+  row.__pl = v
+  return v
+}
+
+function causeName(id: number) {
+  const c = causes.value.find((x: any) => x.id === id)
+  return c ? `${c.itemNo}. ${c.name}` : (id ?? '—')
+}
 const auth = useAuthStore()
 const rows = ref<any[]>([])
 const loading = ref(false)
@@ -57,7 +113,11 @@ async function onDecide(row: any, approve: boolean) {
   load()
 }
 
-onMounted(load)
+onMounted(async () => {
+  // 案由 id → 名称：负责人看到的应是"重复收费"而不是一个数字主键
+  try { causes.value = (await client.get('/bureau/causes')).data.data } catch { /* 不阻断审批列表 */ }
+  await load()
+})
 </script>
 
 <style scoped>
