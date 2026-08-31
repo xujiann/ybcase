@@ -1,6 +1,12 @@
 spring:
   application:
     name: ybcase-server
+  jackson:
+    # Jackson 默认用 UTC 序列化时间戳，而 JVM 已被 applyBusinessTimeZone 设为业务时区，
+    # 结果是日志写 +08:00、接口返回 +00:00，界面原样展示的时间比实际早 8 小时
+    # （消息时间 slice(0,16) 后看着像个正常时间，最不容易被发现）。
+    # user.timezone 由 BureauServerApplication 在 SpringApplication.run 之前设好。
+    time-zone: ${user.timezone:Asia/Shanghai}
   datasource:
     url: jdbc:postgresql://127.0.0.1:5432/ybcase
     username: hip

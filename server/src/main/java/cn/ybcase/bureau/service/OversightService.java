@@ -19,6 +19,7 @@ import java.util.Map;
 public class OversightService {
 
     private final ClueService clueService;
+    private final ExecutionService executionService;
     private final CaseClueRepository clueRepository;
     private final JdbcTemplate jdbc;
     private final BizSeqService seq;
@@ -127,7 +128,10 @@ public class OversightService {
 
     // ---------- 分期计划（第54条） ----------
 
-    public record InstallmentReq(Integer seq, LocalDate dueAt, BigDecimal amount) {}
+    /** kind 缺省为 FINE，兼容旧调用；退回基金/没收类分期须显式传 */
+    public record InstallmentReq(Integer seq, LocalDate dueAt, BigDecimal amount, String kind) {}
+
+    private static final List<String> INSTALLMENT_KINDS = List.of("FINE", "RECOUP", "CONFISCATE");
 
     @Transactional
     public void addInstallment(Long caseId, InstallmentReq req) {
@@ -135,31 +139,56 @@ public class OversightService {
         if (rows.isEmpty()) throw new BizException(2043, "案件不存在");
         if (!Boolean.TRUE.equals(rows.get(0).get("defer_approved")))
             throw new BizException(2065, "须先经负责人批准暂缓/分期缴纳（第54条）");
-        jdbc.update("insert into case_installment (case_id, seq, due_at, amount) values (?,?,?,?)",
-                caseId, req.seq(), req.dueAt(), req.amount());
+        String kind = req.kind() == null || req.kind().isBlank() ? "FINE" : req.kind();
+        if (!INSTALLMENT_KINDS.contains(kind))
+            throw new BizException(2065, "分期款项类型须为 罚款/退回基金/没收违法所得");
+        if (req.amount() == null || req.amount().signum() <= 0)
+            throw new BizException(2065, "分期金额须为正数");
+        // 分期计划总额不得超过决定书就该类款项确定的金额：否则缴完计划仍判"未缴清"，
+        // 或反过来把超额款项入了账（入账侧的封顶在 ExecutionService，这里是计划侧的前置）
+        var dec = jdbc.queryForList(
+                "select fine_amount, recoup_amount, confiscate_amount from case_decision where case_id = ?", caseId);
+        if (dec.isEmpty()) throw new BizException(2065, "案件无处理决定，不能制定分期计划");
+        String col = switch (kind) {
+            case "RECOUP" -> "recoup_amount";
+            case "CONFISCATE" -> "confiscate_amount";
+            default -> "fine_amount";
+        };
+        BigDecimal decided = (BigDecimal) dec.get(0).get(col);
+        decided = decided == null ? BigDecimal.ZERO : decided;
+        if (decided.signum() <= 0)
+            throw new BizException(2065, "决定书未确定该类款项金额，不能就其制定分期计划");
+        BigDecimal planned = jdbc.queryForObject(
+                "select coalesce(sum(amount), 0) from case_installment where case_id = ? and kind = ?",
+                BigDecimal.class, caseId, kind);
+        if (planned.add(req.amount()).compareTo(decided) > 0)
+            throw new BizException(2065, "分期计划累计（" + planned.add(req.amount())
+                    + "）超出决定书确定的金额（" + decided + "）");
+        jdbc.update("insert into case_installment (case_id, seq, due_at, amount, kind) values (?,?,?,?,?)",
+                caseId, req.seq(), req.dueAt(), req.amount(), kind);
     }
 
     @Transactional
     public void payInstallment(Long installmentId) {
-        // 取金额与所属案件：分期缴纳同时要登记为执行记录，
-        // 否则结案判定（fullyExecuted 只看 case_execution）永远认为未缴清，
-        // 批准了分期的案件全部无法结案（第56条）
+        // 分期缴纳同时登记为执行记录：结案判定（fullyExecuted）只看 case_execution，
+        // 只标 paid_at 会让批准了分期的案件永远无法结案（第56条）。
+        // 入账走 ExecutionService.addExecution 而非裸 insert——裸 insert 会写死款项类型，
+        // 并绕过"该类款项须已决定""累计不超决定额"两道校验。
         var rows = jdbc.queryForList(
-                "select case_id, seq, amount from case_installment where id = ? and paid_at is null", installmentId);
+                "select case_id, seq, amount, kind from case_installment where id = ? and paid_at is null",
+                installmentId);
         if (rows.isEmpty()) throw new BizException(2065, "分期记录不存在或已缴清");
         Long caseId = ((Number) rows.get(0).get("case_id")).longValue();
         Integer seq = ((Number) rows.get(0).get("seq")).intValue();
-        java.math.BigDecimal amount = (java.math.BigDecimal) rows.get(0).get("amount");
+        BigDecimal amount = (BigDecimal) rows.get(0).get("amount");
+        String kind = (String) rows.get(0).get("kind");
 
         int n = jdbc.update("update case_installment set paid_at = ? where id = ? and paid_at is null",
                 LocalDate.now(), installmentId);
         if (n == 0) throw new BizException(2065, "分期记录不存在或已缴清");   // 并发下的二次确认
 
-        // 罚款分期入账（与直接缴纳同一账目口径，供结案与统计使用）
-        jdbc.update("""
-                insert into case_execution (case_id, kind, amount, paid_at, method, note)
-                values (?, 'FINE', ?, ?, 'BANK', ?)""",
-                caseId, amount, LocalDate.now(), "分期缴纳第 " + seq + " 期（自动入账）");
+        executionService.addExecution(caseId, new ExecutionService.ExecutionReq(
+                kind, amount, LocalDate.now(), "BANK", "分期缴纳第 " + seq + " 期（自动入账）", null));
     }
 
     // ---------- 专家评审（第25条，期间不计入办案期限） ----------

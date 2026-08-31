@@ -146,6 +146,8 @@ public class BureauStatsController {
                                where e.case_id = cf.id and e.kind = 'RECOUP'), 0) < d.recoup_amount
                   or coalesce((select sum(e.amount) from case_execution e
                                where e.case_id = cf.id and e.kind = 'CONFISCATE'), 0) < d.confiscate_amount)""";
+        // 已批准暂缓/分期缴纳的案件不在此列：其按 case_installment 的 due_at 履行，
+        // 由 installmentOverdue 面板监控；否则依约分期的案件会被一路误报到"已失权"
         // 缴款期届满仍未缴清（第53条）
         m.put("paymentOverdue", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name, cf.delivered_at,
@@ -156,7 +158,7 @@ public class BureauStatsController {
                 from case_file cf join case_decision d on d.case_id = cf.id
                 where cf.status = 'DELIVERED' and cf.delivered_at is not null
                   and cf.delivered_at + ?::int < current_date
-                  and cf.court_enforce_applied = false
+                  and cf.court_enforce_applied = false and cf.defer_approved = false
                 """ + unpaid + """
                 order by cf.delivered_at""", payDays, payDays));
         // 缴款期已届满未缴清但尚未催告——催告是申请强执的法定前置（行政强制法54条）
@@ -165,7 +167,7 @@ public class BureauStatsController {
                 from case_file cf join case_decision d on d.case_id = cf.id
                 where cf.status = 'DELIVERED' and cf.delivered_at is not null
                   and cf.delivered_at + ?::int < current_date
-                  and cf.court_enforce_applied = false
+                  and cf.court_enforce_applied = false and cf.defer_approved = false
                   and not exists (select 1 from case_document doc
                                   where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER')
                 """ + unpaid + """
@@ -175,14 +177,17 @@ public class BureauStatsController {
         m.put("courtEnforceExpiring", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name,
                        cf.delivered_at + ?::int as pay_deadline,
-                       (cf.delivered_at + ?::int) + interval '3 month' as apply_deadline,
+                       -- 必须 ::date：date + interval 会提升为 timestamp，前端切前 10 位恒早一天，
+                       -- 与紧邻的 days_left 自相矛盾（这是本看板唯一"错过即失权"的日期）
+                       ((cf.delivered_at + ?::int) + interval '3 month')::date as apply_deadline,
                        ((cf.delivered_at + ?::int) + interval '3 month')::date - current_date as days_left,
                        (select max(doc.made_at) from case_document doc
                         where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER') as urged_at
                 from case_file cf join case_decision d on d.case_id = cf.id
                 where cf.status = 'DELIVERED' and cf.delivered_at is not null
-                  and cf.court_enforce_applied = false
-                  and ((cf.delivered_at + ?::int) + interval '3 month')::date < current_date + 30
+                  and cf.court_enforce_applied = false and cf.defer_approved = false
+                  -- <= 而非 <：与提醒的 daysLeft <= 30 同口径，否则恰剩 30 天时看板不报而提醒报
+                  and ((cf.delivered_at + ?::int) + interval '3 month')::date <= current_date + 30
                 """ + unpaid + """
                 order by apply_deadline""", payDays, payDays, payDays, payDays));
         // 封存到期（第31条）

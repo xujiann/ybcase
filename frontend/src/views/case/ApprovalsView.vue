@@ -4,7 +4,7 @@
       <h3>待办审批<span class="hint">（申请→负责人批准两步留痕；批准即执行对应动作。展开左侧箭头查看申请内容再裁决）</span></h3>
       <el-button @click="load">刷新</el-button>
     </div>
-    <el-table :data="rows" border stripe size="small" v-loading="loading">
+    <el-table :data="rows" border stripe size="small" v-loading="loading" row-key="id">
       <!-- 批准即执行（立案会真的建案、延期会真的顺延期限），负责人必须先看得见申请内容 -->
       <el-table-column type="expand">
         <template #default="{ row }">
@@ -50,7 +50,9 @@
       </el-table-column>
       <el-table-column prop="reason" label="申请理由" show-overflow-tooltip />
       <el-table-column prop="applicant" label="申请人" width="90" />
-      <el-table-column prop="applied_at" label="申请时间" width="160" />
+      <el-table-column label="申请时间" width="140">
+        <template #default="{ row }">{{ fmtTime(row.applied_at) }}</template>
+      </el-table-column>
       <el-table-column label="裁决" width="170">
         <template #default="{ row }">
           <template v-if="isLeader">
@@ -70,26 +72,31 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 
-import { PARTY_TYPE } from './labels'
+import { PARTY_TYPE, fmtTime } from './labels'
 
 const KIND: Record<string, string> = { FILE_CASE: '立案', EXTEND: '延期', SUSPEND: '中止', TERMINATE: '终止', DEFER: '暂缓分期' }
 const causes = ref<any[]>([])
 
 /** payload 是 jsonb 文本列，可能为 null；解析失败不能让整页白屏 */
-function pl(row: any): any {
-  if (row.__pl) return row.__pl
+function parsePayload(raw: any): any {
   let v: any = {}
   try {
-    v = row.payload ? (typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload) : {}
+    v = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : {}
   } catch { v = {} }
-  if (!v || Object.keys(v).length === 0) v = { __empty: true }
-  row.__pl = v
-  return v
+  return !v || Object.keys(v).length === 0 ? { __empty: true } : v
+}
+
+// 解析在 load() 里一次做完，pl() 只读不写：
+// 曾在渲染期写 row.__pl，而 el-table 对 :data 有 deep watch，写入触发 setData 重建展开状态，
+// 结果是展开行第一次点击立刻塌陷（要点两下才展开）
+function pl(row: any): any {
+  return row.__pl || { __empty: true }
 }
 
 function causeName(id: number) {
+  // CaseCause 没有 name 字段，与立案表单下拉同口径：序号. 类别——描述
   const c = causes.value.find((x: any) => x.id === id)
-  return c ? `${c.itemNo}. ${c.name}` : (id ?? '—')
+  return c ? `${c.itemNo}. ${c.category}——${c.description}` : (id ?? '—')
 }
 const auth = useAuthStore()
 const rows = ref<any[]>([])
@@ -99,7 +106,8 @@ const isLeader = computed(() => auth.user?.roles?.some((r) => ['LEADER', 'ADMIN'
 async function load() {
   loading.value = true
   try {
-    rows.value = (await client.get('/bureau/approvals/pending')).data.data
+    rows.value = ((await client.get('/bureau/approvals/pending')).data.data as any[])
+      .map((r) => ({ ...r, __pl: parsePayload(r.payload) }))
   } finally {
     loading.value = false
   }

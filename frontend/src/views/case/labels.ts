@@ -50,3 +50,11 @@ export const EXCLUSION_REASON: Record<string, string> = {
 export const REVIEW_OPINION: Record<string, string> = {
   AGREE: '同意', CONTINUE: '继续调查', CHANGE: '变更', CORRECT: '纠正', OTHER: '其他',
 }
+
+/** 时间戳展示：后端返回 ISO（带毫秒与时区偏移），直接塞进表格既难读又容易被误读为别的时刻 */
+export function fmtTime(v?: string | null): string {
+  if (!v) return '—'
+  const s = String(v)
+  // 只截到分钟：yyyy-MM-dd HH:mm（偏移已由服务端按业务时区给出，不再做二次换算）
+  return s.length >= 16 ? s.slice(0, 16).replace('T', ' ') : s
+}

@@ -266,9 +266,17 @@ class GuardIntegrationTest {
                 java.time.LocalDate.now(), "当事人", null, null, null));
         executionService.approveDefer(c.getId());
         oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
-                .InstallmentReq(1, java.time.LocalDate.now(), new BigDecimal("2500")));
+                .InstallmentReq(1, java.time.LocalDate.now(), new BigDecimal("2500"), "FINE"));
         oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
-                .InstallmentReq(2, java.time.LocalDate.now(), new BigDecimal("2500")));
+                .InstallmentReq(2, java.time.LocalDate.now(), new BigDecimal("2500"), "FINE"));
+        // 计划总额不得超出决定书就该类款项确定的金额（此前无此前置，缴完计划仍判未缴清）
+        assertEquals(2065, assertThrows(BizException.class, () ->
+                oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
+                        .InstallmentReq(3, java.time.LocalDate.now(), new BigDecimal("1"), "FINE"))).code);
+        // 决定书未判退回基金时不得就其排分期（此前一律按 FINE 入账，无从发现）
+        assertEquals(2065, assertThrows(BizException.class, () ->
+                oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
+                        .InstallmentReq(4, java.time.LocalDate.now(), new BigDecimal("100"), "RECOUP"))).code);
         for (var row : jdbc.queryForList(
                 "select id from case_installment where case_id = ? order by seq", c.getId())) {
             oversightService.payInstallment(((Number) row.get("id")).longValue());
@@ -277,6 +285,31 @@ class GuardIntegrationTest {
         assertEquals(0, executionService.sum(c.getId(), "FINE").compareTo(new BigDecimal("5000")));
         CaseFile closed = caseService.close(c.getId(), "分期缴清，执行完毕", "it");
         assertEquals("CLOSED", closed.getStatus());
+    }
+
+    @Test
+    void 退回基金分期缴清后可结案() {
+        // 分期入账此前写死 kind='FINE'：只判退回基金、不罚款的案件（医保案常见）
+        // 缴完计划后 sum(RECOUP) 仍为 0，fullyExecuted 永远不成立 → 无法结案
+        CaseFile c = caseService.create(req("IT-退基分期" + System.nanoTime(), TWO), "it");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟退回基金", BigDecimal.ZERO,
+                new BigDecimal("6000"), null));
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", BigDecimal.ZERO,
+                new BigDecimal("6000"), null, null, "责令退回基金6000", null, "一般情形"));
+        caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
+                java.time.LocalDate.now(), "当事人", null, null, null));
+        executionService.approveDefer(c.getId());
+        oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
+                .InstallmentReq(1, java.time.LocalDate.now(), new BigDecimal("6000"), "RECOUP"));
+        for (var row : jdbc.queryForList(
+                "select id from case_installment where case_id = ? order by seq", c.getId())) {
+            oversightService.payInstallment(((Number) row.get("id")).longValue());
+        }
+        assertEquals(0, executionService.sum(c.getId(), "RECOUP").compareTo(new BigDecimal("6000")));
+        assertEquals(0, executionService.sum(c.getId(), "FINE").compareTo(BigDecimal.ZERO));
+        assertEquals("CLOSED", caseService.close(c.getId(), "退回基金已缴清", "it").getStatus());
     }
 
     @Test

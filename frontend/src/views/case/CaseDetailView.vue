@@ -329,6 +329,9 @@
           <h4>分期计划（第54条）　<el-button size="small" @click="openInstallment" :disabled="!c.deferApproved">添加分期</el-button></h4>
           <el-table :data="installments" border size="small" class="mb">
             <el-table-column prop="seq" label="期数" width="70" />
+            <el-table-column label="款项" width="110">
+              <template #default="{ row }">{{ EXEC_KIND[row.kind] || row.kind || '罚款' }}</template>
+            </el-table-column>
             <el-table-column prop="due_at" label="到期日" width="120" />
             <el-table-column prop="amount" label="金额" width="120" align="right" />
             <el-table-column label="缴纳" width="150">
@@ -649,6 +652,14 @@
 
     <el-dialog v-model="dlg.installment" title="添加分期（第54条）" width="420px">
       <el-form label-width="80px">
+        <el-form-item label="款项类型">
+          <el-select v-model="installmentForm.kind" style="width: 180px">
+            <el-option label="罚款" value="FINE" />
+            <el-option label="退回基金" value="RECOUP" />
+            <el-option label="没收违法所得" value="CONFISCATE" />
+          </el-select>
+          <span class="hint">须与决定书确定的款项对应，缴纳时按此类型入账</span>
+        </el-form-item>
         <el-form-item label="期数"><el-input-number v-model="installmentForm.seq" :min="1" /></el-form-item>
         <el-form-item label="到期日">
           <el-date-picker v-model="installmentForm.dueAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
@@ -764,7 +775,7 @@ const applyForm = reactive<any>({ kind: 'EXTEND', days: 30, reason: '' })
 const docDeliverForm = reactive<any>({ documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', receiver: '', receiptNo: '' })
 const pendingApprovals = computed(() => (detail.value.approvals || []).filter((a: any) => a.status === 'PENDING'))
 const reviewForm = reactive<any>({ reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
-const installmentForm = reactive<any>({ seq: 1, dueAt: '', amount: 0 })
+const installmentForm = reactive<any>({ seq: 1, dueAt: '', amount: 0, kind: 'FINE' })
 const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
 const attachments = ref<any[]>([])
 const timeline = ref<any[]>([])
@@ -1327,7 +1338,7 @@ function resetCaseLocalForms() {
   Object.assign(decisionForm, { decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
   Object.assign(deliveryForm, { method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null })
   Object.assign(reviewForm, { reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
-  Object.assign(installmentForm, { seq: 1, dueAt: '', amount: 0 })
+  Object.assign(installmentForm, { seq: 1, dueAt: '', amount: 0, kind: 'FINE' })
   Object.assign(hearingForm, { announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
   Object.assign(applyForm, { kind: 'EXTEND', days: 30, reason: '' })
   Object.assign(docDeliverForm, { documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', receiver: '', receiptNo: '' })

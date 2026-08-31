@@ -16,7 +16,9 @@
         </template>
       </el-table-column>
       <el-table-column prop="reply" label="处理回复" show-overflow-tooltip />
-      <el-table-column prop="created_at" label="提交时间" width="160" />
+      <el-table-column label="提交时间" width="140">
+        <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
+      </el-table-column>
       <el-table-column label="操作" width="110">
         <template #default="{ row }">
           <el-button v-if="row.status === 'RESOLVED'" size="small" type="success"
@@ -28,6 +30,7 @@
 </template>
 
 <script setup lang="ts">
+import { fmtTime } from './labels'
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import client from '../../api/client'

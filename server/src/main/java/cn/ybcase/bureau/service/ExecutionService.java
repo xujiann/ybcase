@@ -66,6 +66,20 @@ public class ExecutionService {
             if (already.add(amount).compareTo(decided) > 0)
                 throw new BizException(2042, "累计登记金额（" + already.add(amount)
                         + "）超出决定书确定的金额（" + decided + "），请核对是否重复登记或金额录入有误");
+            // 上面的先查后插在并发下两笔都能过检（双击提交、超时重试），落库后累计超出决定额，
+            // 进而被 fullyExecuted 判为"执行完毕"。与 LATE_FEE 分支一样把封顶写进 insert 的 where，
+            // 由数据库一次性判定；上面的预检保留，只为给出带具体金额的友好提示
+            int ok = jdbc.update("""
+                    insert into case_execution (case_id, kind, amount, paid_at, method, note, receipt_no)
+                    select ?,?,?,?,?,?,?
+                    where (select coalesce(sum(amount), 0) from case_execution
+                           where case_id = ? and kind = ?) + ? <= ?""",
+                    caseId, req.kind(), amount, req.paidAt() != null ? req.paidAt() : LocalDate.now(),
+                    req.method(), req.note(), receiptNo,
+                    caseId, req.kind(), amount, decided);
+            if (ok == 0) throw new BizException(2042,
+                    "累计登记金额超出决定书确定的金额（" + decided + "），请刷新后核对是否已被重复登记");
+            return;
         }
         // 第55条：加处罚款不得超出罚款数额
         if ("LATE_FEE".equals(req.kind())) {

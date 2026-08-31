@@ -511,6 +511,34 @@ def main():
         "kind": "FINE", "amount": 5000, "paidAt": str(today), "method": "BANK"})
     w3 = _exec_warn()
     ok(sum(w3.values()) == 0, f"足额缴清后三类预警全部消退 {w3}")
+    # 已批准暂缓/分期的案件按 case_installment 履行，不应被催缴/失权预警误报
+    _df = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "分期免催缴案",
+        "partyType": "PROVIDER", "amountInvolved": 50000,
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                     {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]})
+    admin.post(f"/bureau/cases/{_df['id']}/report", json={"content": "调查终结"})
+    admin.post(f"/bureau/cases/{_df['id']}/notice", json={
+        "content": "拟罚", "proposedFine": 5000, "proposedRecoup": 0})
+    admin.post(f"/bureau/cases/{_df['id']}/statement", json={"statementWaived": True})
+    admin.post(f"/bureau/cases/{_df['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 5000, "recoupAmount": 0,
+        "content": "罚款5000", "discretionReason": "一般情形"})
+    admin.post(f"/bureau/cases/{_df['id']}/deliver", json={
+        "method": "DIRECT", "deliveredAt": str(today - datetime.timedelta(days=95)), "receiver": "法人"})
+    _s_before = admin.get("/bureau/stats/supervision")
+    ok(any(x["id"] == _df["id"] for x in _s_before["paymentOverdue"]), "未批准分期时正常报催缴")
+    admin.post(f"/bureau/cases/{_df['id']}/approve-defer")
+    _s_after = admin.get("/bureau/stats/supervision")
+    _hit = {k: len([x for x in _s_after[k] if x.get("id") == _df["id"]])
+            for k in ("paymentOverdue", "urgeLetterMissing", "courtEnforceExpiring")}
+    ok(sum(_hit.values()) == 0, f"批准分期后不再误报催缴/失权 {_hit}")
+    # 强执申请期是本看板唯一"错过即失权"的日期，不得因类型提升而少显示一天
+    _ce = [x for x in _s_before["courtEnforceExpiring"] if x["id"] == _df["id"]]
+    if _ce:
+        _ad, _dl = str(_ce[0]["apply_deadline"])[:10], int(_ce[0]["days_left"])
+        ok(datetime.date.fromisoformat(_ad) == today + datetime.timedelta(days=_dl),
+           f"强执申请期日期与剩余天数自洽（{_ad}，剩 {_dl} 天）")
 
     step("分期计划：未批准暂缓拒（2065）；批准后建2期计划并缴纳")
     admin.post(f"/bureau/cases/{d_case['id']}/deliver", json={"method": "DIRECT", "receiver": "负责人"})
@@ -518,9 +546,20 @@ def main():
         "seq": 1, "dueAt": str(today + datetime.timedelta(days=30)), "amount": 2500}, expect_code=2065)
     admin.post(f"/bureau/cases/{d_case['id']}/approve-defer")
     admin.post(f"/bureau/cases/{d_case['id']}/installments", json={
-        "seq": 1, "dueAt": str(today + datetime.timedelta(days=30)), "amount": 2500})
+        "seq": 1, "dueAt": str(today + datetime.timedelta(days=30)), "amount": 2500, "kind": "FINE"})
     admin.post(f"/bureau/cases/{d_case['id']}/installments", json={
-        "seq": 2, "dueAt": str(today + datetime.timedelta(days=60)), "amount": 2500})
+        "seq": 2, "dueAt": str(today + datetime.timedelta(days=60)), "amount": 2500, "kind": "FINE"})
+    # 计划总额不得超出决定书就该类款项确定的金额（本案罚款已排满 5000）
+    admin.post(f"/bureau/cases/{d_case['id']}/installments", json={
+        "seq": 3, "dueAt": str(today), "amount": 1, "kind": "FINE"}, expect_code=2065)
+    # 退回基金分期须按 RECOUP 入账：此前一律写死 FINE，这类款项永远缴不清（本案决定书判了退回 4000）
+    admin.post(f"/bureau/cases/{d_case['id']}/installments", json={
+        "seq": 4, "dueAt": str(today), "amount": 4000, "kind": "RECOUP"})
+    _rc = next(i for i in admin.get(f"/bureau/cases/{d_case['id']}/installments") if i["seq"] == 4)
+    admin.post(f"/bureau/installments/{_rc['id']}/pay")
+    ok(any(e["kind"] == "RECOUP" and float(e["amount"]) == 4000
+           for e in admin.get(f"/bureau/cases/{d_case['id']}")["executions"]),
+       "退回基金分期按 RECOUP 入账（非写死的 FINE）")
     inst = admin.get(f"/bureau/cases/{d_case['id']}/installments")
     admin.post(f"/bureau/installments/{inst[0]['id']}/pay")
     ok(admin.get(f"/bureau/cases/{d_case['id']}/installments")[0]["paid_at"], "第1期已缴")
@@ -529,6 +568,16 @@ def main():
     _fine_paid = [e for e in admin.get(f"/bureau/cases/{d_case['id']}")["executions"]
                   if e["kind"] == "FINE"]
     ok(any(float(e["amount"]) == 2500 for e in _fine_paid), "分期缴纳已自动入账为执行记录")
+    # 每笔分期入账的款项类型须与其计划一致，不能一律写成罚款
+    _exs = admin.get(f"/bureau/cases/{d_case['id']}")["executions"]
+    _mismatch = []
+    for i in admin.get(f"/bureau/cases/{d_case['id']}/installments"):
+        if not i.get("paid_at"):
+            continue
+        if not any(e["kind"] == i["kind"] and float(e["amount"]) == float(i["amount"])
+                   and f"第 {i['seq']} 期" in str(e.get("note") or "") for e in _exs):
+            _mismatch.append((i["seq"], i["kind"], i["amount"]))
+    ok(not _mismatch, f"每笔分期入账的款项类型与计划一致（不符 {_mismatch}）")
 
     step("专家评审：结束自动登记期限扣除（第25/45条）；起始日不得由结束请求倒填")
     # 起始日只在启动时登记且受校验（不得早于立案日、不得晚于今天）

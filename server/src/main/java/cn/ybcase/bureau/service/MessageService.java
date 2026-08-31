@@ -90,14 +90,18 @@ public class MessageService {
                 from case_file cf join case_decision d on d.case_id = cf.id
                 where cf.status = 'DELIVERED' and cf.delivered_at is not null
                   and cf.owner_user is not null and cf.court_enforce_applied = false
-                  and cf.delivered_at + ?::int <= current_date + ?::int
+                  -- 与看板 paymentOverdue 完全同口径：此前用 <= current_date + ahead（提前5天开闸），
+                  -- 而文案档位只按 days_left 分，缴款期未届满的案件必然落到"届满未缴清"那一档，是误报
+                  and cf.delivered_at + ?::int < current_date
+                  -- 已批准暂缓/分期的按 case_installment 履行，不在催缴之列
+                  and cf.defer_approved = false
                   and (coalesce((select sum(e.amount) from case_execution e
                                  where e.case_id = cf.id and e.kind = 'FINE'), 0) < d.fine_amount
                     or coalesce((select sum(e.amount) from case_execution e
                                  where e.case_id = cf.id and e.kind = 'RECOUP'), 0) < d.recoup_amount
                     or coalesce((select sum(e.amount) from case_execution e
                                  where e.case_id = cf.id and e.kind = 'CONFISCATE'), 0) < d.confiscate_amount)""",
-                payDays, payDays, payDays, ahead)) {
+                payDays, payDays, payDays)) {
             long daysLeft = ((Number) r.get("days_left")).longValue();
             boolean urged = Boolean.TRUE.equals(r.get("urged"));
             // 只有强执申请期临期(30日内)/已过时才升级为紧急提示，否则是常规催缴
@@ -111,8 +115,13 @@ public class MessageService {
                         + config.intVal("court_urge_days", 10) + " 日）")
                     + (daysLeft < 0 ? "。申请期已过，罚没款不能再通过法院强制执行追缴，请说明情况另行处理。"
                         : "。逾期未申请将丧失强制执行权。");
+            // 已失权是终局事实、不会再变，按天翻新去重键会让它每个工作日永久重发；
+            // 改为全生命周期只发一次（未失权的催缴仍按天提醒）
+            String dedup = daysLeft < 0
+                    ? "EXEC-LAPSED-" + r.get("id")
+                    : "EXEC-" + r.get("id") + "-" + today;
             send((String) r.get("owner_user"), "DEADLINE", title, body,
-                    "/case/detail/" + r.get("id"), "EXEC-" + r.get("id") + "-" + today);
+                    "/case/detail/" + r.get("id"), dedup);
             n++;
         }
         // 待批审批单 → 负责人

@@ -70,6 +70,10 @@ public class ApprovalService {
         Object executed = null;
         if (approve) {
             executed = execute((String) a.get("kind"), a, approver);
+            // FILE_CASE 是唯一"批准时才产生案件"的类型，申请时 case_id 必然为 null；
+            // 不回填的话这张立案审批表挂不到案件上（byCase 查不到、案卷里看不见第17条批准留痕）
+            if (executed instanceof cn.ybcase.bureau.entity.CaseFile created && a.get("case_id") == null)
+                jdbc.update("update biz_approval set case_id = ? where id = ?", created.getId(), approvalId);
         }
         // 即时通知申请人
         messageService.send((String) a.get("applicant"), "APPROVAL",
