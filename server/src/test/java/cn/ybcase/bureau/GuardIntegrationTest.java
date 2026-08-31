@@ -28,6 +28,7 @@ class GuardIntegrationTest {
     @Autowired cn.ybcase.bureau.service.OversightService oversightService;
     @Autowired cn.ybcase.bureau.service.ProcedureService procedureService;
     @Autowired cn.ybcase.bureau.service.ExecutionService executionService;
+    @Autowired cn.ybcase.bureau.service.DocumentService documentService;
     @Autowired cn.ybcase.core.repository.SysUserRepository sysUserRepository;
     @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
 
@@ -310,6 +311,127 @@ class GuardIntegrationTest {
         assertEquals(0, executionService.sum(c.getId(), "RECOUP").compareTo(new BigDecimal("6000")));
         assertEquals(0, executionService.sum(c.getId(), "FINE").compareTo(BigDecimal.ZERO));
         assertEquals("CLOSED", caseService.close(c.getId(), "退回基金已缴清", "it").getStatus());
+    }
+
+    @Test
+    void 终止调查案件可立卷归档且保留终止状态() {
+        // close() 此前要求"有处理决定"且状态在 DECIDED/DELIVERED——终止调查的案件两条都不满足，
+        // 拿不到案卷号、产不出结案报告，第57条一案一卷对这批案件只能线下手工立卷
+        CaseFile c = caseService.create(req("IT-终止归档" + System.nanoTime(), TWO), "it");
+        caseService.terminate(c.getId(), "违法事实不能成立（第47条）");
+        assertEquals("TERMINATED", caseService.get(c.getId()).getStatus());
+
+        CaseFile archived = caseService.close(c.getId(), "经调查违法事实不能成立，终止调查并立卷归档", "it");
+        assertNotNull(archived.getArchiveNo());
+        assertEquals("TERMINATED", archived.getStatus());   // 归档不改写案件的真实出口
+        assertEquals("TERMINATED", archived.getCloseReason());
+        assertNotNull(archived.getClosedAt());
+        // 重复归档须被拒（状态仍是 TERMINATED，靠 archive_no 而非状态判定）
+        assertEquals(2011, assertThrows(BizException.class,
+                () -> caseService.close(c.getId(), "再归一次", "it")).code);
+    }
+
+    @Test
+    void 卷内目录纳入结构化法定材料() {
+        // 立案审批表在 biz_approval、法制审核意见在 case_review、集体讨论在 case_meeting、
+        // 送达回证在 case_delivery——此前 archiveCatalog 只查 case_document，这些一件都不进卷
+        CaseFile c = caseService.create(req("IT-卷内目录" + System.nanoTime(), TWO), "it");
+        approvalService.recordDirect("FILE_CASE", c.getId(), "直接立案", "juzhang");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("2000"),
+                BigDecimal.ZERO, null));
+        // 再告知加重须载明变更理由（第52条）——这两条告知记录都必须留在案卷里
+        caseService.notify(c.getId(), new CaseService.NoticeReq("改拟罚1500", new BigDecimal("1500"),
+                BigDecimal.ZERO, "复核后调整认定金额"));
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        var rv = caseService.submitReview(c.getId(), "重大案件");
+        caseService.doReview(rv.getId(), "李法制", "AGREE", "程序合法");
+        caseService.addMeeting(c.getId(), new CaseService.MeetingReq(java.time.LocalDate.now(),
+                "局领导班子", "讨论一致", "同意处罚"));
+        caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("1500"),
+                BigDecimal.ZERO, null, null, "罚款1500", null, "一般情形"));
+        caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
+                java.time.LocalDate.now(), "当事人", null, null, null));
+
+        var catalog = documentService.archiveCatalog(c.getId());
+        @SuppressWarnings("unchecked")
+        var entries = (java.util.List<java.util.Map<String, Object>>) catalog.get("catalog");
+        var types = entries.stream().map(e -> (String) e.get("doc_type")).toList();
+        assertTrue(types.contains("FILING_APPROVAL"), "立案审批表未进卷：" + types);
+        assertTrue(types.contains("LEGAL_OPINION"), "法制审核意见未进卷：" + types);
+        assertTrue(types.contains("MEETING_RECORD"), "集体讨论记录未进卷：" + types);
+        assertTrue(types.contains("DELIVERY_RECEIPT"), "送达回证未进卷：" + types);
+        // 装订顺序：立案审批表在最前，决定书在送达回证之前
+        assertEquals("FILING_APPROVAL", types.get(0), "立案审批表应排卷首：" + types);
+        assertTrue(types.indexOf("DECISION") < types.indexOf("DELIVERY_RECEIPT"), "装订顺序错：" + types);
+        // 手工制作同类文书后，结构化记录不得被"去重"掉：
+        // 按类型（乃至类型+日期）去重都会把上面那两次告知记录抹掉
+        caseService.addDocument(c.getId(), new CaseService.DocumentReq("NOTICE",
+                "行政处罚告知书（手工）", "手工录入", java.time.LocalDate.now(), "it", false, null, null));
+        var after = documentService.archiveCatalog(c.getId());
+        @SuppressWarnings("unchecked")
+        var afterEntries = (java.util.List<java.util.Map<String, Object>>) after.get("catalog");
+        long notices = afterEntries.stream().filter(e -> "NOTICE".equals(e.get("doc_type"))).count();
+        assertEquals(3, notices, "2 次告知记录 + 1 份手工文书都应在卷：" + afterEntries.stream()
+                .map(e -> e.get("doc_type") + "/" + e.get("source")).toList());
+
+        // 虚拟卷内件无 case_document 行，不应带 id（否则前端会拿去签章/送达）
+        entries.stream().filter(e -> "RECORD".equals(e.get("source")))
+                .forEach(e -> assertNull(e.get("id"), "虚拟卷内件不应有 id：" + e.get("title")));
+        // 序号连续
+        for (int i = 0; i < entries.size(); i++)
+            assertEquals(i + 1, entries.get(i).get("seq"));
+    }
+
+    @Test
+    void 小额处罚案件不因未做法制审核被判卷内缺件() {
+        // 第37条法制审核默认是条件式的（THRESHOLD：达数额较大或经听证才须审核）。
+        // 必备清单若无条件要求 LEGAL_OPINION，所有小额处罚案件恒被判"必备文书缺失"，
+        // 开启齐全性强制后直接卡死结案，而事后补审已被状态守卫堵死（submitReview 限 REPORTED/NOTIFIED）
+        CaseFile c = caseService.create(req("IT-小额审核" + System.nanoTime(), TWO), "it");
+        approvalService.recordDirect("FILE_CASE", c.getId(), "直接立案", "juzhang");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("5000"),
+                BigDecimal.ZERO, null));
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("5000"),
+                BigDecimal.ZERO, null, null, "罚款5000", null, "一般情形"));   // 未经法制审核即可决定
+        caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
+                java.time.LocalDate.now(), "当事人", null, null, null));
+
+        @SuppressWarnings("unchecked")
+        var missing = (java.util.List<String>) documentService.archiveCatalog(c.getId()).get("missing");
+        assertFalse(missing.contains("LEGAL_OPINION"),
+                "小额案未达审核标准，不应判缺法制审核意见：" + missing);
+    }
+
+    @Test
+    void 归档后不得再往卷内加文书() {
+        // 封卷闸门此前只认 CLOSED，而终止类案件归档后状态仍是 TERMINATED
+        CaseFile c = caseService.create(req("IT-封卷" + System.nanoTime(), TWO), "it");
+        caseService.terminate(c.getId(), "违法事实不能成立");
+        caseService.close(c.getId(), "终止调查并立卷归档", "it");
+        assertEquals(2031, assertThrows(BizException.class, () -> caseService.addDocument(
+                c.getId(), new CaseService.DocumentReq("OTHER", "补件", "归档后不该加得进去",
+                        java.time.LocalDate.now(), "it", false, null, null))).code);
+    }
+
+    @Test
+    void 非处罚决定的卷内件文书名不得写成行政处罚决定书() {
+        CaseFile c = caseService.create(req("IT-不予处罚" + System.nanoTime(), TWO), "it");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟不予处罚", BigDecimal.ZERO,
+                BigDecimal.ZERO, null));
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        caseService.decide(c.getId(), new CaseService.DecisionReq("NO_PUNISH", BigDecimal.ZERO,
+                BigDecimal.ZERO, null, null, "违法行为轻微并及时改正，不予行政处罚", null, null));
+        @SuppressWarnings("unchecked")
+        var entries = (java.util.List<java.util.Map<String, Object>>)
+                documentService.archiveCatalog(c.getId()).get("catalog");
+        var title = entries.stream().filter(e -> "DECISION".equals(e.get("doc_type")))
+                .map(e -> (String) e.get("title")).findFirst().orElse("");
+        assertTrue(title.startsWith("不予行政处罚决定书"), "不予处罚案的文书名错：" + title);
+        assertFalse(title.contains("行政处罚决定书 （"), "无文号时不应留下尾随空格：" + title);
     }
 
     @Test

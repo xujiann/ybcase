@@ -61,6 +61,11 @@
           <el-button @click="dlg.execution = true">登记执行</el-button>
           <el-button v-if="isLeader" @click="onCloseCase">结案</el-button>
         </template>
+        <!-- 终止调查/移送司法同样要立卷归档（第57条一案一卷），此前这批案件拿不到案卷号。
+             独立成块：不能嵌在按状态分支的 template 里，否则对 TERMINATED 永远不渲染 -->
+        <template v-if="c.status === 'TERMINATED' && !c.archiveNo">
+          <el-button v-if="isLeader" type="primary" @click="onArchiveTerminated">立卷归档</el-button>
+        </template>
         <template v-if="c.status === 'DELIVERED'">
           <el-button type="primary" @click="dlg.execution = true">登记执行</el-button>
           <el-button @click="onLateFee">加处罚款测算</el-button>
@@ -938,10 +943,10 @@ async function onReplyAgreement(row: any) {
 
 async function onPrintArchive() {
   const d = (await client.get(`/bureau/cases/${id.value}/archive-full`)).data.data
-  const cat = (await client.get(`/bureau/cases/${id.value}/archive-catalog`)).data.data
-  const order: Record<number, number> = {}
-  cat.catalog.forEach((x: any) => { order[x.id] = x.seq })
-  const docs = [...d.documents].sort((a: any, b: any) => (order[a.id] || 99) - (order[b.id] || 99))
+  // archive-full 返回的已是"卷内件全集"（含由结构化记录渲染的立案审批表/法制审核意见/
+  // 集体讨论/听证笔录/送达回证），且服务端已按法定装订顺序排好 seq——此前按 id 二次排序，
+  // 而虚拟卷内件无 id，会被全部挤到卷末
+  const docs = d.documents
   const sigOf = (docId: number) => d.signatures.filter((s: any) => s.document_id === docId)
     .map((s: any) => `［电子签章］${esc(s.signer)}（${esc(s.signed_at?.slice(0, 10))}，${esc(s.provider)}）`).join('　')
   const w = window.open('', '_blank')
@@ -949,23 +954,25 @@ async function onPrintArchive() {
   const pages = docs.map((doc: any, i: number) => `
     <section class="page"><h2>${esc(doc.title)}</h2>
     <pre>${esc(doc.content)}</pre>
-    <p class="sig">${sigOf(doc.id)}</p>
-    <p class="foot">第 ${i + 2} 页</p></section>`).join('')
-  const toc = docs.map((doc: any, i: number) => `<tr><td>${i + 1}</td><td>${esc(doc.title)}</td><td>${esc(doc.made_at)}</td><td>${i + 2}</td></tr>`).join('')
+    <p class="sig">${doc.id ? sigOf(doc.id) : ''}</p>
+    </section>`).join('')
+  // 页码交给浏览器（@page counter）：此前目录与页脚都按"一件一页"硬编 i+2，
+  // 任一件正文超过一页、或目录本身超过一页，之后所有页码就整体错位
+  const toc = docs.map((doc: any, i: number) => `<tr><td>${i + 1}</td><td>${esc(doc.title)}</td><td>${esc(doc.made_at)}</td><td>${doc.source === 'RECORD' ? '系统记录' : '文书'}</td></tr>`).join('')
   w.document.write(`<html><head><title>${esc(d.caseFile.case_no)} 卷宗</title><style>
     body{font-family:SimSun,serif;line-height:1.9}
     .page{page-break-after:always;padding:40px 50px;min-height:90vh;position:relative}
     h1,h2{text-align:center} pre{white-space:pre-wrap;font-family:inherit;font-size:15px}
     table{width:100%;border-collapse:collapse}td,th{border:1px solid #333;padding:4px 8px;font-size:14px}
     .sig{margin-top:24px;font-size:13px;color:#333}
-    .foot{position:absolute;bottom:16px;left:0;right:0;text-align:center;font-size:12px;color:#666}
+    @page{margin:14mm;@bottom-center{content:counter(page);font-size:12px;color:#666}}
     </style></head><body>
     <section class="page"><h1>${esc(d.orgName)}<br/>行政处罚案卷</h1>
       <p style="text-align:center;font-size:18px">${esc(d.caseFile.name)}</p>
       <p style="text-align:center">案号：${esc(d.caseFile.case_no)}　案卷号：${esc(d.caseFile.archive_no || '（未结案）')}</p>
       <h2>卷内目录</h2>
-      <table><tr><th>序号</th><th>文书名称</th><th>日期</th><th>页码</th></tr>${toc}</table>
-      <p class="foot">第 1 页</p></section>
+      <table><tr><th>序号</th><th>文书名称</th><th>日期</th><th>来源</th></tr>${toc}</table>
+      </section>
     ${pages}</body></html>`)
   w.document.close()
   w.print()
@@ -1317,6 +1324,15 @@ async function onTransferOwner() {
   const { value } = await ElMessageBox.prompt('接收人登录账号（承办人变更，负责人权限）', '案件移交', { inputPattern: /\S+/, inputErrorMessage: '必填' })
   await client.post(`/bureau/cases/${id.value}/transfer-owner`, { newOwner: value })
   ElMessage.success('已移交')
+  load()
+}
+
+async function onArchiveTerminated() {
+  const { value } = await ElMessageBox.prompt(
+    '终止调查/移送情况说明与归档报告（第56/57条）', '立卷归档',
+    { inputType: 'textarea', inputPattern: /\S+/, inputErrorMessage: '必填' })
+  await client.post(`/bureau/cases/${id.value}/close`, { closeReport: value })
+  ElMessage.success('已立卷归档')
   load()
 }
 

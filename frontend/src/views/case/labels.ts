@@ -24,6 +24,8 @@ export const EVIDENCE_TYPE: Record<string, string> = {
   TESTIMONY: '证人证言', STATEMENT: '当事人陈述', EXPERT: '鉴定意见', RECORD: '勘验/现场笔录',
 }
 export const DOC_TYPE: Record<string, string> = {
+  FILING_APPROVAL: '立案审批表', APPROVAL_FORM: '审批表', LEGAL_OPINION: '法制审核意见书',
+  TRANSFER_LETTER: '移送函', ACCEPT_RECEIPT: '受案回执', ORDER_CORRECT: '责令改正通知书',
   SCENE_RECORD: '现场笔录', INQUIRY_RECORD: '询问笔录', ASSIST_LETTER: '协查函',
   FINAL_REPORT: '调查终结报告', SUSPEND_DECISION: '中止决定书', RESUME_NOTICE: '恢复通知',
   PRESERVE_DECISION: '先行登记保存决定书', SEAL_DECISION: '封存决定书', URGE_LETTER: '催告书',

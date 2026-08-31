@@ -37,6 +37,7 @@ public class FormalizationController {
     private final BureauConfig config;
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.CaseService caseService;
+    private final cn.ybcase.bureau.service.DocumentService documentService;
 
 
     // ---------- 电子签章 ----------
@@ -281,7 +282,9 @@ public class FormalizationController {
         caseService.assertInScope(caseId, auth.getName(), privileged(auth));
         var cf = jdbc.queryForList("select case_no, name, archive_no, closed_at from case_file where id = ?", caseId);
         if (cf.isEmpty()) throw new BizException(2043, "案件不存在");
-        var docs = jdbc.queryForList("select * from case_document where case_id = ?", caseId);
+        // 与卷内目录同一份数据（含由结构化记录渲染的立案审批表/法制审核意见/集体讨论/
+        // 听证笔录/送达回证），且已按法定装订顺序排好序——否则合成打印出来的"卷宗"缺这五类必备件
+        var docs = documentService.archiveEntries(caseId);
         var sigs = jdbc.queryForList("select * from doc_signature where case_id = ? order by id", caseId);
         return R.ok(Map.of("caseFile", cf.get(0), "documents", docs, "signatures", sigs,
                 "orgName", config.str("org_name", "医疗保障局")));

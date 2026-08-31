@@ -245,6 +245,24 @@ def main():
     ok(closed["status"] == "CLOSED" and closed["closeReason"] == "EXECUTED"
        and closed["archiveNo"], f"已结案归档 案卷号 {closed['archiveNo']}")
 
+    step("卷内目录：结构化法定材料一并进卷（立案审批表/法制审核/集体讨论/送达回证）")
+    _cat = admin.get(f"/bureau/cases/{cid}/archive-catalog")["catalog"]
+    _types = [x["doc_type"] for x in _cat]
+    _need = ["FILING_APPROVAL", "FINAL_REPORT", "NOTICE", "LEGAL_OPINION",
+             "MEETING_RECORD", "DECISION", "DELIVERY_RECEIPT", "CLOSE_REPORT"]
+    _lack = [t for t in _need if t not in _types]
+    ok(not _lack, f"卷内目录含全部必备件（缺 {_lack}）")
+    ok(_types[0] == "FILING_APPROVAL", f"立案审批表排卷首（实为 {_types[0]}）")
+    ok(_types.index("DECISION") < _types.index("DELIVERY_RECEIPT"), f"装订顺序正确 {_types}")
+    ok([x["seq"] for x in _cat] == list(range(1, len(_cat) + 1)), "卷内序号连续")
+    # 虚拟卷内件无 case_document 行：不得带 id（前端据此隐藏签章/送达）
+    ok(all(x["id"] is None for x in _cat if x.get("source") == "RECORD"), "虚拟卷内件不带 id")
+    # 合成打印取的必须是同一份（此前只取 case_document，打出来的卷缺这五类）
+    _full = admin.get(f"/bureau/cases/{cid}/archive-full")["documents"]
+    ok([x["doc_type"] for x in _full] == _types, "合成打印与卷内目录同一份且同序")
+    ok(all(x.get("content") is not None for x in _full if x.get("source") == "RECORD"),
+       "虚拟卷内件带正文可打印")
+
     step("简易程序：自然人罚款300超限拒（2003）；150元当场决定+当场收缴100元")
     case2 = admin.post("/bureau/cases", json={
         "causeId": cause31["id"], "procedureType": "SUMMARY",
@@ -713,6 +731,26 @@ def main():
         "decisionType": "PUNISH", "fineAmount": 100, "content": "当场处罚"})
     sr = admin.post(f"/bureau/cases/{s_case['id']}/summary-record")
     ok(sr["summaryRecordAt"] == str(today), "简易备案完成")
+
+    step("终止调查案件立卷归档（第47/57条）：保留 TERMINATED 状态，重复归档被拒")
+    _tm = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "终止归档案",
+        "partyType": "PROVIDER", "amountInvolved": 1000,
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                     {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]})
+    _tmd = admin.post(f"/bureau/cases/{_tm['id']}/terminate", json={"reason": "违法事实不能成立（第47条）"})
+    ok(_tmd["status"] == "TERMINATED", "案件已终止调查")
+    _arch = admin.post(f"/bureau/cases/{_tm['id']}/close",
+                       json={"closeReport": "经调查违法事实不能成立，终止调查并立卷归档"})
+    ok(_arch["archiveNo"] and _arch["status"] == "TERMINATED"
+       and _arch["closeReason"] == "TERMINATED",
+       f"终止案件已立卷归档 {_arch['archiveNo']}（状态仍为 TERMINATED）")
+    admin.post(f"/bureau/cases/{_tm['id']}/close",
+               json={"closeReport": "再归一次"}, expect_code=2011)
+    # 终止类必备件与处罚类不同：不查 NOTICE/DECISION，查终止调查决定书
+    _tcat = admin.get(f"/bureau/cases/{_tm['id']}/archive-catalog")
+    ok("TERMINATE_DECISION" in _tcat["missing"] and "NOTICE" not in _tcat["missing"],
+       f"终止类按自己的必备清单校验（missing={_tcat['missing']}）")
 
     step("移送台账：线索整体移送后状态 TRANSFERRED + 接收确认")
     t_clue = admin.post("/bureau/clues", json={

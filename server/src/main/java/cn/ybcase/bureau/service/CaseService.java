@@ -173,7 +173,10 @@ public class CaseService {
     @Transactional
     public void addDocument(Long caseId, DocumentReq req) {
         CaseFile c = get(caseId);
-        if ("CLOSED".equals(c.getStatus())) throw new BizException(2031, "案件已结案归档，不可新增文书");
+        // 判"已封卷"用案卷号而非状态：终止调查/移送司法的案件归档后状态仍是 TERMINATED，
+        // 只认 CLOSED 会让这批已立卷的案件还能继续往卷里塞文书
+        if ("CLOSED".equals(c.getStatus()) || c.getArchiveNo() != null)
+            throw new BizException(2031, "案件已立卷归档，不可新增文书");
         jdbc.update("""
                 insert into case_document (case_id, doc_type, title, content, made_at, maker, signed, note, due_at)
                 values (?,?,?,?,?,?,?,?,?)""",
@@ -641,9 +644,42 @@ public class CaseService {
 
     // ---------- 结案（第56-57条） ----------
 
+    /**
+     * 终止调查/移送司法案件的立卷归档（第57条）：保留 TERMINATED 状态，只补案卷号与结案报告。
+     * private 自调用方法标 @Transactional 无效，事务由调用方 close() 承担。
+     */
+    private CaseFile archiveTerminated(CaseFile c, String closeReport, String maker) {
+        if (c.getArchiveNo() != null)
+            throw new BizException(2011, "本案已立卷归档（案卷号 " + c.getArchiveNo() + "）");
+        if (closeReport == null || closeReport.isBlank())
+            throw new BizException(2011, "须填写终止调查/移送情况说明与归档报告（第56/57条）");
+        var d = decisionRepository.findByCaseId(c.getId()).orElse(null);
+        String reason = d != null && String.valueOf(d.getDecisionType()).startsWith("TRANSFER")
+                ? "JUDICIAL" : "TERMINATED";
+        addDocument(c.getId(), new DocumentReq(
+                "CLOSE_REPORT", c.getCaseNo() + " 归档报告", closeReport,
+                LocalDate.now(), maker, false, null, null));
+        if (config.bool("archive_completeness_required", false)) {
+            List<String> missing = documentService.missingRequiredDocs(c.getId());
+            if (!missing.isEmpty())
+                throw new BizException(2052, "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）");
+        }
+        c.setClosedAt(LocalDate.now());
+        c.setCloseReason(reason);
+        c.setArchiveNo(c.getCaseNo() + "卷");
+        return caseRepository.save(c);
+    }
+
     @Transactional
     public CaseFile close(Long caseId, String closeReport, String maker) {
         CaseFile c = get(caseId);
+        // 终止调查（第47条五类情形）与移送司法的案件同样要立卷归档（第57条一案一卷），
+        // 但它们既没有处罚决定、也不在 DECIDED/DELIVERED 状态——此前被"无处理决定"与
+        // 状态白名单双重拦死，拿不到案卷号、产不出结案报告，只能线下手工立卷。
+        // 归档不改变 TERMINATED 状态（终止是案件的真实出口，不应被改写成"已结案"），
+        // 以 archive_no 是否已生成作为"是否已归档"的标志。
+        if ("TERMINATED".equals(c.getStatus())) return archiveTerminated(c, closeReport, maker);
+
         CaseDecision d = decisionRepository.findByCaseId(caseId)
                 .orElseThrow(() -> new BizException(2011, "无处理决定，不能结案"));
         if (!List.of("DECIDED", "DELIVERED").contains(c.getStatus()))

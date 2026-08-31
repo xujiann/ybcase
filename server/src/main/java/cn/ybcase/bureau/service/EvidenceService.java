@@ -85,7 +85,9 @@ public class EvidenceService {
     @Transactional
     public void crossExam(Long caseId, Long evidenceId, String opinion) {
         CaseFile c = CaseGuards.get(caseRepository, caseId);
-        if ("CLOSED".equals(c.getStatus())) throw new BizException(2031, "案件已结案归档");
+        // 同 CaseService.addDocument：已立卷归档以 archive_no 判定，终止类案件状态仍是 TERMINATED
+        if ("CLOSED".equals(c.getStatus()) || c.getArchiveNo() != null)
+            throw new BizException(2031, "案件已立卷归档");
         if (opinion == null || opinion.isBlank()) throw new BizException(2045, "须记录当事人对证据的意见（无异议也须注明）");
         int n = jdbc.update("update case_evidence set cross_exam_opinion = ?, cross_exam_at = ? where id = ? and case_id = ?",
                 opinion, LocalDate.now(), evidenceId, caseId);
