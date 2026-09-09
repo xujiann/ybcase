@@ -103,6 +103,17 @@ public class DocumentService {
      * 去重：同类型若已有手工录入的文书，以手工件为准，不再重复上目录。
      */
     public List<Map<String, Object>> archiveEntries(Long caseId) {
+        return archiveEntries(caseId, true);
+    }
+
+    /** withContent=false 时不返回正文：卷内目录只用类型/标题/日期，正文只有合成打印才需要 */
+    public List<Map<String, Object>> archiveEntries(Long caseId, boolean withContent) {
+        List<Map<String, Object>> all = archiveEntriesFull(caseId);
+        if (!withContent) all.forEach(e -> e.remove("content"));
+        return all;
+    }
+
+    private List<Map<String, Object>> archiveEntriesFull(Long caseId) {
         List<Map<String, Object>> docs = new ArrayList<>(jdbc.queryForList(
                 "select id, doc_type, title, content, made_at, maker, signed from case_document where case_id = ?",
                 caseId));
@@ -127,7 +138,7 @@ public class DocumentService {
     public Map<String, Object> archiveCatalog(Long caseId) {
         CaseFile c = caseRepository.findById(caseId)
                 .orElseThrow(() -> new BizException(2043, "案件不存在"));
-        List<Map<String, Object>> docs = archiveEntries(caseId);
+        List<Map<String, Object>> docs = archiveEntries(caseId, false);
         var decision = decisionRepository.findByCaseId(caseId).orElse(null);
         List<String> required = requiredFor(c, decision);
         List<String> missing = new ArrayList<>();
@@ -164,9 +175,14 @@ public class DocumentService {
      */
     public boolean legalReviewRequired(Long caseId, CaseDecision d) {
         if ("ALL".equalsIgnoreCase(config.str("legal_review_mode", "THRESHOLD"))) return true;
+        // 与 CaseService.punitiveAmount 同口径：没收违法所得计入"数额较大"（参数可关）
         java.math.BigDecimal fine = d == null || d.getFineAmount() == null
                 ? java.math.BigDecimal.ZERO : d.getFineAmount();
-        if (fine.compareTo(config.decimal("legal_review_fine_threshold", "100000")) >= 0) return true;
+        java.math.BigDecimal conf = d == null || d.getConfiscateAmount() == null
+                ? java.math.BigDecimal.ZERO : d.getConfiscateAmount();
+        java.math.BigDecimal punitive = config.bool("threshold_include_confiscate", true)
+                ? fine.add(conf) : fine;
+        if (punitive.compareTo(config.decimal("legal_review_fine_threshold", "100000")) >= 0) return true;
         Integer held = jdbc.queryForObject(
                 "select count(*) from case_notice where case_id = ? and hearing_held_at is not null",
                 Integer.class, caseId);
@@ -290,6 +306,38 @@ public class DocumentService {
     }
 
     /** 卷内件里的日期/时间：时间戳收敛到分钟——微秒精度（2026-08-31 12:41:59.293882）不该进法律文书 */
+    /**
+     * 条文号是否被引用：依据库的 article 用中文数字（第三十八条），
+     * 而执法事项的 basis_refs 用阿拉伯数字，且存在"第38/40条"这类多条并列写法。
+     */
+    public static boolean articleCited(String refs, String art) {
+        int n = cnNum(art.replace("第", "").replace("条", ""));
+        if (n <= 0) return false;
+        if (refs.contains("第" + n + "条")) return true;
+        // 多条并列：第38/40条、第38、40条
+        return java.util.regex.Pattern
+                .compile("第[0-9]+(?:[/、，,][0-9]+)*条")
+                .matcher(refs).results()
+                .anyMatch(m -> java.util.Arrays
+                        .asList(m.group().replace("第", "").replace("条", "").split("[/、，,]"))
+                        .contains(String.valueOf(n)));
+    }
+
+    /** 中文数字转整数：三十八→38、八十七→87、一百零八→108 */
+    public static int cnNum(String s) {
+        String digits = "零一二三四五六七八九";
+        int section = 0, digit = 0;
+        for (char ch : s.toCharArray()) {
+            int d = digits.indexOf(ch);
+            if (d >= 0) { digit = d; continue; }
+            if (Character.isDigit(ch)) { digit = digit * 10 + (ch - '0'); continue; }
+            if (ch == '十') { section += (digit == 0 ? 1 : digit) * 10; digit = 0; continue; }
+            if (ch == '百') { section += (digit == 0 ? 1 : digit) * 100; digit = 0; continue; }
+            return -1;
+        }
+        return section + digit;
+    }
+
     private static String dt(Object v) {
         if (v == null) return "";
         String t = String.valueOf(v);
@@ -349,9 +397,12 @@ public class DocumentService {
         for (var b : jdbc.queryForList("select law_name, article, content from law_basis")) {
             if (refs.contains((String) b.get("law_name")) || refs.contains("《" + b.get("law_name") + "》")) {
                 String art = (String) b.get("article");
-                String shortRef = ((String) b.get("law_name")).replace("中华人民共和国", "");
-                if (refs.contains(art) || refs.contains(art.replace("第", "").replace("条", ""))
-                        || refs.contains(shortRef)) {
+                // 此前这里还有一个 refs.contains(shortRef) 分支：外层已按法名命中，
+                // 短名必然也在 refs 里，该分支恒真 → 条文号过滤是死代码，
+                // 命中一部法律就把该法**全部**条文正文追加进文书正文。
+                // 只按条文号命中：law_basis.article 形如"第三十八条"，
+                // 执法事项的 basis_refs 可能写成"第38条"，两种写法都要认。
+                if (refs.contains(art) || articleCited(refs, art)) {
                     sb.append("\n").append(b.get("law_name")).append(art).append("：").append(b.get("content"));
                 }
             }

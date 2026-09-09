@@ -9,7 +9,7 @@ import java.time.LocalDate;
 import java.util.Map;
 import java.util.Set;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.*;
 
 /** 期限计算与文书渲染纯函数单测（期限是行政复议高发争议点，边界必须钉死） */
 class WorkdaysTest {
@@ -104,5 +104,22 @@ class WorkdaysTest {
         } finally {
             java.util.TimeZone.setDefault(original);   // 不污染同批其它测试
         }
+    }
+
+    @org.junit.jupiter.api.Test
+    void 中文条文号转换与引用判定() {
+        // 曾把"三十八"算成 308（十之后的个位应相加而非移位），使条文过滤全部失配
+        assertEquals(38, cn.ybcase.bureau.service.DocumentService.cnNum("三十八"));
+        assertEquals(87, cn.ybcase.bureau.service.DocumentService.cnNum("八十七"));
+        assertEquals(40, cn.ybcase.bureau.service.DocumentService.cnNum("四十"));
+        assertEquals(10, cn.ybcase.bureau.service.DocumentService.cnNum("十"));
+        assertEquals(108, cn.ybcase.bureau.service.DocumentService.cnNum("一百零八"));
+        assertTrue(cn.ybcase.bureau.service.DocumentService.articleCited(
+                "《医疗保障基金使用监督管理条例》第38条", "第三十八条"));
+        // 多条并列写法
+        assertTrue(cn.ybcase.bureau.service.DocumentService.articleCited("《条例》第38/40条", "第四十条"));
+        // 不被引用的条文不得混入文书（此前过滤是死代码，命中一部法律就把全部条文塞进去）
+        assertFalse(cn.ybcase.bureau.service.DocumentService.articleCited(
+                "《医疗保障基金使用监督管理条例》第38条", "第三十九条"));
     }
 }

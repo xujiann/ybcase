@@ -29,6 +29,7 @@ class GuardIntegrationTest {
     @Autowired cn.ybcase.bureau.service.ProcedureService procedureService;
     @Autowired cn.ybcase.bureau.service.ExecutionService executionService;
     @Autowired cn.ybcase.bureau.service.DocumentService documentService;
+    @Autowired cn.ybcase.bureau.service.EvidenceService evidenceService;
     @Autowired cn.ybcase.core.repository.SysUserRepository sysUserRepository;
     @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
 
@@ -92,7 +93,7 @@ class GuardIntegrationTest {
                 new CaseService.DecisionReq("PUNISH", BigDecimal.ONE, null, null, null, "x", null, "r")));
         assertEquals(2006, e.code);
         caseService.report(c.getId(), "调查终结：集成测试", "it");
-        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("1000"), BigDecimal.ZERO, null));
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("1000"), BigDecimal.ZERO, BigDecimal.ZERO, null));
         var e2 = assertThrows(BizException.class, () -> caseService.decide(c.getId(),
                 new CaseService.DecisionReq("PUNISH", new BigDecimal("2000"), null, null, null, "x", null, "r")));
         assertEquals(2007, e2.code);
@@ -103,7 +104,7 @@ class GuardIntegrationTest {
         CaseFile c = caseService.create(req("IT-听证" + System.nanoTime(), TWO), "it");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("150000"),
-                BigDecimal.ZERO, null));
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
         // 未放弃、未陈述申辩且期限未届满
         var e1 = assertThrows(BizException.class, () -> caseService.decide(c.getId(),
                 new CaseService.DecisionReq("PUNISH", new BigDecimal("150000"), null, null, null, "x", null, "r")));
@@ -121,12 +122,12 @@ class GuardIntegrationTest {
         CaseFile c = caseService.create(req("IT-再告知" + System.nanoTime(), TWO), "it");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚1万", new BigDecimal("10000"),
-                BigDecimal.ZERO, null));
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
         var e = assertThrows(BizException.class, () -> caseService.notify(c.getId(),
-                new CaseService.NoticeReq("改拟罚10万", new BigDecimal("100000"), BigDecimal.ZERO, null)));
+                new CaseService.NoticeReq("改拟罚10万", new BigDecimal("100000"), BigDecimal.ZERO, BigDecimal.ZERO, null)));
         assertEquals(2077, e.code);
         caseService.notify(c.getId(), new CaseService.NoticeReq("改拟罚10万", new BigDecimal("100000"),
-                BigDecimal.ZERO, "复核发现新增违法事实，认定金额变更"));
+                BigDecimal.ZERO, BigDecimal.ZERO, "复核发现新增违法事实，认定金额变更"));
         // 决定仍以历次告知最低额为上限
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         var e2 = assertThrows(BizException.class, () -> caseService.decide(c.getId(),
@@ -138,7 +139,7 @@ class GuardIntegrationTest {
     void 审批单流转_延期申请批准后期限顺延() {
         CaseFile c = caseService.create(req("IT-审批" + System.nanoTime(), TWO), "banban");
         long id = approvalService.apply(new ApprovalService.ApplyReq(
-                "EXTEND", null, c.getId(), Map.of("days", 10), "案情复杂"), "banban");
+                "EXTEND", null, c.getId(), Map.of("days", 10), "案情复杂"), "banban", true);
         var result = approvalService.decide(id, true, "同意", "juzhang");
         assertTrue((Boolean) result.get("approved"));
         CaseFile after = caseService.get(c.getId());
@@ -160,7 +161,7 @@ class GuardIntegrationTest {
                         "officers", List.of(
                                 Map.of("name", "王办案", "certNo", "YB001", "duty", "LEAD"),
                                 Map.of("name", "张协办", "certNo", "YB002", "duty", "MEMBER"))),
-                "立案审批表"), "banban");
+                "立案审批表"), "banban", true);
         var result = approvalService.decide(id, true, "同意立案", "juzhang");
         assertTrue((Boolean) result.get("approved"));
     }
@@ -227,7 +228,7 @@ class GuardIntegrationTest {
         CaseFile c = caseService.create(req("IT-听证时序" + System.nanoTime(), TWO), "it");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new java.math.BigDecimal("150000"),
-                java.math.BigDecimal.ZERO, null));
+                java.math.BigDecimal.ZERO, BigDecimal.ZERO, null));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, true, null, null));
         // 通知日回拨 8 天、计划日在未来 → 满足"通知满7日"但未到计划日
         procedureService.scheduleHearing(c.getId(), new cn.ybcase.bureau.service.ProcedureService.HearingScheduleReq(
@@ -243,7 +244,7 @@ class GuardIntegrationTest {
         CaseFile c = caseService.create(req("IT-公开守卫" + System.nanoTime(), TWO), "it");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟不予处罚", java.math.BigDecimal.ZERO,
-                java.math.BigDecimal.ZERO, null));
+                java.math.BigDecimal.ZERO, BigDecimal.ZERO, null));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         caseService.decide(c.getId(), new CaseService.DecisionReq("NO_PUNISH", null, null, null, null,
                 "不予处罚", null, null));
@@ -259,7 +260,7 @@ class GuardIntegrationTest {
         CaseFile c = caseService.create(req("IT-分期结案" + System.nanoTime(), TWO), "it");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("5000"),
-                BigDecimal.ZERO, null));
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("5000"),
                 BigDecimal.ZERO, null, null, "罚款5000", null, "一般情形"));
@@ -295,7 +296,7 @@ class GuardIntegrationTest {
         CaseFile c = caseService.create(req("IT-退基分期" + System.nanoTime(), TWO), "it");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟退回基金", BigDecimal.ZERO,
-                new BigDecimal("6000"), null));
+                new BigDecimal("6000"), BigDecimal.ZERO, null));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", BigDecimal.ZERO,
                 new BigDecimal("6000"), null, null, "责令退回基金6000", null, "一般情形"));
@@ -339,10 +340,10 @@ class GuardIntegrationTest {
         approvalService.recordDirect("FILE_CASE", c.getId(), "直接立案", "juzhang");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("2000"),
-                BigDecimal.ZERO, null));
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
         // 再告知加重须载明变更理由（第52条）——这两条告知记录都必须留在案卷里
         caseService.notify(c.getId(), new CaseService.NoticeReq("改拟罚1500", new BigDecimal("1500"),
-                BigDecimal.ZERO, "复核后调整认定金额"));
+                BigDecimal.ZERO, BigDecimal.ZERO, "复核后调整认定金额"));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         var rv = caseService.submitReview(c.getId(), "重大案件");
         caseService.doReview(rv.getId(), "李法制", "AGREE", "程序合法");
@@ -392,7 +393,7 @@ class GuardIntegrationTest {
         approvalService.recordDirect("FILE_CASE", c.getId(), "直接立案", "juzhang");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("5000"),
-                BigDecimal.ZERO, null));
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("5000"),
                 BigDecimal.ZERO, null, null, "罚款5000", null, "一般情形"));   // 未经法制审核即可决定
@@ -421,7 +422,7 @@ class GuardIntegrationTest {
         CaseFile c = caseService.create(req("IT-不予处罚" + System.nanoTime(), TWO), "it");
         caseService.report(c.getId(), "调查终结", "it");
         caseService.notify(c.getId(), new CaseService.NoticeReq("拟不予处罚", BigDecimal.ZERO,
-                BigDecimal.ZERO, null));
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         caseService.decide(c.getId(), new CaseService.DecisionReq("NO_PUNISH", BigDecimal.ZERO,
                 BigDecimal.ZERO, null, null, "违法行为轻微并及时改正，不予行政处罚", null, null));
@@ -435,10 +436,80 @@ class GuardIntegrationTest {
     }
 
     @Test
+    void 已完成的扣除按天顺延办案期限() {
+        // 扣除区间必须落在 [立案日, 今天] 内，故把立案日回拨 30 天再登记一段已完成的鉴定期间
+        CaseFile c = caseService.create(req("IT-扣除顺延" + System.nanoTime(), TWO), "it");
+        jdbc.update("update case_file set filed_at = filed_at - 30 where id = ?", c.getId());
+        java.time.LocalDate deadline = caseService.get(c.getId()).getDeadlineAt();
+        caseService.addExclusion(c.getId(), new CaseService.ExclusionReq("APPRAISE",
+                java.time.LocalDate.now().minusDays(10), java.time.LocalDate.now().minusDays(5), "鉴定已完成"));
+        var d = caseService.detail(c.getId());
+        assertEquals(deadline.plusDays(5).toString(), String.valueOf(d.get("effectiveDeadline")),
+                "5 日扣除应使有效期限顺延 5 日");
+    }
+
+    @Test
+    void 期限扣除结束日不得晚于今天() {
+        // 此前只校验起始日不得晚于今天，结束日无上界：填一个远期结束日即可一次性
+        // 扣掉上限天数（默认180日），等于绕开"延期须负责人批准"
+        CaseFile c = caseService.create(req("IT-扣除上界" + System.nanoTime(), TWO), "it");
+        var e = assertThrows(BizException.class, () -> caseService.addExclusion(c.getId(),
+                new CaseService.ExclusionReq("EXPERT", java.time.LocalDate.now().minusDays(1),
+                        java.time.LocalDate.now().plusDays(60), "远期结束日")));
+        assertEquals(2032, e.code);
+    }
+
+    @Test
+    void 没收违法所得计入数额较大阈值() {
+        // 罚款填 0 + 巨额没收：此前三道"数额较大"门槛（听证告知/法制审核/集体讨论）
+        // 都只按罚款额比对，可全部跳过
+        CaseFile c = caseService.create(req("IT-没收阈值" + System.nanoTime(), TWO), "it");
+        caseService.report(c.getId(), "调查终结", "it");
+        var n = caseService.notify(c.getId(), new CaseService.NoticeReq("拟没收15万",
+                BigDecimal.ZERO, BigDecimal.ZERO, new BigDecimal("150000"), null));
+        assertTrue(Boolean.TRUE.equals(n.getHearingEntitled()),
+                "罚款0+没收15万应达听证告知标准（默认阈值10万）");
+    }
+
+    @Test
+    void 已归档案卷不得再写集体讨论与陈述申辩() {
+        CaseFile c = caseService.create(req("IT-封卷补写" + System.nanoTime(), TWO), "it");
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", new BigDecimal("1000"),
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
+        caseService.terminate(c.getId(), "违法事实不能成立");
+        caseService.close(c.getId(), "终止调查并立卷归档", "it");
+        assertEquals(2031, assertThrows(BizException.class, () -> caseService.addMeeting(c.getId(),
+                new CaseService.MeetingReq(java.time.LocalDate.now(), "甲乙丙", "补写", "补写"))).code);
+        assertEquals(2031, assertThrows(BizException.class, () -> caseService.recordStatement(c.getId(),
+                new CaseService.StatementReq("归档后补写", null, null, null, null))).code);
+    }
+
+    @Test
+    void 结案时解除仍在生效的封存() {
+        // updateSeal 限案件在办状态，进入 DECIDED 后就再也解不掉；
+        // 结案时不解除的话，督办看板的"封存到期"会对已办结案件永久常亮
+        CaseFile c = caseService.create(req("IT-封存终态" + System.nanoTime(), TWO), "it");
+        evidenceService.addEvidence(c.getId(), new cn.ybcase.bureau.service.EvidenceService.EvidenceReq(
+                "OTHER_MATERIAL", "被封存的账册", "现场取得", java.time.LocalDate.now(),
+                "王办案", null, false, true));
+        caseService.report(c.getId(), "调查终结", "it");
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟不予处罚", BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, null));
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        caseService.decide(c.getId(), new CaseService.DecisionReq("NO_PUNISH", BigDecimal.ZERO,
+                BigDecimal.ZERO, null, null, "违法行为轻微，不予处罚", null, null));
+        caseService.close(c.getId(), "不予处罚，结案归档", "it");
+        Integer sealed = jdbc.queryForObject(
+                "select count(*) from case_evidence where case_id = ? and sealed = true", Integer.class, c.getId());
+        assertEquals(0, sealed, "结案后不应再有处于封存中的证据");
+    }
+
+    @Test
     void 审批驳回不执行动作() {
         CaseFile c = caseService.create(req("IT-驳回" + System.nanoTime(), TWO), "banban");
         long id = approvalService.apply(new ApprovalService.ApplyReq(
-                "SUSPEND", null, c.getId(), null, "待鉴定"), "banban");
+                "SUSPEND", null, c.getId(), null, "待鉴定"), "banban", true);
         approvalService.decide(id, false, "理由不足", "juzhang");
         assertEquals("INVESTIGATING", caseService.get(c.getId()).getStatus());
     }

@@ -173,10 +173,7 @@ public class CaseService {
     @Transactional
     public void addDocument(Long caseId, DocumentReq req) {
         CaseFile c = get(caseId);
-        // 判"已封卷"用案卷号而非状态：终止调查/移送司法的案件归档后状态仍是 TERMINATED，
-        // 只认 CLOSED 会让这批已立卷的案件还能继续往卷里塞文书
-        if ("CLOSED".equals(c.getStatus()) || c.getArchiveNo() != null)
-            throw new BizException(2031, "案件已立卷归档，不可新增文书");
+        CaseGuards.requireNotArchived(c);
         jdbc.update("""
                 insert into case_document (case_id, doc_type, title, content, made_at, maker, signed, note, due_at)
                 values (?,?,?,?,?,?,?,?,?)""",
@@ -204,6 +201,10 @@ public class CaseService {
         if (req.endAt() != null) {
             if (req.endAt().isBefore(req.startAt()))
                 throw new BizException(2032, "结束日期不得早于起始日期");
+            // 与起始日对称的上界：扣除的是"已经发生"的期间。此前不限未来，
+            // 填一个远期结束日即可一次性扣掉上限天数（默认180日），等于绕开"延期须负责人批准"
+            if (req.endAt().isAfter(LocalDate.now()))
+                throw new BizException(2032, "结束日期不得晚于今天；事由尚未结束的请留空结束日期，结束后再补登");
             long span = ChronoUnit.DAYS.between(req.startAt(), req.endAt()) + 1;
             int max = config.intVal("exclusion_max_days", 180);
             if (span > max)
@@ -348,7 +349,17 @@ public class CaseService {
 
     // ---------- 处罚告知/陈述申辩/听证（第41条） ----------
 
-    public record NoticeReq(String content, BigDecimal proposedFine, BigDecimal proposedRecoup,
+    /**
+     * 处罚性金额＝罚款＋没收违法所得（参数 threshold_include_confiscate 可关）。
+     * 没收违法所得与罚款同属行政处罚种类，只按罚款额比对"数额较大"，
+     * 会让"罚款填 0 + 巨额没收"同时跳过听证告知、法制审核与集体讨论三道门槛。
+     * 该口径最终由局方确定，故做成参数，默认计入。
+     */
+    BigDecimal punitiveAmount(BigDecimal fine, BigDecimal confiscate) {
+        return config.bool("threshold_include_confiscate", true) ? nz(fine).add(nz(confiscate)) : nz(fine);
+    }
+
+    public record NoticeReq(String content, BigDecimal proposedFine, BigDecimal proposedRecoup, BigDecimal proposedConfiscate,
                             String changeReason) {}
 
     @Transactional
@@ -382,8 +393,10 @@ public class CaseService {
         int stmtDays = config.intVal("statement_deadline_days", 3);
         if (stmtDays > 0) n.setStatementDeadline(LocalDate.now().plusDays(stmtDays));
         // 拟罚款达到听证标准（按当事人类型分档，辽46条）：告知听证权利
-        n.setHearingEntitled(nz(req.proposedFine()).compareTo(config.byPartyType(c.getPartyType(),
-                "hearing_threshold_individual", "hearing_threshold_org", "100000")) >= 0);
+        n.setProposedConfiscate(nz(req.proposedConfiscate()));
+        n.setHearingEntitled(punitiveAmount(nz(req.proposedFine()), nz(req.proposedConfiscate()))
+                .compareTo(config.byPartyType(c.getPartyType(),
+                        "hearing_threshold_individual", "hearing_threshold_org", "100000")) >= 0);
         noticeRepository.save(n);
         c.setStatus("NOTIFIED");
         caseRepository.save(c);
@@ -396,6 +409,7 @@ public class CaseService {
 
     @Transactional
     public CaseNotice recordStatement(Long caseId, StatementReq req) {
+        CaseGuards.requireNotArchived(get(caseId));
         CaseNotice n = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
                 .orElseThrow(() -> new BizException(2006, "尚未作出处罚告知"));
         // 辽44条：期限内未行使陈述权、申辩权的，视为放弃
@@ -431,7 +445,7 @@ public class CaseService {
 
     @Transactional
     public void addMeeting(Long caseId, MeetingReq req) {
-        get(caseId);
+        CaseGuards.requireNotArchived(get(caseId));
         if (req.attendees() == null || req.attendees().isBlank())
             throw new BizException(2047, "须记录集体讨论参加人员（第44条）");
         if (req.conclusion() == null || req.conclusion().isBlank())
@@ -509,7 +523,8 @@ public class CaseService {
                         + " 届满前不得作出处罚决定（第41条）；当事人已陈述申辩或明确放弃的，请先录入陈述申辩记录");
             // 法制审核：THRESHOLD=数额较大或经听证必审（国家37条）；ALL=全案必审（辽40条）
             boolean needReview = "ALL".equalsIgnoreCase(config.str("legal_review_mode", "THRESHOLD"))
-                    || fine.compareTo(cfgDecimal("legal_review_fine_threshold")) >= 0
+                    || punitiveAmount(fine, nz(req.confiscateAmount()))
+                            .compareTo(cfgDecimal("legal_review_fine_threshold")) >= 0
                     || notice.getHearingHeldAt() != null;
             if (needReview) {
                 CaseReview review = reviewRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
@@ -529,7 +544,8 @@ public class CaseService {
                 BigDecimal meetingThreshold = config.byPartyType(c.getPartyType(),
                         "meeting_required_fine_individual", "meeting_required_fine_org", "100000");
                 // 空壳讨论记录不算数：须有实质内容且经签字确认（第44条集体讨论决定）
-                if (fine.compareTo(meetingThreshold) >= 0 && !hasValidMeeting(caseId))
+                if (punitiveAmount(fine, nz(req.confiscateAmount())).compareTo(meetingThreshold) >= 0
+                        && !hasValidMeeting(caseId))
                     throw new BizException(2047, "较大数额罚款（≥" + meetingThreshold + "元）应当经负责人集体讨论决定，请先录入讨论记录（辽54条/局令44条）");
             }
             // 辽44条：裁量性处罚决定应说明裁量考虑因素（参数开关）
@@ -621,8 +637,12 @@ public class CaseService {
         // 辽56条：公开的是"行政处罚决定"，且应在决定书送达后（未送达即公开会侵害当事人陈述救济权）
         if (!"PUNISH".equals(d.getDecisionType()))
             throw new BizException(2042, "仅行政处罚决定需要依法公开（当前决定类型：" + d.getDecisionType() + "）");
-        if (cf.getDeliveredAt() == null)
-            throw new BizException(2042, "处罚决定书尚未送达，不得先行公开（辽56条）");
+        // 公告送达的 deliveredAt 记的是"公告期满之日"，是个未来日期；只判非空
+        // 会让公告一登记就能立刻公开，比法定生效早整整一个公告期（默认60日）
+        if (cf.getDeliveredAt() == null || cf.getDeliveredAt().isAfter(LocalDate.now()))
+            throw new BizException(2042, "处罚决定书尚未送达"
+                    + (cf.getDeliveredAt() == null ? "" : "（公告送达期满日 " + cf.getDeliveredAt() + "）")
+                    + "，不得先行公开（辽56条）");
         // 幂等：重复调用会把公开日期刷成当天，把"7日内公开"的超期证据洗白（第56条监督链）
         if (Boolean.TRUE.equals(d.getPublished()) && d.getPublishedAt() != null)
             throw new BizException(2042, "该决定已于 " + d.getPublishedAt() + " 公开，不可重复登记");
@@ -664,6 +684,7 @@ public class CaseService {
             if (!missing.isEmpty())
                 throw new BizException(2052, "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）");
         }
+        jdbc.update("update case_evidence set sealed = false, register_hold = false where case_id = ?", c.getId());
         c.setClosedAt(LocalDate.now());
         c.setCloseReason(reason);
         c.setArchiveNo(c.getCaseNo() + "卷");
@@ -711,6 +732,10 @@ public class CaseService {
                 throw new BizException(2052, "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）");
         }
 
+        // 结案即解除仍在生效的强制措施（第31条封存、第26条先行登记保存）：
+        // updateSeal 限案件在办状态，进入 DECIDED 后就再也解不掉，
+        // 结案时不解除的话，督办看板的"封存到期"会对已办结案件永久常亮
+        jdbc.update("update case_evidence set sealed = false, register_hold = false where case_id = ?", caseId);
         c.setStatus("CLOSED");
         c.setClosedAt(LocalDate.now());
         c.setCloseReason(closeReason);

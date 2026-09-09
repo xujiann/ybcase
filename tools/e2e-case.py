@@ -158,11 +158,18 @@ def main():
     admin.post(f"/bureau/cases/{cid}/documents", json={
         "docType": "INQUIRY_RECORD", "title": "对该院医保办主任的询问笔录",
         "content": "问：……答：……", "madeAt": str(today), "maker": "王办案", "signed": True})
+    # 扣除的是"已经发生"的期间：当天立案的案件不可能已完成 5 日鉴定，
+    # 正在进行中的事由留空结束日（服务端按 current_date 计算），事由结束后再补登。
+    # 原来这里填的是 today+5 —— 只有靠"结束日不限未来"这个洞才成立，
+    # 而那个洞意味着填个远期结束日即可一次扣满上限，绕开"延期须负责人批准"。
     admin.post(f"/bureau/cases/{cid}/exclusions", json={
-        "reason": "APPRAISE", "startAt": str(today), "endAt": str(today + datetime.timedelta(days=5)),
-        "note": "委托会计师事务所专项审计"})
+        "reason": "APPRAISE", "startAt": str(today),
+        "endAt": str(today + datetime.timedelta(days=5))}, expect_code=2032)
+    admin.post(f"/bureau/cases/{cid}/exclusions", json={
+        "reason": "APPRAISE", "startAt": str(today), "note": "委托会计师事务所专项审计（进行中）"})
     detail = admin.get(f"/bureau/cases/{cid}")
-    ok(detail["effectiveDeadline"] == str(today + datetime.timedelta(days=95)), "有效期限含扣除 95 日")
+    ok(detail["effectiveDeadline"] == str(today + datetime.timedelta(days=90)),
+       "进行中的扣除尚未产生顺延（期限仍为 90 日）")
 
     step("程序顺序守卫：终结前告知拒（2004）；告知前决定拒（2006）")
     admin.post(f"/bureau/cases/{cid}/notice",
@@ -332,6 +339,10 @@ def main():
                   "sealExpiring", "paymentOverdue", "urgeLetterMissing", "courtEnforceExpiring"]
     _missing = [k for k in _WARN_KEYS if k not in sup]
     ok(not _missing, f"督办看板 16 类预警键齐全（缺 {_missing}）")
+    # 每类都有上界：此前 16 类全部无上界，真实数据量下一次返回六千余行、前端要渲染四万多个节点
+    ok("topN" in sup and "truncated" in sup, "督办看板返回截断契约（topN/truncated）")
+    _over = {k: len(sup[k]) for k in _WARN_KEYS if len(sup[k]) > sup["topN"]}
+    ok(not _over, f"各类预警条数不超过 topN={sup['topN']}（超出 {_over}）")
 
     step("线索不予立案闭环")
     clue2 = admin.post("/bureau/clues", json={
@@ -1173,13 +1184,20 @@ def main():
         "reason": "APPRAISE", "startAt": str(today),
         "endAt": str(today - datetime.timedelta(days=1))}, expect_code=2032)
     admin.post(f"/bureau/cases/{exid}/exclusions", json={
+        "reason": "APPRAISE", "startAt": str(today - datetime.timedelta(days=400)),
+        "endAt": str(today)}, expect_code=2032)
+    # 结束日不得晚于今天：扣除的是已经发生的期间，否则填个远期结束日即可一次扣满上限，
+    # 等于绕开"延期须负责人批准"
+    admin.post(f"/bureau/cases/{exid}/exclusions", json={
         "reason": "APPRAISE", "startAt": str(today),
-        "endAt": str(today + datetime.timedelta(days=400))}, expect_code=2032)
+        "endAt": str(today + datetime.timedelta(days=5))}, expect_code=2032)
+    # 事由尚未结束的留空结束日期（服务端按 current_date 计算）。
+    # 注意本案今日立案：起始日不得早于立案日，故不能构造"过去已完成"的区间——
+    # 已完成扣除对期限的顺延由集成测试（可回拨立案日）覆盖。
     admin.post(f"/bureau/cases/{exid}/exclusions", json={
-        "reason": "APPRAISE", "startAt": str(today), "endAt": str(today + datetime.timedelta(days=5))})
+        "reason": "APPRAISE", "startAt": str(today)})
     admin.post(f"/bureau/cases/{exid}/exclusions", json={
-        "reason": "TEST", "startAt": str(today), "endAt": str(today + datetime.timedelta(days=2))},
-        expect_code=2032)
+        "reason": "TEST", "startAt": str(today)}, expect_code=2032)
     print("    PASS: 立案前/缺起始/倒挂/超上限/重叠 全部拒绝")
 
     step("审批单裁决幂等：同一单二次裁决拒（防双击双执行）")

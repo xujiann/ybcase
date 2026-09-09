@@ -49,15 +49,13 @@
         </template>
         <template v-if="c.status === 'NOTIFIED'">
           <el-button v-if="isLeader" type="primary" @click="openDecide">作出决定</el-button>
-          <el-button @click="dlg.statement = true">陈述申辩/听证</el-button>
+          <el-button @click="openStatement">陈述申辩/听证</el-button>
           <el-button @click="onSubmitReview">提交法制审核</el-button>
           <el-button v-if="isLeader" @click="onExtendCase">延长期限</el-button>
           <el-button v-else @click="dlg.apply = true">申请延期</el-button>
         </template>
         <template v-if="c.status === 'DECIDED'">
           <el-button type="primary" @click="dlg.deliver = true">登记送达</el-button>
-          <el-button v-if="c.procedureType === 'SUMMARY' && !c.summaryRecordAt" @click="onSummaryRecord">简易程序备案</el-button>
-          <el-button v-if="!c.eDeliveryConsent" @click="dlg.eConsent = true">电子送达确认书</el-button>
           <el-button @click="dlg.execution = true">登记执行</el-button>
           <el-button v-if="isLeader" @click="onCloseCase">结案</el-button>
         </template>
@@ -66,6 +64,14 @@
         <template v-if="c.status === 'TERMINATED' && !c.archiveNo">
           <el-button v-if="isLeader" type="primary" @click="onArchiveTerminated">立卷归档</el-button>
         </template>
+        <!-- 下面两项的有效期跨越 DECIDED 与 DELIVERED，不能嵌在按状态分支的 template 里：
+             简易备案是"决定后7个工作日内"（第51条），登记送达后仍须办；
+             电子送达确认书在决定作出前的文书送达同样要用。此前都只在 DECIDED 分支出现，
+             一旦登记送达入口就永久消失，而督办看板的"简易备案超期"会一直常亮无解。 -->
+        <el-button v-if="c.procedureType === 'SUMMARY' && c.decidedAt && !c.summaryRecordAt"
+                   @click="onSummaryRecord">简易程序备案</el-button>
+        <el-button v-if="!c.eDeliveryConsent && !['CLOSED', 'TERMINATED'].includes(c.status)"
+                   @click="dlg.eConsent = true">电子送达确认书</el-button>
         <template v-if="c.status === 'DELIVERED'">
           <el-button type="primary" @click="dlg.execution = true">登记执行</el-button>
           <el-button @click="onLateFee">加处罚款测算</el-button>
@@ -474,6 +480,10 @@
       <el-form label-width="110px">
         <el-form-item label="拟罚款金额"><el-input-number v-model="noticeForm.proposedFine" :min="0" :precision="2" style="width: 200px" /></el-form-item>
         <el-form-item label="拟追回基金"><el-input-number v-model="noticeForm.proposedRecoup" :min="0" :precision="2" style="width: 200px" /></el-form-item>
+        <el-form-item label="拟没收违法所得">
+          <el-input-number v-model="noticeForm.proposedConfiscate" :min="0" :precision="2" style="width: 200px" />
+          <div class="hint">与罚款合计参与"数额较大"判定（听证告知/法制审核/集体讨论）</div>
+        </el-form-item>
         <el-form-item label="变更理由">
           <el-input v-model="noticeForm.changeReason" type="textarea" :rows="2"
                     placeholder="仅再次告知且金额高于前次时必填：说明改变原认定事实、证据或依据的理由（辽52条）" />
@@ -793,8 +803,10 @@ const officerForm = reactive({ name: '', certNo: '', duty: 'MEMBER' })
 const evidenceForm = reactive({ type: 'DOCUMENT', name: '', source: '', obtainedAt: today, keeper: '', note: '', registerHold: false, sealed: false })
 const documentForm = reactive<any>({ docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false, dueAt: null })
 const exclusionForm = reactive({ reason: 'APPRAISE', startAt: today, endAt: today, note: '' })
-const noticeForm = reactive<any>({ content: '', proposedFine: 0, proposedRecoup: 0, changeReason: '' })
+const noticeForm = reactive<any>({ content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '' })
 const statementForm = reactive<any>({ statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null, statementWaived: false })
+/** 打开弹窗时的回填快照，提交时据此只发改动过的字段 */
+let statementSnapshot: any = { ...statementForm }
 const meetingForm = reactive({ heldAt: today, attendees: '', record: '', conclusion: '' })
 const decisionForm = reactive({ decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
 const deliveryForm = reactive({ method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null as string | null })
@@ -1019,8 +1031,25 @@ async function submit(path: string, body: any, dlgKey: string) {
 }
 
 async function onAvoid(row: any) {
-  const { value } = await ElMessageBox.prompt('回避事由（第5条）', '申请回避', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/cases/${id.value}/officers/${row.id}/avoid`, { reason: value })
+  // 后端按"申请主体 + 是否主办"分档要求批准人（第5条）：当事人申请、或主办人员回避，
+  // 都须记录负责人批准。此前只发 reason，这两种情形 100% 被 2061 拒，
+  // 而本人主动回避又被默认记成 SELF，当事人申请回避这一法定情形在系统里留不下痕迹。
+  const applicant = await ElMessageBox.confirm(
+    '本次回避是当事人申请的，还是办案人员主动申请？', '申请回避（第5条）',
+    { confirmButtonText: '当事人申请', cancelButtonText: '本人主动', distinguishCancelAndClose: true })
+    .then(() => 'PARTY').catch((a) => { if (a === 'close') throw a; return 'SELF' })
+  const { value: reason } = await ElMessageBox.prompt('回避事由（第5条）', '申请回避',
+    { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  let decidedBy: string | undefined
+  if (applicant === 'PARTY' || row.duty === 'LEAD') {
+    const r = await ElMessageBox.prompt(
+      applicant === 'PARTY' ? '当事人申请回避须经负责人审查决定，请填写批准人'
+                            : '主办人员回避须经负责人批准，请填写批准人',
+      '批准人', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+    decidedBy = r.value
+  }
+  await client.post(`/bureau/cases/${id.value}/officers/${row.id}/avoid`,
+    { reason, applicant, decidedBy })
   ElMessage.success('已回避')
   load()
 }
@@ -1141,8 +1170,42 @@ async function onNotify() {
   load()
 }
 
+/**
+ * 打开前必须从最新告知记录回填。后端 recordStatement 是"null 才不修改"的偏更新语义，
+ * 而本弹窗此前恒以空白初值打开并整表提交：
+ *  - 发 hearingRequested:false 会把当事人已申请的听证静默改成"未申请"，
+ *    之后既排不了期（2039），decide() 的 2075 守卫也随之失效；
+ *  - 发 statement:"" 是非 null，2076 守卫判的是 getStatement()==null，一次空白保存即解除
+ *    "陈述申辩期届满前不得作出处罚决定"；且此后任何保存都会撞 2046，复核意见再也补不上。
+ */
+function openStatement() {
+  const n = detail.value?.notices?.[0] || {}
+  Object.assign(statementForm, {
+    statement: n.statement ?? '',
+    statementReview: n.statement_review ?? '',
+    hearingRequested: n.hearing_requested ?? false,
+    hearingHeldAt: n.hearing_held_at ?? null,
+    statementWaived: n.statement_waived ?? false,
+  })
+  statementSnapshot = { ...statementForm }
+  dlg.statement = true
+}
+
 async function onStatement() {
-  await client.post(`/bureau/cases/${id.value}/statement`, statementForm)
+  // 只发真正被改动的字段，未改动的一律发 null（后端语义＝不修改）。
+  // 不能简单地"只发真值"：那样取消勾选听证申请就永远提交不上去。
+  const body: any = {}
+  for (const k of ['statement', 'statementReview', 'hearingRequested', 'hearingHeldAt', 'statementWaived']) {
+    const v = (statementForm as any)[k]
+    if (v === (statementSnapshot as any)[k]) { body[k] = null; continue }
+    // 空串归一为 null：否则等于向后端声明"当事人已陈述申辩"
+    body[k] = v === '' ? null : v
+  }
+  if (Object.values(body).every((v) => v === null)) {
+    ElMessage.info('没有需要保存的改动')
+    return
+  }
+  await client.post(`/bureau/cases/${id.value}/statement`, body)
   ElMessage.success('已保存')
   dlg.statement = false
   load()
@@ -1153,6 +1216,7 @@ function openDecide() {
   if (n) {
     decisionForm.fineAmount = n.proposedFine
     decisionForm.recoupAmount = n.proposedRecoup
+    decisionForm.confiscateAmount = n.proposedConfiscate ?? 0
   }
   dlg.decide = true
 }
@@ -1349,7 +1413,7 @@ function resetCaseLocalForms() {
   Object.values(FORM_RESETS).forEach((reset) => reset())
   // 复位对象必须与 759-764 行的初值逐字段对齐：漏掉 statementWaived 会把 A 案的"明确放弃陈述申辩"
   // 带进 B 案，一次误提交就在 B 案案卷里写下当事人放弃陈述申辩的假事实并解除 2076 守卫
-  Object.assign(noticeForm, { content: '', proposedFine: 0, proposedRecoup: 0, changeReason: '' })
+  Object.assign(noticeForm, { content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '' })
   Object.assign(statementForm, { statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null, statementWaived: false })
   Object.assign(decisionForm, { decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '' })
   Object.assign(deliveryForm, { method: 'DIRECT', deliveredAt: today, receiver: '', note: '', receiptNo: '', receiptSignedAt: null })

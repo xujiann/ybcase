@@ -26,10 +26,21 @@ echo "[3/5] Docker 构建前端(Node,缓存 node_modules)"
 docker run --rm -v "$SRC":/app -v ybcase_npm:/app/frontend/node_modules -w /app/frontend \
     node:22-alpine sh -c "npm ci --no-audit --no-fund && npm run build"
 
+# 备份提前到落盘之前：upgrade.sh 里的 pg_dump + pg_restore --list 校验随库增长可达数分钟，
+# 夹在"新产物已就位、容器还没重建"之间会把上面那段不一致窗口整体拉长。
+echo "[4/5] 升级前备份（回滚依据）"
+if [ -x "$DEPLOY/backup.sh" ]; then (cd "$DEPLOY" && ./backup.sh); fi
+
 echo "[4/5] 部署构建产物到 $DEPLOY"
 # 回滚点必须在覆盖之前留存：upgrade.sh 里再存就已经是新 jar 了（回滚等于没回滚）
 if [ -f "$DEPLOY/ybcase-server.jar" ]; then cp -f "$DEPLOY/ybcase-server.jar" "$DEPLOY/ybcase-server.jar.prev"; fi
-cp "$SRC"/server/target/ybcase-server-*.jar "$DEPLOY/ybcase-server.jar"
+# 必须换 inode 而非原地改写：该 jar 被 bind mount 进**正在运行**的 app 容器，
+# 而 Spring Boot fat jar 的类与资源是惰性读的（LaunchedClassLoader 全程持有该 fd）。
+# 原地 cp（O_TRUNC）会让旧 JVM 在"覆盖完成→容器重建"这段时间里从新 jar 的旧偏移量读字节，
+# 表现为随机 ZipException/NoClassDefFoundError，而健康检查仍报 UP。
+# mv 是同分区内的原子 rename：旧进程继续读旧 inode，直到容器重建才切换。
+cp "$SRC"/server/target/ybcase-server-*.jar "$DEPLOY/ybcase-server.jar.new"
+mv -f "$DEPLOY/ybcase-server.jar.new" "$DEPLOY/ybcase-server.jar"
 # 前端原地更新目录内容,不整体替换目录——否则换掉 inode 会让 Caddy 的 bind mount 失效(404)
 mkdir -p "$DEPLOY/dist"
 rm -rf "$DEPLOY/dist"/* "$DEPLOY/dist"/.[!.]* 2>/dev/null || true
@@ -40,7 +51,7 @@ cp -r "$SRC/frontend/dist/." "$DEPLOY/dist/"
 cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh
 cp "$SRC"/deploy/docker-compose.yml "$SRC"/deploy/Caddyfile "$DEPLOY/"
 
-echo "[5/5] 备份 + 重启 + 健康检查"
-cd "$DEPLOY" && ./upgrade.sh
+echo "[5/5] 重启 + 健康检查"
+cd "$DEPLOY" && ./upgrade.sh --skip-backup
 # 编排配置若有变更（时区/挂载/日志），需让 db 与 caddy 也应用新配置
 sudo docker compose up -d

@@ -53,9 +53,11 @@ public class BureauAuditFilter extends OncePerRequestFilter {
             boolean sensitiveRead = "GET".equals(request.getMethod())
                     && (uri.contains("/download") || uri.contains("/publish-export") || uri.startsWith("/api/audit")
                         || uri.contains("/screenshot") || uri.contains("/archive-full"));
+            // 登录（含失败）必须留痕：此前被显式排除，等保要求的"谁在什么时候从哪台机器登录"
+            // 在审计里完全查不到，账号被爆破也无从追溯。过滤器只记
+            // method/path/status/ip/request_id，不读请求体，不存在凭据泄露。
             if ((WRITE_METHODS.contains(request.getMethod()) || sensitiveRead)
-                    && uri.startsWith("/api")
-                    && !uri.equals("/api/auth/login")) {
+                    && uri.startsWith("/api")) {
                 try {
                     Authentication auth = SecurityContextHolder.getContext().getAuthentication();
                     // 业务异常统一以 HTTP 200 + 业务码返回，若只记 http_status，

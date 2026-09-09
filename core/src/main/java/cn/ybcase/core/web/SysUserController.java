@@ -70,10 +70,20 @@ public class SysUserController {
     public R<UserDto> update(@PathVariable Long id, @RequestBody SaveUserRequest req) {
         SysUser u = userRepository.findById(id).orElse(null);
         if (u == null) return R.fail(1103, "用户不存在");
-        applyFields(u, req);
+        // 全部校验必须在 applyFields 之前：R.fail 不是异常，@Transactional 不会回滚，
+        // 而 u 是受管实体，改完字段即便返回失败也会在事务提交时被脏检查刷库——
+        // 结果是"口令没改成、姓名/科室/角色却已经改了"，且界面提示的是失败。
         if (req.password() != null && !req.password().isBlank()) {
             String pwdError = passwordPolicyError(req.password());
             if (pwdError != null) return R.fail(1102, pwdError);
+        }
+        // 与 setEnabled 的"不能停用内置管理员"同源：摘掉 admin 的 ADMIN 角色，
+        // 全系统将无人可管理用户与参数，且无法自救。
+        if ("admin".equals(u.getUsername())
+                && (req.roleCodes() == null || !req.roleCodes().contains("ADMIN")))
+            return R.fail(1104, "不能移除内置管理员的 ADMIN 角色");
+        applyFields(u, req);
+        if (req.password() != null && !req.password().isBlank()) {
             u.setPassword(passwordEncoder.encode(req.password()));
             u.setPasswordUpdatedAt(java.time.Instant.now());
             // 管理员改他人口令（账号泄露处置路径）须吊销该账号旧令牌，否则旧 JWT 仍可用满有效期

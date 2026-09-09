@@ -47,8 +47,11 @@ public class AttachmentController {
         boolean fileMode = "FILE".equalsIgnoreCase(config.str("attachment_storage", "DB"));
         long limit = "AV_RECORD".equals(category) && fileMode ? MAX_AV_SIZE : MAX_SIZE;
         if (file.getSize() > limit) throw new BizException(2054, "附件超过大小限制（" + (limit / 1024 / 1024) + "MB）");
-        Integer exists = jdbc.queryForObject("select count(*) from case_file where id = ?", Integer.class, id);
-        if (exists == null || exists == 0) throw new BizException(2043, "案件不存在");
+        // 附件是卷内材料，已立卷归档的案卷同样不得追加（此前只查案件存在性）
+        var cf = jdbc.queryForList("select status, archive_no from case_file where id = ?", id);
+        if (cf.isEmpty()) throw new BizException(2043, "案件不存在");
+        if ("CLOSED".equals(cf.get(0).get("status")) || cf.get(0).get("archive_no") != null)
+            throw new BizException(2031, "案件已立卷归档，不可再增删卷内材料");
 
         byte[] data = null;
         String filePath = null;

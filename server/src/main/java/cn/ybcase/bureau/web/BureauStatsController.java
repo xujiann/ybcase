@@ -54,12 +54,21 @@ public class BureauStatsController {
     @GetMapping("/supervision")
     public R<Map<String, Object>> supervision() {
         Map<String, Object> m = new java.util.LinkedHashMap<>();
+        // 每类只返回最紧急的前 N 条：各查询本就按紧急度 ORDER BY，截断保留的正是最该看的。
+        // 此前 16 类全部无上界，实测 3102 案件时响应 933KB、合计 6434 行，
+        // 前端普通 el-table 全量渲染出 46296 个 DOM 节点、约 17 秒才可用，且随案件量线性恶化。
+        final int top = cfg.intVal("supervision_top_n", 100);
+        java.util.Map<String, Boolean> truncated = new java.util.LinkedHashMap<>();
+        java.util.function.BiConsumer<String, List<Map<String, Object>>> put = (k, v) -> {
+            if (v.size() > top) { truncated.put(k, true); m.put(k, new java.util.ArrayList<>(v.subList(0, top))); }
+            else m.put(k, v);
+        };
         // 线索核查超期（第14条）
-        m.put("clueOverdue", jdbc.queryForList("""
+        put.accept("clueOverdue", jdbc.queryForList("""
                 select id, clue_no, suspect_name, received_at, deadline_at, extended
                 from case_clue where status = 'PENDING' and deadline_at < current_date order by deadline_at"""));
         // 办案期限：临期(10日内)与超期（第45条，含扣除期间顺延）
-        m.put("caseNearDeadline", jdbc.queryForList("""
+        put.accept("caseNearDeadline", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name, cf.status, cf.filed_at,
                        cf.deadline_at + coalesce((select sum(e.end_at - e.start_at)::int from case_period_exclusion e
                                                   where e.case_id = cf.id and e.end_at is not null), 0) as effective_deadline
@@ -70,25 +79,25 @@ public class BureauStatsController {
                       < current_date + 10
                 order by effective_deadline"""));
         // 法制审核超期（第40条：10个工作日）
-        m.put("reviewOverdue", jdbc.queryForList("""
+        put.accept("reviewOverdue", jdbc.queryForList("""
                 select r.id, r.case_id, cf.case_no, r.submitted_at, r.deadline_at
                 from case_review r join case_file cf on cf.id = r.case_id
                 where r.reviewed_at is null and r.deadline_at < current_date order by r.deadline_at"""));
         // 送达超期（第59条：决定后7个工作日，按节假日表精确计算，不再用自然日近似）
         int deliverDays = cfg.intVal("delivery_days", 7);
-        m.put("deliveryOverdue", jdbc.queryForList("""
+        put.accept("deliveryOverdue", jdbc.queryForList("""
                 select id, case_no, name, decided_at from case_file
                 where status = 'DECIDED' and decided_at is not null order by decided_at""").stream()
                 .filter(r -> cfg.plusWorkdays(((java.sql.Date) r.get("decided_at")).toLocalDate(),
                         deliverDays).isBefore(java.time.LocalDate.now()))
                 .toList());
         // 先行登记保存超期未处理（第26条：7个工作日）
-        m.put("holdOverdue", jdbc.queryForList("""
+        put.accept("holdOverdue", jdbc.queryForList("""
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.hold_expire_at
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.register_hold = true and ev.hold_expire_at < current_date order by ev.hold_expire_at"""));
         // 重大处罚决定未报政府备案（辽54条：较大数额罚款按单位档阈值近似）
-        m.put("govRecordMissing", jdbc.queryForList("""
+        put.accept("govRecordMissing", jdbc.queryForList("""
                 select d.case_id, cf.case_no, cf.name, d.fine_amount, d.decided_at
                 from case_decision d join case_file cf on cf.id = d.case_id
                 where d.decision_type = 'PUNISH' and d.gov_record_no is null
@@ -96,19 +105,19 @@ public class BureauStatsController {
                                                  where cfg_key = 'meeting_required_fine_org'), 100000)
                 order by d.decided_at"""));
         // 分期缴纳到期未缴（第54条）
-        m.put("installmentOverdue", jdbc.queryForList("""
+        put.accept("installmentOverdue", jdbc.queryForList("""
                 select i.id, i.case_id, cf.case_no, i.seq, i.due_at, i.amount
                 from case_installment i join case_file cf on cf.id = i.case_id
                 where i.paid_at is null and i.due_at < current_date order by i.due_at"""));
         // 听证意见超期（辽50条：听证结束2日内提出意见）
-        m.put("hearingOpinionOverdue", jdbc.queryForList("""
+        put.accept("hearingOpinionOverdue", jdbc.queryForList("""
                 select h.id, h.case_id, cf.case_no, h.held_at
                 from case_hearing h join case_file cf on cf.id = h.case_id
                 where h.status = 'HELD' and h.held_at + ?::int < current_date order by h.held_at""",
                 cfg.intVal("hearing_opinion_days", 2)));
         // 简易程序备案超期（第51条：决定后7个工作日，节假日表精确计算）
         int recordDays = cfg.intVal("summary_record_days", 7);
-        m.put("summaryRecordOverdue", jdbc.queryForList("""
+        put.accept("summaryRecordOverdue", jdbc.queryForList("""
                 select id, case_no, name, decided_at from case_file
                 where procedure_type = 'SUMMARY' and decided_at is not null and summary_record_at is null
                 order by decided_at""").stream()
@@ -116,18 +125,18 @@ public class BureauStatsController {
                         recordDays).isBefore(java.time.LocalDate.now()))
                 .toList());
         // 协查超期（第34条：15日内完成）
-        m.put("assistOverdue", jdbc.queryForList("""
+        put.accept("assistOverdue", jdbc.queryForList("""
                 select a.id, a.case_id, cf.case_no, a.org, a.due_at
                 from case_assist a join case_file cf on cf.id = a.case_id
                 where a.replied_at is null and a.due_at < current_date order by a.due_at"""));
         // 责令改正逾期未报告（限期跟踪）
-        m.put("correctOverdue", jdbc.queryForList("""
+        put.accept("correctOverdue", jdbc.queryForList("""
                 select d.id, d.case_id, cf.case_no, d.title, d.due_at
                 from case_document d join case_file cf on cf.id = d.case_id
                 where d.doc_type = 'ORDER_CORRECT' and d.due_at is not null and d.due_at < current_date
                   and cf.status not in ('CLOSED','TERMINATED') order by d.due_at"""));
         // 处罚决定公开超期（辽56条：作出决定7日内公开，参数化）
-        m.put("publishOverdue", jdbc.queryForList("""
+        put.accept("publishOverdue", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name, d.decided_at
                 from case_decision d join case_file cf on cf.id = d.case_id
                 where d.decision_type = 'PUNISH' and d.published = false
@@ -149,7 +158,7 @@ public class BureauStatsController {
         // 已批准暂缓/分期缴纳的案件不在此列：其按 case_installment 的 due_at 履行，
         // 由 installmentOverdue 面板监控；否则依约分期的案件会被一路误报到"已失权"
         // 缴款期届满仍未缴清（第53条）
-        m.put("paymentOverdue", jdbc.queryForList("""
+        put.accept("paymentOverdue", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name, cf.delivered_at,
                        cf.delivered_at + ?::int as pay_deadline,
                        d.fine_amount, d.recoup_amount, d.confiscate_amount,
@@ -162,7 +171,7 @@ public class BureauStatsController {
                 """ + unpaid + """
                 order by cf.delivered_at""", payDays, payDays));
         // 缴款期已届满未缴清但尚未催告——催告是申请强执的法定前置（行政强制法54条）
-        m.put("urgeLetterMissing", jdbc.queryForList("""
+        put.accept("urgeLetterMissing", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name, cf.delivered_at + ?::int as pay_deadline
                 from case_file cf join case_decision d on d.case_id = cf.id
                 where cf.status = 'DELIVERED' and cf.delivered_at is not null
@@ -174,7 +183,7 @@ public class BureauStatsController {
                 order by cf.delivered_at""", payDays, payDays));
         // 强执申请期将满/已过（行政强制法53条：缴款期满起3个月内申请，逾期即失权）
         // 这是全流程唯一"错过即作废且标的最大"的期限，故不止报超期，提前 30 日即入清单
-        m.put("courtEnforceExpiring", jdbc.queryForList("""
+        put.accept("courtEnforceExpiring", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name,
                        cf.delivered_at + ?::int as pay_deadline,
                        -- 必须 ::date：date + interval 会提升为 timestamp，前端切前 10 位恒早一天，
@@ -191,10 +200,13 @@ public class BureauStatsController {
                 """ + unpaid + """
                 order by apply_deadline""", payDays, payDays, payDays, payDays));
         // 封存到期（第31条）
-        m.put("sealExpiring", jdbc.queryForList("""
+        put.accept("sealExpiring", jdbc.queryForList("""
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.seal_expire_at, ev.seal_extended
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.sealed = true and ev.seal_expire_at < current_date + 5 order by ev.seal_expire_at"""));
+        // 前端据此提示"共 N 条，仅显示最紧急的前 N 条"
+        m.put("truncated", truncated);
+        m.put("topN", top);
         return R.ok(m);
     }
 

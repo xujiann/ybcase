@@ -20,4 +20,13 @@ final class CaseGuards {
         if (!List.of("INVESTIGATING", "REPORTED", "NOTIFIED").contains(c.getStatus()))
             throw new BizException(2044, "案件当前状态（" + c.getStatus() + "）不允许该操作");
     }
+
+    /**
+     * 已立卷归档的案卷不得再增删卷内材料（第57条一案一卷）。
+     * 判"已封卷"用案卷号而非状态：终止调查/移送司法的案件归档后状态仍是 TERMINATED。
+     */
+    public static void requireNotArchived(CaseFile c) {
+        if ("CLOSED".equals(c.getStatus()) || c.getArchiveNo() != null)
+            throw new BizException(2031, "案件已立卷归档，不可再增删卷内材料");
+    }
 }

@@ -34,6 +34,10 @@ public class CaseNotice {
     @Column(nullable = false, precision = 14, scale = 2)
     private BigDecimal proposedRecoup = BigDecimal.ZERO;
 
+    /** 拟没收违法所得：与罚款同属处罚种类，计入"数额较大"阈值（threshold_include_confiscate） */
+    @Column(name = "proposed_confiscate")
+    private BigDecimal proposedConfiscate = BigDecimal.ZERO;
+
     /** 陈述申辩截止日（辽44条：告知起3日，逾期视为放弃；null=不限） */
     private LocalDate statementDeadline;
 

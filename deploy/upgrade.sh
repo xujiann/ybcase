@@ -6,7 +6,11 @@ set -uo pipefail
 cd /opt/ybcase
 
 echo "[1/4] 升级前备份(失败可回滚)"
-if [ -x ./backup.sh ]; then ./backup.sh || { echo "!! 备份失败,中止升级"; exit 1; }; else echo "  (未找到 backup.sh,跳过)"; fi
+if [ -x if [ "${1:-}" = "--skip-backup" ]; then
+  echo "  备份已由 server-build.sh 在覆盖产物之前完成，跳过"
+else
+  ./backup.sh
+fi ]; then ./backup.sh || { echo "!! 备份失败,中止升级"; exit 1; }; else echo "  (未找到 backup.sh,跳过)"; fi
 
 echo "[2/4] 校验回滚点"
 # 注意：经 server-build.sh 调用时，新 jar 已覆盖到位，此处再 cp 会把"新 jar"存成回滚点，

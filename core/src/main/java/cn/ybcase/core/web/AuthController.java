@@ -44,6 +44,11 @@ public class AuthController {
         try {
             authenticationManager.authenticate(
                     new UsernamePasswordAuthenticationToken(req.username(), req.password()));
+        } catch (org.springframework.security.authentication.DisabledException e) {
+            // 停用账号是正常业务分支，不是系统故障：此前落到兜底 handler 返回 500，
+            // 前端据此弹出"点顶栏反馈可一键报告"，把管理员停用账号的正常动作变成故障单。
+            // 子类分支必须写在 BadCredentialsException 之前。
+            return R.fail(1005, "账号已停用，请联系管理员");
         } catch (BadCredentialsException e) {
             // 防爆破：连续失败 5 次锁定 15 分钟
             userOpt.ifPresent(u -> {

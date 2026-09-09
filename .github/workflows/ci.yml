@@ -136,9 +136,14 @@ jobs:
           export YBCASE_DB_PASSWORD=hip123456
           # 显式喂入仓库里的开发默认密钥，验证 pilot 会拒绝启动
           export YBCASE_JWT_SECRET=dev-only-secret-change-me-bureau-case-0123456789
-          if java -jar server/target/ybcase-server-*.jar \
-               --spring.profiles.active=pilot --server.port=8092 > insecure.log 2>&1; then
-            echo "预期启动失败但成功了：默认 JWT 密钥竟可用于 pilot"; exit 1
+          # 必须带硬超时：门禁一旦回归（默认密钥竟能启动），进程会一直跑下去，
+          # 这一步就不是"失败"而是挂到 job 超时（默认 6 小时），白白吃掉月度 Actions 额度。
+          # timeout 返回 124 表示进程没有如期退出 == 门禁失效，同样判失败。
+          timeout 90 java -jar server/target/ybcase-server-*.jar \
+               --spring.profiles.active=pilot --server.port=8092 > insecure.log 2>&1
+          rc=$?
+          if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then
+            echo "预期启动失败但未失败（退出码 $rc）：默认 JWT 密钥竟可用于 pilot"; tail -30 insecure.log; exit 1
           fi
           grep -q "拒绝以开发默认 JWT 密钥启动" insecure.log \
             || { echo "启动失败原因不是密钥门禁："; tail -30 insecure.log; exit 1; }

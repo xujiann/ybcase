@@ -32,6 +32,11 @@ public class ExecutionService {
 
     @Transactional
     public void addExecution(Long caseId, ExecutionReq req) {
+        // 按案件加行锁，把同一案件的入账串行化。
+        // 仅把封顶谓词写进 insert 的 where 是不够的：READ COMMITTED 下并发的两个事务
+        // 各自读到的都是插入前的 sum，两笔都能过检，落库后累计超出决定额，
+        // 进而被 fullyExecuted 判为"执行完毕"。
+        jdbc.queryForObject("select id from case_file where id = ? for update", Long.class, caseId);
         CaseFile c = CaseGuards.get(caseRepository, caseId);
         if (!List.of("DECIDED", "DELIVERED").contains(c.getStatus()))
             throw new BizException(2042, "仅已决定/已送达的案件可登记执行");

@@ -34,7 +34,7 @@ public class ApprovalService {
     public record ApplyReq(String kind, Long clueId, Long caseId, Map<String, Object> payload, String reason) {}
 
     @Transactional
-    public long apply(ApplyReq req, String applicant) {
+    public long apply(ApplyReq req, String applicant, boolean privileged) {
         if (!KINDS.contains(req.kind())) throw new BizException(2071, "审批类型须为 立案/延期/中止/终止/暂缓 之一");
         if (req.reason() == null || req.reason().isBlank()) throw new BizException(2071, "须填写申请理由");
         if ("FILE_CASE".equals(req.kind())) {
@@ -43,6 +43,9 @@ public class ApprovalService {
         } else if (req.caseId() == null) {
             throw new BizException(2071, "须关联案件");
         }
+        // caseId 来自请求体，CaseScopeInterceptor 只按路径变量拦截，这里必须自行补范围校验，
+        // 否则办案员可对本人无权查看的案件提交延期/中止/终止/暂缓申请
+        if (req.caseId() != null) caseService.assertInScope(req.caseId(), applicant, privileged);
         String payload = toJson(req.payload());
         Long id = jdbc.queryForObject("""
                 insert into biz_approval (kind, clue_id, case_id, payload, reason, applicant)
@@ -118,7 +121,14 @@ public class ApprovalService {
                 CaseService.CaseCreateReq req = objectMapper.convertValue(p, CaseService.CaseCreateReq.class);
                 yield caseService.create(req, (String) a.get("applicant"));
             }
-            case "EXTEND" -> caseService.extend(caseId, ((Number) p.getOrDefault("days", 0)).intValue(), reason);
+            // getOrDefault 对"键存在但值为 null"返回 null（不是默认值）→ NPE → 500，
+            // 而这张单据此后每次批准都 500，永远办不掉
+            case "EXTEND" -> {
+                Object days = p.get("days");
+                if (!(days instanceof Number n))
+                    throw new BizException(2071, "延期申请未填写延长天数，无法执行；请驳回后重新提交");
+                yield caseService.extend(caseId, n.intValue(), reason);
+            }
             case "SUSPEND" -> caseService.suspend(caseId, reason);
             case "TERMINATE" -> caseService.terminate(caseId, reason);
             case "DEFER" -> executionService.approveDefer(caseId);

@@ -83,7 +83,7 @@ public class FormalizationController {
 
     @PostMapping("/approvals")
     public R<Map<String, Object>> apply(@RequestBody ApprovalService.ApplyReq req, Authentication auth) {
-        return R.ok(Map.of("id", approvalService.apply(req, auth.getName())));
+        return R.ok(Map.of("id", approvalService.apply(req, auth.getName(), privileged(auth))));
     }
 
     @GetMapping("/approvals/pending")
