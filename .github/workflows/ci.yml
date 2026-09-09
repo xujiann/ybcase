@@ -139,9 +139,11 @@ jobs:
           # 必须带硬超时：门禁一旦回归（默认密钥竟能启动），进程会一直跑下去，
           # 这一步就不是"失败"而是挂到 job 超时（默认 6 小时），白白吃掉月度 Actions 额度。
           # timeout 返回 124 表示进程没有如期退出 == 门禁失效，同样判失败。
+          # 步骤跑在 bash -e 下：命令直接失败会立刻中止整步，rc=$? 根本执行不到，
+          # 必须用 `|| rc=$?` 把失败纳入复合命令，才不触发 -e
+          rc=0
           timeout 90 java -jar server/target/ybcase-server-*.jar \
-               --spring.profiles.active=pilot --server.port=8092 > insecure.log 2>&1
-          rc=$?
+               --spring.profiles.active=pilot --server.port=8092 > insecure.log 2>&1 || rc=$?
           if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then
             echo "预期启动失败但未失败（退出码 $rc）：默认 JWT 密钥竟可用于 pilot"; tail -30 insecure.log; exit 1
           fi
