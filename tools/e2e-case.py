@@ -9,6 +9,7 @@
 """
 import sys
 import datetime
+import os
 
 import requests
 
@@ -93,7 +94,12 @@ def main():
     ok(cause13["subjectType"] == "PROVIDER" and cause31["subjectType"] == "INDIVIDUAL", "案由主体分类正确")
 
     step("线索登记：核查期限=收到日+15个工作日")
-    today = datetime.date.today()
+    # 必须按业务时区取"今天"：服务端 JVM 固定 Asia/Shanghai，而 CI runner 是 UTC。
+    # 北京时间 00:00-08:00 之间跑 CI 时，runner 的 date.today() 还是前一天，所有"立案日+N"断言整体差一天
+    # （首次触发：2026-09-12T16:52Z 的一次推送）。
+    # 用固定偏移而非 zoneinfo：Asia/Shanghai 无夏令时恒为 UTC+8，且 Windows 的 Python 没有 tzdata 包
+    _TZ_HOURS = int(os.environ.get("YBCASE_TZ_OFFSET_HOURS", "8"))
+    today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=_TZ_HOURS)).date()
     clue = admin.post("/bureau/clues", json={
         "source": "COMPLAINT", "content": "举报某医院重复收费、超标准收费",
         "suspectName": "示范市第一医院", "suspectType": "PROVIDER",
