@@ -70,7 +70,9 @@
              一旦登记送达入口就永久消失，而督办看板的"简易备案超期"会一直常亮无解。 -->
         <el-button v-if="c.procedureType === 'SUMMARY' && c.decidedAt && !c.summaryRecordAt"
                    @click="onSummaryRecord">简易程序备案</el-button>
-        <el-button v-if="!c.eDeliveryConsent && !['CLOSED', 'TERMINATED'].includes(c.status)"
+        <!-- 实体字段名 eDeliveryConsent，Jackson 对 getEDeliveryConsent 生成的 JSON 键是 edeliveryConsent
+             （首字母连续大写被整体小写），读驼峰恒 undefined → 登记后按钮不消失，每点一次多插一份确认书 -->
+        <el-button v-if="!c.edeliveryConsent && !['CLOSED', 'TERMINATED'].includes(c.status)"
                    @click="dlg.eConsent = true">电子送达确认书</el-button>
         <template v-if="c.status === 'DELIVERED'">
           <el-button type="primary" @click="dlg.execution = true">登记执行</el-button>
@@ -786,6 +788,12 @@ const dlg = reactive<Record<string, boolean>>({
 })
 const eConsentForm = reactive<any>({ receiver: '', channel: '', docNo: '' })
 const uploadCategory = ref('DOC_SCAN')
+/** 附件上限（MB）：与服务端 AttachmentController 的 MAX_SIZE/MAX_AV_SIZE 同口径 */
+const fileStorage = ref(false)
+function uploadLimitMb(category: string) {
+  return category === 'AV_RECORD' && fileStorage.value ? 200 : 10
+}
+client.get('/config/public').then((r) => { fileStorage.value = r.data.data?.attachment_storage === 'FILE' }).catch(() => {})
 const applyForm = reactive<any>({ kind: 'EXTEND', days: 30, reason: '' })
 const docDeliverForm = reactive<any>({ documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', receiver: '', receiptNo: '' })
 const pendingApprovals = computed(() => (detail.value.approvals || []).filter((a: any) => a.status === 'PENDING'))
@@ -875,6 +883,14 @@ async function onUpload(e: Event) {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
+  // 客户端预检：超限的执法音像此前要整段传完才被服务端拒，且超过网关上限时友好提示到不了浏览器
+  const limitMb = uploadLimitMb(uploadCategory.value)
+  if (file.size > limitMb * 1024 * 1024) {
+    ElMessage.error(`文件 ${(file.size / 1024 / 1024).toFixed(1)}MB 超过「${uploadCategory.value === 'AV_RECORD' ? '执法音像' : '扫描件/其他'}」上限 ${limitMb}MB`
+      + (uploadCategory.value === 'AV_RECORD' && !fileStorage.value ? '（当前为库内存储，执法音像需管理员切换外置存储后方可上传大文件）' : ''))
+    input.value = ''
+    return
+  }
   const fd = new FormData()
   fd.append('file', file)
   fd.append('category', uploadCategory.value)
@@ -1180,12 +1196,15 @@ async function onNotify() {
  */
 function openStatement() {
   const n = detail.value?.notices?.[0] || {}
+  // notices 来自 noticeRepository（JPA 实体，Jackson 输出驼峰），
+  // 与 hearings/deliveries 那些走 json_agg 的蛇形列不同——上一版这里读了蛇形键，
+  // 四个字段恒为 undefined：回填全空、快照全假，"取消勾选听证申请"永远提交不上去
   Object.assign(statementForm, {
     statement: n.statement ?? '',
-    statementReview: n.statement_review ?? '',
-    hearingRequested: n.hearing_requested ?? false,
-    hearingHeldAt: n.hearing_held_at ?? null,
-    statementWaived: n.statement_waived ?? false,
+    statementReview: n.statementReview ?? '',
+    hearingRequested: n.hearingRequested ?? false,
+    hearingHeldAt: n.hearingHeldAt ?? null,
+    statementWaived: n.statementWaived ?? false,
   })
   statementSnapshot = { ...statementForm }
   dlg.statement = true
@@ -1226,7 +1245,14 @@ async function onDecide() {
     ElMessage.warning('请填写决定内容')
     return
   }
-  await client.post(`/bureau/cases/${id.value}/decide`, decisionForm)
+  // 不予处罚/不成立/移送：金额输入框被 v-if 隐藏，但 decisionForm 里仍带着 openDecide
+  // 从告知书预填的拟罚金额——整表提交会把"不予处罚"记成"罚款N元"，污染罚没统计与上报，
+  // 还会按金额误触法制审核门槛
+  const body: any = { ...decisionForm }
+  if (body.decisionType !== 'PUNISH') {
+    body.fineAmount = 0; body.recoupAmount = 0; body.confiscateAmount = 0
+  }
+  await client.post(`/bureau/cases/${id.value}/decide`, body)
   ElMessage.success('决定已作出')
   dlg.decide = false
   load()

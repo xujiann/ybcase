@@ -117,6 +117,8 @@ jobs:
           export YBCASE_DB_USER=hip
           export YBCASE_DB_PASSWORD=hip123456
           export YBCASE_JWT_SECRET=ci-only-pilot-secret-0123456789abcdefghijklmnop
+          # 空库初始化门禁需要它；此步的库已有 E2E 用户故不会触发，但显式给出以免日后调整步骤顺序时误炸
+          export YBCASE_ADMIN_INIT_PASSWORD=CiOnlyInit2026
           nohup java -jar server/target/ybcase-server-*.jar \
             --spring.profiles.active=pilot --server.port=8091 > pilot.log 2>&1 &
           for i in $(seq 1 60); do
@@ -128,6 +130,22 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8091/v3/api-docs)
           test "$code" != "200" || { echo "pilot 下 OpenAPI 文档未关闭（HTTP $code）"; exit 1; }
           echo "pilot 启动校验通过（Swagger 已关闭，HTTP $code）"
+
+      - name: 拒绝在空库上以默认口令初始化 pilot（安全门禁）
+        run: |
+          export YBCASE_DB_URL=jdbc:postgresql://localhost:5432/ybcase_empty
+          export YBCASE_DB_USER=hip
+          export YBCASE_DB_PASSWORD=hip123456
+          export YBCASE_JWT_SECRET=ci-only-pilot-secret-0123456789abcdefghijklmnop
+          PGPASSWORD=hip123456 psql -h localhost -U hip -d postgres -c "create database ybcase_empty owner hip"
+          # 仓库公开，空库首启不得种 admin123；缺 YBCASE_ADMIN_INIT_PASSWORD 必须拒绝启动
+          rc=0
+          timeout 90 java -jar server/target/ybcase-server-*.jar                --spring.profiles.active=pilot --server.port=8093 > emptyinit.log 2>&1 || rc=$?
+          if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then
+            echo "预期拒绝但未拒绝（退出码 $rc）"; tail -30 emptyinit.log; exit 1
+          fi
+          grep -q "拒绝在空库上以默认口令初始化 pilot" emptyinit.log             || { echo "启动失败原因不是初始口令门禁："; tail -30 emptyinit.log; exit 1; }
+          echo "空库默认口令初始化已被正确拒绝"
 
       - name: 拒绝默认密钥启动 pilot（安全门禁）
         run: |

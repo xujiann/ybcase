@@ -763,6 +763,43 @@ def main():
     ok("TERMINATE_DECISION" in _tcat["missing"] and "NOTICE" not in _tcat["missing"],
        f"终止类按自己的必备清单校验（missing={_tcat['missing']}）")
 
+    step("撤回听证申请：hearingRequested true→false 后可作决定（第12轮：前端此前永远发不出 false）")
+    _wc = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "撤回听证院",
+        "partyType": "PROVIDER", "amountInvolved": 200000,
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                     {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]})
+    admin.post(f"/bureau/cases/{_wc['id']}/report", json={"content": "调查终结"})
+    admin.post(f"/bureau/cases/{_wc['id']}/notice", json={
+        "content": "拟罚15万", "proposedFine": 150000, "proposedRecoup": 0})
+    admin.post(f"/bureau/cases/{_wc['id']}/statement", json={"hearingRequested": True})
+    admin.post(f"/bureau/cases/{_wc['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 150000, "content": "x", "discretionReason": "x"},
+        expect_code=2075)
+    admin.post(f"/bureau/cases/{_wc['id']}/statement", json={"hearingRequested": False, "statementWaived": True})
+    _n = admin.get(f"/bureau/cases/{_wc['id']}")["notices"][0]
+    ok(_n.get("hearingRequested") is False and "statementReview" in _n,
+       "notices 为驼峰键且听证申请已撤回（前端回填读的就是这些键）")
+    # 案件 JSON 里电子送达确认的键名是 edeliveryConsent（Jackson 对 getEDeliveryConsent 的命名），前端按此读
+    ok("edeliveryConsent" in admin.get(f"/bureau/cases/{_wc['id']}")["caseFile"], "caseFile.edeliveryConsent 键存在")
+
+    step("登录锁定可由管理员解除；移送台账对办案员按数据范围收窄")
+    _users = admin.get("/system/users")
+    _users = _users["records"] if isinstance(_users, dict) else _users
+    _uid = next(u["id"] for u in _users if u["username"] == "banban")
+    for _ in range(5):
+        requests.post(f"{BASE}/auth/login", json={"username": "banban", "password": "wrong-pass"}, timeout=10)
+    _locked = requests.post(f"{BASE}/auth/login", json={"username": "banban", "password": "admin123"}, timeout=10).json()
+    ok(_locked["code"] == 1002, "5 次错密后账号锁定（1002）")
+    admin.call("PUT", f"/system/users/{_uid}/unlock")
+    _ok = requests.post(f"{BASE}/auth/login", json={"username": "banban", "password": "admin123"}, timeout=10).json()
+    ok(_ok["code"] == 0, "管理员解锁后可登录")
+    _bb = Api("banban")
+    _all = admin.get("/bureau/transfers")
+    _mine = _bb.get("/bureau/transfers")
+    # banban（王办案）参办不少案件，只断言"是全量的子集且接口不报错"；SELF 隔离本身由 2080 用例覆盖
+    ok(len(_mine) <= len(_all), f"办案员移送台账已按范围收窄（{len(_mine)}/{len(_all)}）")
+
     step("移送台账：线索整体移送后状态 TRANSFERRED + 接收确认")
     t_clue = admin.post("/bureau/clues", json={
         "source": "COMPLAINT", "content": "举报某药店无证经营（属市场监管职权）",
@@ -1198,6 +1235,15 @@ def main():
         "reason": "APPRAISE", "startAt": str(today)})
     admin.post(f"/bureau/cases/{exid}/exclusions", json={
         "reason": "TEST", "startAt": str(today)}, expect_code=2032)
+    # 进行中的事由结束后补登结束日（此前既无接口、开放行也不计入期限，鉴定期扣除会整段丢失）
+    _open = [x for x in admin.get(f"/bureau/cases/{exid}")["exclusions"] if x.get("end_at") is None]
+    ok(len(_open) == 1, "存在一条进行中的扣除")
+    admin.post(f"/bureau/cases/{exid}/exclusions/{_open[0]['id']}/end",
+               json={"endAt": str(today + datetime.timedelta(days=3))}, expect_code=2032)   # 未来日拒
+    admin.post(f"/bureau/cases/{exid}/exclusions/{_open[0]['id']}/end", json={"endAt": str(today)})
+    admin.post(f"/bureau/cases/{exid}/exclusions/{_open[0]['id']}/end",
+               json={"endAt": str(today)}, expect_code=2032)   # 已收口不可重复
+    ok(all(x.get("end_at") for x in admin.get(f"/bureau/cases/{exid}")["exclusions"]), "开放区间已收口")
     print("    PASS: 立案前/缺起始/倒挂/超上限/重叠 全部拒绝")
 
     step("审批单裁决幂等：同一单二次裁决拒（防双击双执行）")

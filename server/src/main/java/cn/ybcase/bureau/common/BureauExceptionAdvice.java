@@ -65,10 +65,19 @@ public class BureauExceptionAdvice {
 
     @ExceptionHandler(org.springframework.dao.DataAccessException.class)
     public R<Void> handleData(org.springframework.dao.DataAccessException e) {
-        log.warn("数据访问异常", e);
-        if (e instanceof org.springframework.dao.DuplicateKeyException)
+        // 只有完整性约束（唯一/外键/非空）才是"用户输入问题"；磁盘满、库宕、连接池耗尽、
+        // 语句超时是基础设施故障——此前一律说成"请检查必填项"，办案员会反复重填，
+        // 运维在日志里也只看到 WARN，故障被静默吞掉
+        if (e instanceof org.springframework.dao.DuplicateKeyException) {
+            log.warn("重复提交: {}", e.getMostSpecificCause().getMessage());
             return R.fail(2101, "该记录已存在，请勿重复提交");
-        return R.fail(2101, "数据校验未通过：请检查关联对象是否存在、必填项是否完整、日期格式是否正确");
+        }
+        if (e instanceof org.springframework.dao.DataIntegrityViolationException) {
+            log.warn("数据完整性冲突", e);
+            return R.fail(2101, "数据校验未通过：请检查关联对象是否存在、必填项是否完整、日期格式是否正确");
+        }
+        log.error("数据库访问故障（非输入问题，须运维介入）", e);
+        return R.fail(500, "数据库暂时不可用，请稍后重试；若持续出现请点顶栏\"反馈\"报告");
     }
 
     private static String shortMsg(Exception e) {

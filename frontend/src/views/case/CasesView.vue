@@ -102,7 +102,7 @@
       </el-form>
       <template #footer>
         <el-button @click="createVisible = false">取消</el-button>
-        <el-button type="primary" @click="onCreate">{{ isLeader ? '立案' : '提交申请' }}</el-button>
+        <el-button type="primary" @click="onCreate" :loading="submitting">{{ isLeader ? '立案' : '提交申请' }}</el-button>
       </template>
     </el-dialog>
   </el-card>
@@ -127,6 +127,7 @@ const causes = ref<any[]>([])
 const loading = ref(false)
 const statusFilter = ref('')
 const createVisible = ref(false)
+const submitting = ref(false)
 const q = ref('')
 const page = ref(1)
 const pageSize = 20
@@ -175,29 +176,36 @@ function openCreate(fromClue = false) {
 }
 
 async function onCreate() {
-  if (!form.partyName || !form.causeId) {
-    ElMessage.warning('请填写当事人并选择案由')
-    return
-  }
-  if (form.officers.some((o: any) => !o.name || !o.certNo)) {
-    ElMessage.warning('办案人员须填写姓名与执法证号')
-    return
-  }
-  if (!isLeader.value) {
-    // 办案人员：提交 FILE_CASE 审批单，负责人批准时才真正建案（ApprovalService.execute）
-    await client.post('/bureau/approvals', {
-      kind: 'FILE_CASE', clueId: form.clueId || null,
-      payload: { ...form }, reason: `立案申请：${form.partyName}`,
-    })
-    ElMessage.success('立案申请已提交，待负责人批准后自动建案')
+  // 防重：连点或 15s 超时后的重试会生成两条连号且无法删除的记录
+  if (submitting.value) return
+  submitting.value = true
+  try {
+    if (!form.partyName || !form.causeId) {
+      ElMessage.warning('请填写当事人并选择案由')
+      return
+    }
+    if (form.officers.some((o: any) => !o.name || !o.certNo)) {
+      ElMessage.warning('办案人员须填写姓名与执法证号')
+      return
+    }
+    if (!isLeader.value) {
+      // 办案人员：提交 FILE_CASE 审批单，负责人批准时才真正建案（ApprovalService.execute）
+      await client.post('/bureau/approvals', {
+        kind: 'FILE_CASE', clueId: form.clueId || null,
+        payload: { ...form }, reason: `立案申请：${form.partyName}`,
+      })
+      ElMessage.success('立案申请已提交，待负责人批准后自动建案')
+      createVisible.value = false
+      router.push('/case/approvals')
+      return
+    }
+    const resp = await client.post('/bureau/cases', form)
+    ElMessage.success(`已立案：${resp.data.data.caseNo}`)
     createVisible.value = false
-    router.push('/case/approvals')
-    return
+    router.push(`/case/detail/${resp.data.data.id}`)
+  } finally {
+    submitting.value = false
   }
-  const resp = await client.post('/bureau/cases', form)
-  ElMessage.success(`已立案：${resp.data.data.caseNo}`)
-  createVisible.value = false
-  router.push(`/case/detail/${resp.data.data.id}`)
 }
 
 onMounted(async () => {

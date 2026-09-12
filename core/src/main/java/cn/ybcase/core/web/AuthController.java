@@ -33,11 +33,15 @@ public class AuthController {
     private static final java.time.Duration LOCK_DURATION = java.time.Duration.ofMinutes(15);
 
     @PostMapping("/login")
-    public R<Map<String, Object>> login(@RequestBody LoginRequest req) {
+    public R<Map<String, Object>> login(@RequestBody LoginRequest req, jakarta.servlet.http.HttpServletRequest http) {
+        // 登录时 SecurityContext 里没有用户，审计过滤器拿不到用户名；把尝试登录的用户名与结果码
+        // 放到请求属性里，让审计能区分"谁在爆破谁"。属性名与 server 侧 BureauAuditFilter 约定一致。
+        http.setAttribute("ybcaseAuditUser", req.username());
         var userOpt = userRepository.findByUsername(req.username());
         if (userOpt.isPresent()) {
             var u = userOpt.get();
             if (u.getLockedUntil() != null && u.getLockedUntil().isAfter(java.time.Instant.now())) {
+                http.setAttribute("ybcaseBizCode", 1002);
                 return R.fail(1002, "账号已锁定，请 15 分钟后重试");
             }
         }
@@ -48,6 +52,7 @@ public class AuthController {
             // 停用账号是正常业务分支，不是系统故障：此前落到兜底 handler 返回 500，
             // 前端据此弹出"点顶栏反馈可一键报告"，把管理员停用账号的正常动作变成故障单。
             // 子类分支必须写在 BadCredentialsException 之前。
+            http.setAttribute("ybcaseBizCode", 1005);
             return R.fail(1005, "账号已停用，请联系管理员");
         } catch (BadCredentialsException e) {
             // 防爆破：连续失败 5 次锁定 15 分钟
@@ -59,6 +64,7 @@ public class AuthController {
                 }
                 userRepository.save(u);
             });
+            http.setAttribute("ybcaseBizCode", 1001);
             return R.fail(1001, "用户名或密码错误");
         }
         userOpt.ifPresent(u -> {
@@ -74,7 +80,8 @@ public class AuthController {
                 .orElse(0L);
         return R.ok(Map.of("token", token,
                 "passwordAgeDays", pwdAgeDays,
-                "passwordExpireWarning", pwdAgeDays >= 90));
+                "passwordExpireWarning", pwdAgeDays >= 90,
+                "mustChangePassword", userOpt.map(SysUser::getMustChangePassword).orElse(false)));
     }
 
     /** 自助修改密码（等保：口令 90 天更换提醒的配套动作） */
@@ -95,6 +102,7 @@ public class AuthController {
         }
         user.setPassword(passwordEncoder.encode(req.newPassword()));
         user.setPasswordUpdatedAt(java.time.Instant.now());
+        user.setMustChangePassword(false);   // 本人已设口令
         // 改密即吊销全部旧令牌（含已泄露的），用户须重新登录
         user.setTokenVersion(user.getTokenVersion() + 1);
         userRepository.save(user);
@@ -123,6 +131,7 @@ public class AuthController {
                 "username", user.getUsername(),
                 "realName", user.getRealName(),
                 "roles", user.getRoles().stream().map(r -> r.getCode()).toList(),
+                "mustChangePassword", Boolean.TRUE.equals(user.getMustChangePassword()),
                 "menus", menus));
     }
 }

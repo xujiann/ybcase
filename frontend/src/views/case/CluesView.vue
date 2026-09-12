@@ -75,7 +75,7 @@
       </el-form>
       <template #footer>
         <el-button @click="createVisible = false">取消</el-button>
-        <el-button type="primary" @click="onCreate">保存</el-button>
+        <el-button type="primary" @click="onCreate" :loading="submitting">保存</el-button>
       </template>
     </el-dialog>
   </el-card>
@@ -93,6 +93,7 @@ const records = ref<any[]>([])
 const loading = ref(false)
 const statusFilter = ref('')
 const createVisible = ref(false)
+const submitting = ref(false)
 function todayLocal() {
   const d = new Date()
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -111,16 +112,23 @@ async function load() {
 }
 
 async function onCreate() {
-  if (!form.suspectName || !form.content) {
-    ElMessage.warning('请填写嫌疑人与线索内容')
-    return
+  // 防重：连点或 15s 超时后的重试会生成两条连号且无法删除的记录
+  if (submitting.value) return
+  submitting.value = true
+  try {
+    if (!form.suspectName || !form.content) {
+      ElMessage.warning('请填写嫌疑人与线索内容')
+      return
+    }
+    await client.post('/bureau/clues', form)
+    ElMessage.success('线索已登记')
+    createVisible.value = false
+    form.suspectName = ''
+    form.content = ''
+    load()
+  } finally {
+    submitting.value = false
   }
-  await client.post('/bureau/clues', form)
-  ElMessage.success('线索已登记')
-  createVisible.value = false
-  form.suspectName = ''
-  form.content = ''
-  load()
 }
 
 async function onExclusion(row: any) {

@@ -64,8 +64,8 @@ public class MessageService {
         // 办案期限临期/超期 → 承办人
         for (var r : jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.owner_user,
-                       cf.deadline_at + coalesce((select sum(e.end_at - e.start_at)::int from case_period_exclusion e
-                                                  where e.case_id = cf.id and e.end_at is not null), 0) as eff
+                       cf.deadline_at + coalesce((select sum(coalesce(e.end_at, current_date) - e.start_at)::int from case_period_exclusion e
+                                                  where e.case_id = cf.id), 0) as eff
                 from case_file cf
                 where cf.status in ('INVESTIGATING','REPORTED','NOTIFIED') and cf.owner_user is not null""")) {
             LocalDate eff = ((java.sql.Date) r.get("eff")).toLocalDate();

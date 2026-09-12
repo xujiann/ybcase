@@ -27,6 +27,9 @@ server:
 # 日志：容器 stdout 由 docker 日志轮转接管（compose 已限制大小），
 # 同时落盘一份便于事后排查；生产不打 SQL 与调试细节，避免泄露与磁盘暴涨
 logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %5p [%t] [%X{rid:-}] %-40.40logger{39} : %m%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %5p [%t] [%X{rid:-}] %-40.40logger{39} : %m%n"
   level:
     root: INFO
     cn.ybcase: INFO

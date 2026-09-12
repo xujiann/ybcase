@@ -37,6 +37,8 @@ services:
       YBCASE_DB_USER: hip
       YBCASE_DB_PASSWORD: ${DB_PASSWORD}
       YBCASE_JWT_SECRET: ${JWT_SECRET}
+      # 空库初始化时 admin 的初始口令（首次登录强制修改）；pilot 下缺失或为 admin123 会拒绝启动
+      YBCASE_ADMIN_INIT_PASSWORD: ${ADMIN_INIT_PASSWORD:-}
       # 业务日期（立案日/告知日/期限起算）全部用 LocalDate.now()，依赖 JVM 默认时区。
       # 容器默认 UTC 会让中国 0-8 点记成前一天——法律文书日期出错，故双保险：TZ + JVM 参数
       TZ: Asia/Shanghai

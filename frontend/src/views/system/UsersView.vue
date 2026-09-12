@@ -33,6 +33,8 @@
                      @click="toggleEnabled(row)">
             {{ row.enabled ? '停用' : '启用' }}
           </el-button>
+          <el-button v-if="row.lockedUntil && new Date(row.lockedUntil) > new Date()" size="small" text type="warning"
+                     @click="onUnlock(row)">解锁</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -152,6 +154,13 @@ async function save() {
   } finally {
     saving.value = false
   }
+}
+
+/** 公网上任何人对着用户名错 5 次即可把账号锁死（含 admin），管理员须能解锁 */
+async function onUnlock(row: any) {
+  await client.put(`/system/users/${row.id}/unlock`)
+  ElMessage.success('已解锁')
+  load()
 }
 
 async function toggleEnabled(row: UserRow) {

@@ -6,6 +6,8 @@ encode gzip
 
 # 安全响应头：令牌存 localStorage 且会话 12 小时，须防点击劫持与 MIME 嗅探
 header {
+    # 首次/直输域名的 http→https 那一跳可被劫持成假登录页；正式域名确认全站 HTTPS 后可再加 preload
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
     X-Frame-Options "DENY"
     X-Content-Type-Options "nosniff"
     Referrer-Policy "same-origin"

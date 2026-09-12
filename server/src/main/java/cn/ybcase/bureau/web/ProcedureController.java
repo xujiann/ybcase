@@ -1,5 +1,7 @@
 package cn.ybcase.bureau.web;
 
+import static cn.ybcase.bureau.common.CaseScopeInterceptor.privileged;
+
 import cn.ybcase.bureau.entity.CaseFile;
 import cn.ybcase.bureau.service.ProcedureService;
 import cn.ybcase.core.common.R;
@@ -7,6 +9,7 @@ import static cn.ybcase.bureau.common.ReqValues.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -20,6 +23,7 @@ public class ProcedureController {
 
     private final ProcedureService procedureService;
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.bureau.service.CaseService caseService;
 
     // 听证
     @PostMapping("/cases/{id}/hearings")
@@ -65,21 +69,36 @@ public class ProcedureController {
 
     // 移送台账
     @GetMapping("/transfers")
-    public R<List<Map<String, Object>>> transfers() {
-        return R.ok(jdbc.queryForList("""
-                select t.*, c.clue_no, cf.case_no from case_transfer t
-                left join case_clue c on c.id = t.clue_id
-                left join case_file cf on cf.id = t.case_id order by t.id desc limit 200"""));
+    public R<List<Map<String, Object>>> transfers(Authentication auth) {
+        // 非监督岗按 case_view_scope=SELF 收窄：只看本人承办/参办案件的移送记录（线索级移送无案件，仍可见）。
+        // SCOPE_SQL 绑定表名 case_file 且以 " and (" 开头，故子查询写成 where 1=1 + SCOPE_SQL
+        String base = "select t.*, c.clue_no, cf.case_no from case_transfer t"
+                + " left join case_clue c on c.id = t.clue_id"
+                + " left join case_file cf on cf.id = t.case_id";
+        if (caseService.scopedSelf(privileged(auth))) {
+            return R.ok(jdbc.queryForList(base
+                    + " where t.case_id is null or t.case_id in (select id from case_file where 1=1"
+                    + cn.ybcase.bureau.service.CaseService.SCOPE_SQL + ")"
+                    + " order by t.id desc limit 200", auth.getName(), auth.getName()));
+        }
+        return R.ok(jdbc.queryForList(base + " order by t.id desc limit 200"));
     }
 
     @PostMapping("/transfers")
-    public R<Void> addTransfer(@RequestBody ProcedureService.TransferReq req) {
+    public R<Void> addTransfer(@RequestBody ProcedureService.TransferReq req, Authentication auth) {
+        // caseId 来自请求体，CaseScopeInterceptor 只认路径变量，这里自行补范围校验
+        if (req.caseId() != null) caseService.assertInScope(req.caseId(), auth.getName(), privileged(auth));
         procedureService.addTransfer(req);
         return R.ok();
     }
 
     @PostMapping("/transfers/{id}/confirm")
-    public R<Void> confirmTransfer(@PathVariable Long id) {
+    public R<Void> confirmTransfer(@PathVariable Long id, Authentication auth) {
+        // 兄弟资源路由不带 caseId：按移送记录反查所属案件再做范围校验
+        var rows = jdbc.queryForList("select case_id from case_transfer where id = ?", id);
+        if (rows.isEmpty()) throw new cn.ybcase.bureau.common.BizException(2059, "移送记录不存在");
+        Object cid = rows.get(0).get("case_id");
+        if (cid != null) caseService.assertInScope(((Number) cid).longValue(), auth.getName(), privileged(auth));
         procedureService.confirmTransfer(id);
         return R.ok();
     }

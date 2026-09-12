@@ -46,14 +46,19 @@
           </template>
         </el-dropdown>
       </el-header>
-      <el-dialog v-model="pwdVisible" title="修改密码（至少8位，含字母和数字）" width="420px">
+      <!-- 强制模式（首次登录/管理员重置后）：不能关、不能点遮罩、不能 Esc，改完自动登出重登 -->
+      <el-dialog v-model="pwdVisible" :title="pwdForced ? '首次登录须修改密码（至少8位，含字母和数字）' : '修改密码（至少8位，含字母和数字）'"
+                 width="420px" :close-on-click-modal="!pwdForced" :close-on-press-escape="!pwdForced"
+                 :show-close="!pwdForced">
+        <el-alert v-if="pwdForced" type="warning" :closable="false" class="mb"
+                  title="当前口令由管理员设定，出于安全要求须改为本人口令后方可使用系统。" />
         <el-form label-width="80px">
           <el-form-item label="原密码"><el-input v-model="pwdForm.oldPassword" type="password" show-password /></el-form-item>
           <el-form-item label="新密码"><el-input v-model="pwdForm.newPassword" type="password" show-password /></el-form-item>
           <el-form-item label="确认新密码"><el-input v-model="pwdForm.confirm" type="password" show-password /></el-form-item>
         </el-form>
         <template #footer>
-          <el-button @click="pwdVisible = false">取消</el-button>
+          <el-button v-if="!pwdForced" @click="pwdVisible = false">取消</el-button>
           <el-button type="primary" @click="onChangePassword">保存</el-button>
         </template>
       </el-dialog>
@@ -127,7 +132,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import client, { recentErrors } from '../api/client'
@@ -140,7 +145,16 @@ const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'd
 const router = useRouter()
 const auth = useAuthStore()
 const pwdVisible = ref(false)
+const pwdForced = ref(false)
 const pwdForm = reactive({ oldPassword: '', newPassword: '', confirm: '' })
+// 用户信息就绪后若标记须改密，立即弹出强制改密框
+watch(() => auth.user?.mustChangePassword, (v) => {
+  if (v) {
+    pwdForm.oldPassword = ''; pwdForm.newPassword = ''; pwdForm.confirm = ''
+    pwdForced.value = true
+    pwdVisible.value = true
+  }
+}, { immediate: true })
 const searchQ = ref('')
 const searchVisible = ref(false)
 const searchResult = ref<any>({})
@@ -161,7 +175,7 @@ function onMenuSelect() {
 
 async function refreshUnread() {
   try {
-    unread.value = (await client.get('/bureau/messages/unread-count')).data.data
+    unread.value = (await client.get('/bureau/messages/unread-count', { headers: { 'X-Background': '1' } })).data.data
   } catch { /* 未登录等场景忽略 */ }
 }
 
@@ -239,6 +253,12 @@ onMounted(() => {
   if (!auth.user) auth.fetchMe().catch(() => {})
   refreshUnread()
   unreadTimer = window.setInterval(refreshUnread, 60000)  // 轻量轮询未读数
+  // 令牌临期提醒：解析 JWT exp（无需密钥），到期前 10 分钟提示保存，避免长表单写到一半被 401
+  try {
+    const payload = JSON.parse(atob((localStorage.getItem('bureau_token') || '').split('.')[1] || ''))
+    const msLeft = payload.exp * 1000 - Date.now() - 10 * 60 * 1000
+    if (msLeft > 0) window.setTimeout(() => ElMessage.warning('登录将在 10 分钟后过期，请及时保存正在填写的内容'), msLeft)
+  } catch { /* 令牌格式异常时不提示 */ }
   // 系统级错误发生时自动弹反馈框（预填 BUG 类型）
   window.addEventListener('ybcase-api-500', on500)
   window.addEventListener('resize', onResize)

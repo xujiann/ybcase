@@ -143,6 +143,15 @@ public class CaseController {
         return R.ok(documentService.timeline(id));
     }
 
+    /** 进行中的扣除事由结束后补登结束日（收口开放区间） */
+    @PostMapping("/{id}/exclusions/{exclusionId}/end")
+    public R<Void> endExclusion(@PathVariable Long id, @PathVariable Long exclusionId,
+                                @RequestBody Map<String, String> body) {
+        caseService.endExclusion(id, exclusionId,
+                body.get("endAt") == null ? null : java.time.LocalDate.parse(body.get("endAt")));
+        return R.ok();
+    }
+
     @PostMapping("/{id}/exclusions")
     public R<Void> addExclusion(@PathVariable Long id, @RequestBody CaseService.ExclusionReq req) {
         caseService.addExclusion(id, req);

@@ -26,10 +26,12 @@ if [ -f ybcase-server.jar.prev ]; then
         echo "  回滚点就绪：$(stat -c%y ybcase-server.jar.prev 2>/dev/null | cut -d. -f1)"
     fi
 else
-    # 手工直接调用 upgrade.sh（未经 server-build）时兜底留存
+    # 首次部署：当前 jar 就是唯一版本，留存供下次回滚
     cp -f ybcase-server.jar ybcase-server.jar.prev 2>/dev/null || true
     echo "  首次部署，已留存当前 jar 作回滚点"
 fi
+# 注意：回滚点必须由调用方（server-build.sh / push-update.sh）在覆盖之前留存。
+# 走到这里时新 jar 已就位，此处再 cp 只会把"新 jar"存成回滚点——所以上面只校验、不刷新。
 
 echo "[3/4] 重启 app 加载新 jar(Flyway 自动增量迁移)"
 sudo docker compose up -d --force-recreate app
@@ -51,9 +53,11 @@ else
   echo "!! 后端未在 90 秒内就绪,最近日志:"
   sudo docker compose logs --tail 40 app
   echo
-  echo "!! 如需回滚到上一版本:"
+  echo "!! 如需回滚到上一版本（顺序不可颠倒：先停 app 再恢复库，否则在途写入会落进即将被 DROP 的表）:"
+  echo "   sudo docker compose stop app caddy"
+  echo "   sudo docker compose exec -T db pg_restore -U hip -d ybcase --clean --if-exists --single-transaction < backup/db-<STAMP>.dump"
   echo "   cp ybcase-server.jar.prev ybcase-server.jar && sudo docker compose up -d --force-recreate app"
-  echo "   如迁移已改库,还需恢复备份:"
-  echo "   sudo docker compose exec -T db pg_restore -U hip -d ybcase --clean --if-exists < backup/db-<最近时间>.dump"
+  echo "   FILE 模式还需还原同一 STAMP 的附件包: sudo docker compose exec -T app tar -C /app/data -xf - < backup/att-<STAMP>.tar"
+  echo "   sudo docker compose up -d"
   exit 1
 fi

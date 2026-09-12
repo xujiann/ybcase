@@ -29,6 +29,13 @@ public class RequestIdFilter extends OncePerRequestFilter {
         String rid = UUID.randomUUID().toString().substring(0, 18);
         request.setAttribute(ATTR, rid);
         response.setHeader(HEADER, rid);
-        filterChain.doFilter(request, response);
+        // 进 MDC：此前 request_id 只在响应头与审计表，服务端日志里根本没有它，
+        // 用户反馈带来的请求号在日志里对不上任何一行
+        org.slf4j.MDC.put("rid", rid);
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            org.slf4j.MDC.remove("rid");
+        }
     }
 }

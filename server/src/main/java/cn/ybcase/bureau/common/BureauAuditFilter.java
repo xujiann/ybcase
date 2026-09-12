@@ -67,7 +67,9 @@ public class BureauAuditFilter extends OncePerRequestFilter {
                     jdbc.update("""
                             insert into sys_audit_log (username, method, path, http_status, client_ip, request_id)
                             values (?,?,?,?,?,?)""",
-                            auth == null ? null : auth.getName(), request.getMethod(),
+                            auth != null ? auth.getName()
+                                    : (String) request.getAttribute("ybcaseAuditUser"),   // 登录路径无 SecurityContext
+                            request.getMethod(),
                             uri, status, clientIp(request),
                             request.getAttribute(RequestIdFilter.ATTR));
                 } catch (Exception ignore) {

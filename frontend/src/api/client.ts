@@ -91,6 +91,12 @@ client.interceptors.response.use(
       message: error.message || '', requestId: error.response?.headers?.['x-request-id'] || null,
     })
     if (error.response?.status === 401) {
+      // 后台轮询（未读数）撞到令牌过期时不要 router.push：办案员可能正在弹窗里写长文本，
+      // 硬导航会把整个组件连同表单一起销毁。轮询只提示、停止；等用户下一次主动操作再跳登录。
+      if (error.config?.headers?.['X-Background']) {
+        ElMessage.warning('登录已过期，请保存好正在填写的内容后重新登录')
+        return Promise.reject(error)
+      }
       localStorage.removeItem('bureau_token')
       // 带回跳地址：办案人员常在详情页填写长表单，重登后回首页会找不回刚才的位置。
       // 已在登录页时不再重复跳转（并发请求同时 401 会触发多次 push）

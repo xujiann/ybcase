@@ -28,11 +28,11 @@ public class SysUserController {
     private final PasswordEncoder passwordEncoder;
 
     public record UserDto(Long id, String username, String realName, String title,
-                          Long deptId, String phone, Boolean enabled, List<String> roleCodes) {
+                          Long deptId, String phone, Boolean enabled, List<String> roleCodes, java.time.Instant lockedUntil) {
         static UserDto from(SysUser u) {
             return new UserDto(u.getId(), u.getUsername(), u.getRealName(), u.getTitle(),
                     u.getDeptId(), u.getPhone(), u.getEnabled(),
-                    u.getRoles().stream().map(SysRole::getCode).toList());
+                    u.getRoles().stream().map(SysRole::getCode).toList(), u.getLockedUntil());
         }
     }
 
@@ -61,6 +61,7 @@ public class SysUserController {
         SysUser u = new SysUser();
         u.setUsername(req.username());
         u.setPassword(passwordEncoder.encode(req.password()));
+        u.setMustChangePassword(true);   // 管理员设的初始口令，首次登录须改
         applyFields(u, req);
         return R.ok(UserDto.from(userRepository.save(u)));
     }
@@ -86,10 +87,23 @@ public class SysUserController {
         if (req.password() != null && !req.password().isBlank()) {
             u.setPassword(passwordEncoder.encode(req.password()));
             u.setPasswordUpdatedAt(java.time.Instant.now());
+            u.setMustChangePassword(true);   // 管理员重置的口令同样须由本人改一次
             // 管理员改他人口令（账号泄露处置路径）须吊销该账号旧令牌，否则旧 JWT 仍可用满有效期
             u.setTokenVersion(u.getTokenVersion() + 1);
         }
         return R.ok(UserDto.from(userRepository.save(u)));
+    }
+
+    /** 解除登录锁定：公网上任何人对着用户名错 5 次即可锁死账号，须给管理员一个解锁通道 */
+    @PutMapping("/{id}/unlock")
+    @Transactional
+    public R<Void> unlock(@PathVariable Long id) {
+        SysUser u = userRepository.findById(id).orElse(null);
+        if (u == null) return R.fail(1103, "用户不存在");
+        u.setLockedUntil(null);
+        u.setFailedAttempts(0);
+        userRepository.save(u);
+        return R.ok();
     }
 
     @PutMapping("/{id}/enabled")

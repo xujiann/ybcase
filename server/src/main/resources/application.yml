@@ -40,3 +40,8 @@ management:
     web:
       exposure:
         include: health,info
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %5p [%t] [%X{rid:-}] %-40.40logger{39} : %m%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %5p [%t] [%X{rid:-}] %-40.40logger{39} : %m%n"

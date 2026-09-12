@@ -25,17 +25,26 @@ fi
 
 # 2. 附件目录（FILE 外置存储模式）。此前用 || true 吞掉全部失败，
 #    连"打出空 tar"都算成功——证据没备份到却天天显示正常。
-STORAGE=$(docker compose exec -T db psql -U hip -d ybcase -tAc "select cfg_value from sys_config where cfg_key='attachment_storage'" 2>/dev/null | tr -d '' || echo DB)
+# 与 AttachmentController 的 equalsIgnoreCase 同口径（参数是自由文本，填 "file" 也算 FILE 模式）
+STORAGE=$(docker compose exec -T db psql -U hip -d ybcase -tAc "select upper(btrim(cfg_value)) from sys_config where cfg_key='attachment_storage'" 2>/dev/null | tr -d '' || echo DB)
 if [ "$STORAGE" = "FILE" ]; then
+    # 挂载错位要显式检查，不能靠 tar 大小推断
+    if ! docker compose exec -T app test -d /app/data/attachments; then
+        echo "!! /app/data/attachments 不存在——attachment_dir 未落在挂载卷上，FILE 模式附件不会被备份"; exit 1
+    fi
     ATT="$DIR/att-$STAMP.tar"
     if ! docker compose exec -T app tar -C /app/data -cf - attachments > "$ATT"; then
         echo "!! 附件打包失败（FILE 模式下附件即执法音像证据）"; rm -f "$ATT"; exit 1
     fi
-    # 空 tar 约 10KB 以下：说明卷没挂对或目录为空，此时"备份成功"是假象
-    if [ "$(stat -c%s "$ATT")" -le 10240 ]; then
-        echo "!! 附件包异常过小（$(stat -c%s "$ATT") 字节）——检查 attachment_dir 是否落在挂载卷上"
+    # 按"库里有多少外置附件、包里有多少文件"校验，而不是猜字节数：
+    # GNU tar 按 10240 字节 record 补齐，空目录或几个小文件恰好就是 10240，按大小判会每夜误报
+    N_DB=$(docker compose exec -T db psql -U hip -d ybcase -tAc "select count(*) from case_attachment where file_path is not null" 2>/dev/null | tr -d '' || echo 0)
+    N_TAR=$(tar -tf "$ATT" 2>/dev/null | grep -vc '/$' || echo 0)
+    if [ "${N_DB:-0}" -gt 0 ] && [ "${N_TAR:-0}" -lt "$N_DB" ]; then
+        echo "!! 附件包不完整：库内外置附件 $N_DB 条，包内文件 $N_TAR 个——检查 attachment_dir 是否落在挂载卷上"
         rm -f "$ATT"; exit 1
     fi
+    [ "${N_DB:-0}" -eq 0 ] && echo "  （FILE 模式下尚无外置附件，附件包为空目录属正常）"
 fi
 
 # 3. 滚动清理：各类只留最近 14 份

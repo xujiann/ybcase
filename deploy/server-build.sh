@@ -49,9 +49,18 @@ cp -r "$SRC/frontend/dist/." "$DEPLOY/dist/"
 # 此前只同步了两个脚本，compose/Caddyfile 的改动（时区、working_dir、日志轮转、安全头）
 # 永远到不了线上——源码改了、线上还是旧配置，且从部署日志完全看不出来。
 cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh
+CADDY_CHANGED=0
+if ! cmp -s "$SRC/deploy/Caddyfile" "$DEPLOY/Caddyfile"; then CADDY_CHANGED=1; fi
 cp "$SRC"/deploy/docker-compose.yml "$SRC"/deploy/Caddyfile "$DEPLOY/"
 
 echo "[5/5] 重启 + 健康检查"
 cd "$DEPLOY" && ./upgrade.sh --skip-backup
 # 编排配置若有变更（时区/挂载/日志），需让 db 与 caddy 也应用新配置
 sudo docker compose up -d
+# Caddyfile 是 Caddy 启动时载入的，bind mount 文件内容变化 compose 察觉不到——
+# 此前反代/安全头/资源缓存的改动同步到了部署目录却从未生效。有变才 reload（不断连）。
+if [ "$CADDY_CHANGED" = 1 ]; then
+  echo "Caddyfile 有变更，热重载 Caddy"
+  sudo docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile \
+    || sudo docker compose restart caddy
+fi

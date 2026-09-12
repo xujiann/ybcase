@@ -161,6 +161,11 @@ public class FeedbackController {
     }
 
     private static String csv(Object v) {
-        return v == null ? "" : String.valueOf(v).replace(",", "，").replace("\n", " ");
+        // 标准 CSV 转义 + 公式注入防护（与前端 StatsView.csvCell 同口径）：
+        // 以 = + - @ 制表回车开头的值前置单引号，Excel 打开时不会当公式执行
+        if (v == null) return "";
+        String s = String.valueOf(v);
+        if (!s.isEmpty() && "=+-@\t\r".indexOf(s.charAt(0)) >= 0) s = "'" + s;
+        return "\"" + s.replace("\"", "\"\"") + "\"";
     }
 }

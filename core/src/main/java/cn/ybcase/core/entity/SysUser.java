@@ -56,6 +56,10 @@ public class SysUser {
     @Column(nullable = false)
     private Integer tokenVersion = 0;
 
+    /** 初始口令由管理员设定：首次登录必须改为本人口令（改密成功后清除） */
+    @Column(name = "must_change_password", nullable = false)
+    private Boolean mustChangePassword = false;
+
     /** 乐观锁：防止"停用"与"改密"并发时读-改-写互相覆盖（如把已停用账号改回启用） */
     @jakarta.persistence.Version
     @Column(nullable = false)

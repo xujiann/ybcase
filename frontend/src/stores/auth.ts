@@ -17,6 +17,8 @@ export interface UserInfo {
   realName: string
   roles: string[]
   menus: MenuItem[]
+  /** 初始口令由管理员设定，首次登录须改；MainLayout 据此弹出不可关闭的改密框 */
+  mustChangePassword?: boolean
 }
 
 export const useAuthStore = defineStore('auth', {

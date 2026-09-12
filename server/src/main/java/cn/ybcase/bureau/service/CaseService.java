@@ -186,6 +186,25 @@ public class CaseService {
 
     public record ExclusionReq(String reason, LocalDate startAt, LocalDate endAt, String note) {}
 
+    /** 为进行中的扣除事由登记结束日（收口开放区间）。上一轮把结束日限定为不晚于今天后，
+     *  办案人被引向"留空、事后补登"，但此前既无补登接口、开放行也不计入期限——鉴定期扣除会整段丢失 */
+    @Transactional
+    public void endExclusion(Long caseId, Long exclusionId, LocalDate endAt) {
+        CaseFile c = get(caseId);
+        var rows = jdbc.queryForList(
+                "select start_at, end_at from case_period_exclusion where id = ? and case_id = ?", exclusionId, caseId);
+        if (rows.isEmpty()) throw new BizException(2032, "扣除记录不存在");
+        if (rows.get(0).get("end_at") != null) throw new BizException(2032, "该扣除事由已登记结束日期");
+        if (endAt == null) throw new BizException(2032, "须填写结束日期");
+        LocalDate start = ((java.sql.Date) rows.get(0).get("start_at")).toLocalDate();
+        if (endAt.isBefore(start)) throw new BizException(2032, "结束日期不得早于起始日期（" + start + "）");
+        if (endAt.isAfter(LocalDate.now())) throw new BizException(2032, "结束日期不得晚于今天");
+        long span = ChronoUnit.DAYS.between(start, endAt) + 1;
+        int max = config.intVal("exclusion_max_days", 180);
+        if (span > max) throw new BizException(2032, "扣除天数（" + span + "日）超过上限 " + max + " 日");
+        jdbc.update("update case_period_exclusion set end_at = ? where id = ?", endAt, exclusionId);
+    }
+
     @Transactional
     public void addExclusion(Long caseId, ExclusionReq req) {
         CaseFile c = get(caseId);
@@ -372,7 +391,8 @@ public class CaseService {
         CaseNotice prev = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
         if (prev != null
                 && (nz(req.proposedFine()).compareTo(nz(prev.getProposedFine())) > 0
-                    || nz(req.proposedRecoup()).compareTo(nz(prev.getProposedRecoup())) > 0)
+                    || nz(req.proposedRecoup()).compareTo(nz(prev.getProposedRecoup())) > 0
+                    || nz(req.proposedConfiscate()).compareTo(nz(prev.getProposedConfiscate())) > 0)
                 && (req.changeReason() == null || req.changeReason().isBlank()))
             throw new BizException(2077, "再次告知的拟处罚金额高于前次，须载明改变原认定事实、证据或依据的理由（辽52条）；"
                     + "不得因当事人陈述申辩而加重处罚（第41条）");
@@ -498,9 +518,13 @@ public class CaseService {
             BigDecimal minRecoup = allNotices.stream()
                     .map(CaseNotice::getProposedRecoup).filter(java.util.Objects::nonNull)
                     .min(BigDecimal::compareTo).orElse(notice.getProposedRecoup());
-            if (fine.compareTo(minFine) > 0 || recoup.compareTo(minRecoup) > 0)
+            BigDecimal minConfiscate = allNotices.stream()
+                    .map(x -> nz(x.getProposedConfiscate())).min(BigDecimal::compareTo).orElse(BigDecimal.ZERO);
+            BigDecimal confiscate = nz(req.confiscateAmount());
+            if (fine.compareTo(minFine) > 0 || recoup.compareTo(minRecoup) > 0
+                    || confiscate.compareTo(minConfiscate) > 0)
                 throw new BizException(2007, "决定金额不得高于告知金额（已告知最低 罚款" + minFine + "元/追回"
-                        + minRecoup + "元）——不得因陈述申辩而加重处罚（第41条）");
+                        + minRecoup + "元/没收" + minConfiscate + "元）——不得因陈述申辩而加重处罚（第41条）");
             // 第41条：当事人申请听证的，应当组织听证后再决定
             if (Boolean.TRUE.equals(notice.getHearingRequested()) && notice.getHearingHeldAt() == null)
                 throw new BizException(2075, "当事人已申请听证，应当组织听证并制作笔录后方可作出决定（第41条）");
@@ -826,7 +850,8 @@ public class CaseService {
 
     // 普通字符串拼接（文本块会剥前导空格导致 "?and" 语法错，医院项目同坑）
     // 关联键用账号 ID：早先按 real_name 匹配会让同名执法人员互相可见，改一次姓名即可绕过隔离
-    private static final String SCOPE_SQL =
+    /** 数据范围谓词（以 " and (" 开头，绑定表名 case_file 无别名）：供跨控制器的 SELF 收窄复用 */
+    public static final String SCOPE_SQL =
             " and (case_file.owner_user = ? or exists (select 1 from case_officer o"
             + " join sys_user su on su.id = o.user_id"
             + " where o.case_id = case_file.id and o.avoided = false and su.username = ?)) ";
@@ -917,7 +942,10 @@ public class CaseService {
      */
     private long totalExclusionDays(Long caseId) {
         List<Map<String, Object>> rows = jdbc.queryForList(
-                "select start_at, end_at from case_period_exclusion where case_id = ? and end_at is not null", caseId);
+                // 进行中的事由（end_at 为空）按截至今天计入：扣除的本就是"已经发生"的期间，
+                // 与 addExclusion 的重叠判定（coalesce(end_at, current_date)）同口径
+                "select start_at, coalesce(end_at, current_date) as end_at from case_period_exclusion where case_id = ?",
+                caseId);
         return rows.stream().mapToLong(r -> ChronoUnit.DAYS.between(
                 ((java.sql.Date) r.get("start_at")).toLocalDate(),
                 ((java.sql.Date) r.get("end_at")).toLocalDate())).sum();

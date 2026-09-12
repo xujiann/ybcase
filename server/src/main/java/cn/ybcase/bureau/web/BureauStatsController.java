@@ -70,12 +70,12 @@ public class BureauStatsController {
         // 办案期限：临期(10日内)与超期（第45条，含扣除期间顺延）
         put.accept("caseNearDeadline", jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.name, cf.status, cf.filed_at,
-                       cf.deadline_at + coalesce((select sum(e.end_at - e.start_at)::int from case_period_exclusion e
-                                                  where e.case_id = cf.id and e.end_at is not null), 0) as effective_deadline
+                       cf.deadline_at + coalesce((select sum(coalesce(e.end_at, current_date) - e.start_at)::int from case_period_exclusion e
+                                                  where e.case_id = cf.id), 0) as effective_deadline
                 from case_file cf
                 where cf.status in ('INVESTIGATING','REPORTED','NOTIFIED')
-                  and cf.deadline_at + coalesce((select sum(e.end_at - e.start_at)::int from case_period_exclusion e
-                                                 where e.case_id = cf.id and e.end_at is not null), 0)
+                  and cf.deadline_at + coalesce((select sum(coalesce(e.end_at, current_date) - e.start_at)::int from case_period_exclusion e
+                                                 where e.case_id = cf.id), 0)
                       < current_date + 10
                 order by effective_deadline"""));
         // 法制审核超期（第40条：10个工作日）
