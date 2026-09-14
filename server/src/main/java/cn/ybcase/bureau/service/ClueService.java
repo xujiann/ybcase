@@ -123,7 +123,7 @@ public class ClueService {
         }
         Long total = jdbc.queryForObject("select count(*) from case_clue" + where, Long.class, args.toArray());
         args.add(size);
-        args.add((Math.max(page, 1) - 1) * size);
+        args.add((long) (Math.max(page, 1) - 1) * size);   // int 乘法在大页号下溢出为负 offset，PG 报错被翻成 2101
         java.util.List<java.util.Map<String, Object>> rows = jdbc.queryForList(
                 "select * from case_clue" + where + " order by id desc limit ? offset ?", args.toArray());
         return java.util.Map.of("total", total == null ? 0 : total, "page", page, "size", size, "rows", rows);

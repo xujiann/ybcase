@@ -48,7 +48,7 @@
           </el-table>
         </el-collapse-item>
       </el-collapse>
-      <el-dialog v-model="correctionVisible" title="更正案件要素（留痕）" width="640px">
+      <el-dialog v-model="dlg.correction" title="更正案件要素（留痕）" width="640px">
         <el-form :model="correctionForm" label-width="110px">
           <el-form-item label="当事人名称">
             <el-input v-model="correctionForm.partyName" />
@@ -82,7 +82,7 @@
           </el-form-item>
         </el-form>
         <template #footer>
-          <el-button @click="correctionVisible = false">取消</el-button>
+          <el-button @click="dlg.correction = false">取消</el-button>
           <el-button type="primary" @click="onCorrect" :loading="correcting">提交更正</el-button>
         </template>
       </el-dialog>
@@ -862,6 +862,7 @@ const dlg = reactive<Record<string, boolean>>({
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
   execution: false, doc: false, catalog: false, hearing: false, review: false, installment: false,
   apply: false, docDeliver: false, eConsent: false, tplPick: false,
+  correction: false,   // 更正弹窗必须随切案复位：否则 A 案的更正值会提交到 B 案
 })
 const tplOptions = ref<any[]>([])
 const tplPickType = ref('')
@@ -1552,7 +1553,6 @@ const CORRECTION_FIELD: Record<string, string> = {
 const corrections = computed<any[]>(() => detail.value.corrections || [])
 const canCorrect = computed(() => ['INVESTIGATING', 'REPORTED'].includes(c.value.status)
   && !!auth.user?.roles?.some((r: string) => ['HANDLER', 'LEADER', 'ADMIN'].includes(r)))
-const correctionVisible = ref(false)
 const correcting = ref(false)
 const causes = ref<any[]>([])
 const correctionForm = reactive<any>({})
@@ -1568,7 +1568,7 @@ async function openCorrection() {
     amountInvolved: Number(c.value.amountInvolved || 0), causeId: c.value.causeId,
   }
   Object.assign(correctionForm, correctionSnapshot, { reason: '' })
-  correctionVisible.value = true
+  dlg.correction = true
 }
 
 async function onCorrect() {
@@ -1590,7 +1590,7 @@ async function onCorrect() {
   try {
     await client.put(`/bureau/cases/${id.value}/party-info`, body)
     ElMessage.success('已更正并留痕')
-    correctionVisible.value = false
+    dlg.correction = false
     load()
   } finally {
     correcting.value = false

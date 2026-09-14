@@ -141,7 +141,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import client from '../../api/client'
@@ -175,6 +175,9 @@ async function loadOwners() {
   if (!isPrivileged.value) return
   owners.value = (await client.get('/bureau/owners')).data.data
 }
+// 刷新/新标签页直接进入时 auth.user 还没到（MainLayout 挂载后才 fetchMe），onMounted 里的 loadOwners
+// 会被门禁跳过且不再重试——下拉永远为空、承办人列只剩裸账号名。用户信息到达后补拉一次。
+watch(isPrivileged, (v) => { if (v && !owners.value.length) loadOwners() })
 
 async function openTransfer() {
   transfer.fromOwner = ownerFilter.value

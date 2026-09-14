@@ -995,7 +995,7 @@ public class CaseService {
         }
         Long total = jdbc.queryForObject("select count(*) from case_file" + where, Long.class, args.toArray());
         args.add(size);
-        args.add((Math.max(page, 1) - 1) * size);
+        args.add((long) (Math.max(page, 1) - 1) * size);
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "select * from case_file" + where + " order by id desc limit ? offset ?", args.toArray());
         return Map.of("total", total == null ? 0 : total, "page", page, "size", size, "rows", rows);

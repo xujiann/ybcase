@@ -72,12 +72,20 @@ public class BureauLawController {
             if (!"HOLIDAY".equals(kind) && !"SHIFT_WORK".equals(kind))
                 throw new cn.ybcase.bureau.common.BizException(2100,
                         "第 " + (i + 1) + " 行类型无效：" + kind + "（须为 HOLIDAY 或 SHIFT_WORK）");
-            args.add(new Object[]{day, kind, r.get("name")});
+            String name = r.get("name");
+            if (name != null && name.length() > 64)
+                throw new cn.ybcase.bureau.common.BizException(2100, "第 " + (i + 1) + " 行名称超过 64 字");
+            args.add(new Object[]{day, kind, name});
         }
         jdbc.batchUpdate("""
                 insert into sys_holiday (day, kind, name) values (?, ?, ?)
                 on conflict (day) do update set kind = excluded.kind, name = excluded.name""", args);
-        config.evictHolidays();
+        // 方法在事务内：提交前失效缓存会被并发的 plusWorkdays 用未提交的旧表重新装回（TTL 30s 内期限算错），
+        // 与 SysConfigController.update 同一模式，改为提交后失效
+        org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                new org.springframework.transaction.support.TransactionSynchronization() {
+                    @Override public void afterCommit() { config.evictHolidays(); }
+                });
         return R.ok(Map.of("count", args.size(), "missingYears", config.missingHolidayYears()));
     }
 
