@@ -242,16 +242,17 @@ public class FormalizationController {
         if (month == null || !month.matches("\\d{4}-\\d{2}"))
             throw new BizException(2100, "月份格式须为 yyyy-MM（收到：" + month + "）");
         LocalDate monthStart = LocalDate.parse(month + "-01");
+        // request_id 是用户反馈直报 ↔ 服务端记录对账的钥匙（V11），导出缺它则报障请求号在唯一能拿到的审计文件里对不上
         var rows = jdbc.queryForList("""
-                select id, username, method, path, http_status, client_ip, created_at
+                select id, username, method, path, http_status, client_ip, created_at, request_id
                 from sys_audit_log where created_at >= ? and created_at < ? order by id""",
                 monthStart, monthStart.plusMonths(1));
-        StringBuilder sb = new StringBuilder("﻿id,用户,方法,路径,状态码,IP,时间\n");
+        StringBuilder sb = new StringBuilder("﻿id,用户,方法,路径,状态码,IP,时间,请求号\n");
         for (var r : rows) {
             sb.append(r.get("id")).append(',').append(nv(r.get("username"))).append(',')
               .append(r.get("method")).append(',').append(nv(r.get("path"))).append(',')
               .append(r.get("http_status")).append(',').append(nv(r.get("client_ip"))).append(',')
-              .append(r.get("created_at")).append('\n');
+              .append(r.get("created_at")).append(',').append(nv(r.get("request_id"))).append('\n');
         }
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=audit-" + month + ".csv")

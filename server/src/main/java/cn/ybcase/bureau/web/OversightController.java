@@ -145,7 +145,8 @@ public class OversightController {
                 from case_decision d
                 join case_file cf on cf.id = d.case_id
                 join case_cause cc on cc.id = cf.cause_id
-                where d.published = true order by d.published_at desc limit 2000""");
+                where d.published = true and d.publish_withdrawn = false
+                order by d.published_at desc limit 2000""");
         for (var r : rows) {
             if ("INDIVIDUAL".equals(r.get("party_type"))) {
                 String name = (String) r.get("party_name");

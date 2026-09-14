@@ -191,6 +191,30 @@ public class OversightService {
                 kind, amount, LocalDate.now(), "BANK", "分期缴纳第 " + seq + " 期（自动入账）", null));
     }
 
+    // ---------- 处罚决定公开撤回（行政处罚法第48条第2款） ----------
+
+    /**
+     * 决定被复议/诉讼撤销、变更或确认违法后，三日内撤回公开并说明理由。
+     * 只写撤回字段、不回改 published：公示导出据 publish_withdrawn 排除，
+     * 而"曾于何日公开"这一事实（含 7 日内公开的超期证据）须原样保留。
+     */
+    @Transactional
+    public void withdrawPublish(Long caseId, String reason, String operator) {
+        if (reason == null || reason.isBlank()) throw new BizException(2138, "须填写撤回公开的理由（撤销/变更/确认违法的文书依据）");
+        var rows = jdbc.queryForList(
+                "select published, publish_withdrawn from case_decision where case_id = ?", caseId);
+        if (rows.isEmpty() || !Boolean.TRUE.equals(rows.get(0).get("published")))
+            throw new BizException(2136, "该案处罚决定尚未公开，无需撤回");
+        if (Boolean.TRUE.equals(rows.get(0).get("publish_withdrawn")))
+            throw new BizException(2137, "该决定的公开已撤回，不可重复登记");
+        int n = jdbc.update("""
+                update case_decision set publish_withdrawn = true, withdrawn_at = now(),
+                       withdraw_reason = ?, withdrawn_by = ?
+                where case_id = ? and published = true and publish_withdrawn = false""",
+                reason.trim(), operator, caseId);
+        if (n == 0) throw new BizException(2137, "该决定的公开已撤回，不可重复登记");   // 并发兜底
+    }
+
     // ---------- 专家评审（第25条，期间不计入办案期限） ----------
 
     @Transactional
