@@ -379,6 +379,13 @@ public class DocumentService {
                     add(events, toDate(r.get("notified_at")), "处罚告知", "");
                     add(events, toDate(r.get("hearing_held_at")), "听证", "");
                 });
+        // 要素更正逐字段入大事记（全过程记录）；created_at 是 timestamptz，::date 按会话时区（=JVM 业务时区）取日
+        jdbc.queryForList("select created_at::date as d, field, old_value, new_value, reason"
+                        + " from case_correction where case_id = ? order by id", caseId)
+                .forEach(r -> add(events, toDate(r.get("d")), "要素更正",
+                        CaseService.CORRECTION_FIELD_LABELS.getOrDefault((String) r.get("field"), (String) r.get("field"))
+                                + " " + nv((String) r.get("old_value")) + "→" + nv((String) r.get("new_value"))
+                                + "（" + r.get("reason") + "）"));
         events.sort(Comparator.comparing(e -> (LocalDate) e.get("date")));
         return events;
     }

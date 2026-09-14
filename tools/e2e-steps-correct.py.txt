@@ -1,0 +1,71 @@
+    # ======== 案件要素更正通道 + 线索分页检索（correct）：粘贴到 main() 末尾 ========
+    step("要素更正：建案后改当事人名称+涉案金额，name 重算、corrections 留痕、大事记入账")
+    cr_case = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "partyName": "要素更正医院", "partyType": "PROVIDER",
+        "procedureType": "NORMAL", "amountInvolved": 1000, "summary": "要素更正测试",
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                     {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]})
+    cr_fixed = admin.call("PUT", f"/bureau/cases/{cr_case['id']}/party-info", json={
+        "partyName": "要素更正医院（更正后）", "amountInvolved": 2500.5, "reason": "立案时名称与金额录错"})
+    ok(cr_fixed["partyName"] == "要素更正医院（更正后）"
+       and cr_fixed["name"] == "要素更正医院（更正后）涉嫌" + cause13["category"] + "案",
+       f"name 重算：{cr_fixed['name']}")
+    cr_detail = admin.get(f"/bureau/cases/{cr_case['id']}")
+    ok(cr_detail["caseFile"]["name"] == cr_fixed["name"] and float(cr_detail["caseFile"]["amountInvolved"]) == 2500.5,
+       "详情 name/金额已变")
+    cr_rows = cr_detail["corrections"]
+    ok(len(cr_rows) == 3 and {r["field"] for r in cr_rows} == {"partyName", "amountInvolved", "name"}
+       and len({r["batch_no"] for r in cr_rows}) == 1 and all(r["operator"] == "admin" for r in cr_rows),
+       f"详情带回更正记录 {len(cr_rows)} 行（同批次）")
+    ok(len(admin.get(f"/bureau/cases/{cr_case['id']}/corrections")) == 3, "GET /corrections 独立接口")
+    cr_tl = admin.get(f"/bureau/cases/{cr_case['id']}/timeline")
+    ok(any(e["kind"] == "要素更正" and "当事人名称" in e["detail"] and "录错" in e["detail"] for e in cr_tl),
+       "大事记含要素更正")
+
+    step("要素更正守卫：空理由 2121 / 无变化 2122 / 案由主体不符 2001 / 法制角色 403 / 同主体换案由 name 随案由")
+    admin.call("PUT", f"/bureau/cases/{cr_case['id']}/party-info",
+               json={"partyName": "X", "reason": " "}, expect_code=2121)
+    admin.call("PUT", f"/bureau/cases/{cr_case['id']}/party-info",
+               json={"partyName": "要素更正医院（更正后）", "amountInvolved": 2500.50, "reason": "无变化"}, expect_code=2122)
+    cr_ind = next(c for c in admin.get("/bureau/causes") if c["subjectType"] == "INDIVIDUAL")
+    admin.call("PUT", f"/bureau/cases/{cr_case['id']}/party-info",
+               json={"causeId": cr_ind["id"], "reason": "案由选错"}, expect_code=2001)
+    Api("fazhi").call("PUT", f"/bureau/cases/{cr_case['id']}/party-info",
+                      json={"partyAddress": "法制改的", "reason": "x"}, expect_code=403)
+    cr_other = next(c for c in admin.get("/bureau/causes")
+                    if c["subjectType"] == "PROVIDER" and c["id"] != cause13["id"])
+    cr_fixed2 = admin.call("PUT", f"/bureau/cases/{cr_case['id']}/party-info",
+                           json={"causeId": cr_other["id"], "reason": "案由选错"})
+    ok(cr_fixed2["causeId"] == cr_other["id"] and cr_fixed2["name"] == "要素更正医院（更正后）涉嫌" + cr_other["category"] + "案",
+       f"案由更正后 name={cr_fixed2['name']}")
+    ok(len(admin.get(f"/bureau/cases/{cr_case['id']}/corrections")) == 5, "案由+name 再记 2 行")
+
+    step("要素更正状态守卫：推进到已告知后更正拒 2120")
+    admin.post(f"/bureau/cases/{cr_case['id']}/report", json={"content": "调查终结"})
+    admin.call("PUT", f"/bureau/cases/{cr_case['id']}/party-info",
+               json={"partyContact": "13800000000", "reason": "调查终结阶段仍可改"})
+    admin.post(f"/bureau/cases/{cr_case['id']}/notice", json={"content": "拟罚", "proposedFine": 100, "proposedRecoup": 0})
+    admin.call("PUT", f"/bureau/cases/{cr_case['id']}/party-info",
+               json={"partyContact": "13900000000", "reason": "已告知后不可改"}, expect_code=2120)
+
+    step("线索分页检索：登记3条 → page=1&size=2 total≥3 rows==2 → q/日期区间命中 → 不传 page 仍返回数组")
+    cr_tag = "分页检索" + datetime.datetime.now().strftime("%H%M%S%f")
+    for i in range(3):
+        admin.post("/bureau/clues", json={
+            "source": "COMPLAINT", "content": f"{cr_tag} 内容{i}", "suspectName": f"{cr_tag}药店{i}",
+            "suspectType": "PROVIDER", "receivedAt": str(today)})
+    cr_pg = admin.get("/bureau/clues", params={"page": 1, "size": 2})
+    ok(cr_pg["total"] >= 3 and len(cr_pg["rows"]) == 2 and "clue_no" in cr_pg["rows"][0],
+       f"分页 total={cr_pg['total']} rows={len(cr_pg['rows'])}（蛇形列）")
+    cr_hit = admin.get("/bureau/clues", params={"page": 1, "size": 10, "q": cr_tag})
+    ok(cr_hit["total"] == 3 and all(cr_tag in r["suspect_name"] for r in cr_hit["rows"]), "q 检索命中 3 条")
+    cr_hit2 = admin.get("/bureau/clues", params={
+        "page": 2, "size": 2, "q": cr_tag, "status": "PENDING", "from": str(today), "to": str(today)})
+    ok(cr_hit2["total"] == 3 and len(cr_hit2["rows"]) == 1, "状态+日期区间过滤，第 2 页 1 条")
+    cr_none = admin.get("/bureau/clues", params={
+        "page": 1, "size": 10, "q": cr_tag, "from": str(today + datetime.timedelta(days=1))})
+    ok(cr_none["total"] == 0 and cr_none["rows"] == [], "区间外为空")
+    cr_legacy = admin.get("/bureau/clues")
+    ok(isinstance(cr_legacy, list) and len(cr_legacy) > 0 and "clueNo" in cr_legacy[0], "不传 page 仍返回数组（驼峰，旧契约）")
+    cr_legacy2 = admin.get("/bureau/clues", params={"status": "PENDING"})
+    ok(isinstance(cr_legacy2, list) and all(r["status"] == "PENDING" for r in cr_legacy2), "status 旧契约不变")

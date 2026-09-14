@@ -6,10 +6,11 @@ import cn.ybcase.bureau.service.ClueService;
 import cn.ybcase.core.common.R;
 import static cn.ybcase.bureau.common.ReqValues.*;
 import lombok.RequiredArgsConstructor;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.List;
+import java.time.LocalDate;
 import java.util.Map;
 
 @RestController
@@ -21,9 +22,18 @@ public class ClueController {
     private final CaseClueRepository clueRepository;
 
     @GetMapping
-    public R<List<CaseClue>> list(@RequestParam(required = false) String status) {
-        return R.ok(status == null ? clueRepository.findTop200ByOrderByIdDesc()
-                : clueRepository.findTop200ByStatusOrderByIdDesc(status));
+    public R<?> list(@RequestParam(required = false) String status,
+                     @RequestParam(required = false) String q,
+                     @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+                     @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+                     @RequestParam(required = false) Integer page,
+                     @RequestParam(defaultValue = "20") int size) {
+        // 未传 page 保持旧契约（返回数组，最近 200 条；E2E 依赖）；传了 page 走分页+检索
+        if (page == null) {
+            return R.ok(status == null ? clueRepository.findTop200ByOrderByIdDesc()
+                    : clueRepository.findTop200ByStatusOrderByIdDesc(status));
+        }
+        return R.ok(clueService.pageList(status, q, from, to, page, Math.min(Math.max(size, 1), 100)));
     }
 
     @PostMapping

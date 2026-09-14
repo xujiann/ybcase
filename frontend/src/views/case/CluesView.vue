@@ -3,7 +3,12 @@
     <div class="toolbar">
       <h3>线索管理<span class="hint">（收到之日起 15 个工作日内核查并决定是否立案，可延长一次）</span></h3>
       <div>
-        <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 130px; margin-right: 8px" @change="load">
+        <el-input v-model="q" placeholder="线索编号/嫌疑人/内容" clearable style="width: 200px; margin-right: 8px"
+                  @keyup.enter="reload" @clear="reload" />
+        <el-date-picker v-model="range" type="daterange" value-format="YYYY-MM-DD" unlink-panels
+                        start-placeholder="收到起" end-placeholder="收到止" style="width: 240px; margin-right: 8px"
+                        @change="reload" />
+        <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 130px; margin-right: 8px" @change="reload">
           <el-option v-for="(v, k) in CLUE_STATUS" :key="k" :label="v" :value="k" />
         </el-select>
         <el-button @click="onImport">监控疑点导入</el-button>
@@ -47,6 +52,9 @@
         </template>
       </el-table-column>
     </el-table>
+    <el-pagination style="margin-top: 12px; justify-content: flex-end"
+                   layout="total, prev, pager, next" :total="total" :page-size="pageSize"
+                   :current-page="page" @current-change="(p: number) => { page = p; load() }" />
 
     <el-dialog v-model="createVisible" title="登记线索" width="560px">
       <el-form :model="form" label-width="90px">
@@ -100,12 +108,34 @@ function todayLocal() {
 }
 const today = todayLocal()
 const form = reactive({ source: 'COMPLAINT', suspectName: '', suspectType: 'PROVIDER', receivedAt: today, content: '', handler: '' })
+const q = ref('')
+const range = ref<[string, string] | null>(null)
+const page = ref(1)
+const pageSize = 20
+const total = ref(0)
+
+/** 筛选条件变化回到第一页，否则新条件下当前页可能越界成空表 */
+function reload() {
+  page.value = 1
+  load()
+}
 
 async function load() {
   loading.value = true
   try {
-    const resp = await client.get('/bureau/clues', { params: statusFilter.value ? { status: statusFilter.value } : {} })
-    records.value = resp.data.data
+    const params: any = { page: page.value, size: pageSize }
+    if (statusFilter.value) params.status = statusFilter.value
+    if (q.value.trim()) params.q = q.value.trim()
+    if (range.value?.[0]) params.from = range.value[0]
+    if (range.value?.[1]) params.to = range.value[1]
+    const resp = await client.get('/bureau/clues', { params })
+    // 分页接口返回 snake_case 行（JdbcTemplate），统一映射为模板与操作按钮读取的驼峰字段
+    records.value = resp.data.data.rows.map((r: any) => ({
+      id: r.id, clueNo: r.clue_no, source: r.source, suspectName: r.suspect_name, suspectType: r.suspect_type,
+      content: r.content, receivedAt: r.received_at, deadlineAt: r.deadline_at, extended: r.extended,
+      status: r.status, verifyResult: r.verify_result,
+    }))
+    total.value = resp.data.data.total
   } finally {
     loading.value = false
   }

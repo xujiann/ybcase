@@ -59,10 +59,7 @@ public class CaseService {
                 || req.officers().stream().map(OfficerReq::certNo).filter(java.util.Objects::nonNull)
                        .map(String::trim).distinct().count() < 2)
             throw new BizException(2002, "执法人员不得少于两人（第16条），且须为不同执法证号");
-        CaseCause cause = causeRepository.findById(req.causeId())
-                .orElseThrow(() -> new BizException(2026, "案由不存在"));
-        if (!cause.getSubjectType().equals(req.partyType()))
-            throw new BizException(2001, "当事人类别与案由违法主体类别不一致（苏医保督〔2024〕1号）");
+        CaseCause cause = requireCauseMatch(req.causeId(), req.partyType());
 
         CaseFile c = new CaseFile();
         LocalDate today = LocalDate.now();
@@ -81,8 +78,7 @@ public class CaseService {
         c.setEnforceItemId(req.enforceItemId());
         c.setCaseNo(cfg("case_no_prefix", "医保案") + "〔" + today.getYear() + "〕"
                 + seqService.next("CASE", today.getYear()) + "号");
-        // 调查阶段案件名称：违法主体+涉嫌+案由+案
-        c.setName(req.partyName() + "涉嫌" + cause.getCategory() + "案");
+        c.setName(investigatingName(req.partyName(), cause));
         c.setClueId(req.clueId());
         c.setCauseId(req.causeId());
         c.setProcedureType(req.procedureType() == null ? "NORMAL" : req.procedureType());
@@ -111,6 +107,108 @@ public class CaseService {
         }
         if (req.clueId() != null) clueService.markFiled(req.clueId(), req.clueVerifyResult());
         return c;
+    }
+
+    /** 案由主体与当事人类别一致性（2001）：立案与案由更正共用同一口径 */
+    private CaseCause requireCauseMatch(Long causeId, String partyType) {
+        CaseCause cause = causeRepository.findById(causeId)
+                .orElseThrow(() -> new BizException(2026, "案由不存在"));
+        if (!cause.getSubjectType().equals(partyType))
+            throw new BizException(2001, "当事人类别与案由违法主体类别不一致（苏医保督〔2024〕1号）");
+        return cause;
+    }
+
+    /** 调查阶段案件名称：违法主体+涉嫌+案由+案（决定后去"涉嫌"，另有路径） */
+    private static String investigatingName(String partyName, CaseCause cause) {
+        return partyName + "涉嫌" + cause.getCategory() + "案";
+    }
+
+    // ---------- 案件要素更正（留痕，局令第4/35条） ----------
+
+    /** 更正记录 field 列 → 中文名（大事记与前端共用同一份） */
+    public static final Map<String, String> CORRECTION_FIELD_LABELS = Map.of(
+            "partyName", "当事人名称", "partyCreditNo", "证照号", "partyAddress", "地址",
+            "partyLegalRep", "法定代表人", "partyContact", "联系方式", "summary", "案情摘要",
+            "amountInvolved", "涉案金额", "causeId", "案由", "name", "案件名称");
+
+    /** 字段为空 = 不更正；传空串 = 清空（partyName 除外，不允许清空） */
+    public record CorrectionReq(String partyName, String partyCreditNo, String partyAddress,
+                                String partyLegalRep, String partyContact, String summary,
+                                BigDecimal amountInvolved, Long causeId, String reason) {}
+
+    /**
+     * 立案后要素录错的系统内更正通道：此前只能直连库改且不留痕（审计只记 method/path）。
+     * 仅调查阶段（INVESTIGATING/REPORTED）可改——已告知/已决定的案件，当事人已依据告知内容行使权利，
+     * 要素变动须走更正决定书路径重新履行程序，而不是悄悄改底表。
+     */
+    @Transactional
+    public CaseFile correctPartyInfo(Long caseId, CorrectionReq req, String operator) {
+        CaseFile c = get(caseId);
+        if (!"INVESTIGATING".equals(c.getStatus()) && !"REPORTED".equals(c.getStatus()))
+            throw new BizException(2120, "案件当前状态（" + c.getStatus()
+                    + "）不允许更正要素：已告知/已决定的案件请通过更正决定书路径处理");
+        if (req.reason() == null || req.reason().isBlank())
+            throw new BizException(2121, "须填写更正理由");
+
+        // 顺序即记录顺序；name 派生自 partyName/案由，放最后
+        List<String[]> changes = new java.util.ArrayList<>();
+        String partyName = c.getPartyName();
+        if (req.partyName() != null) {
+            if (req.partyName().isBlank()) throw new BizException(2123, "当事人名称不能为空");
+            partyName = diffText(changes, "partyName", c.getPartyName(), req.partyName());
+            c.setPartyName(partyName);
+        }
+        c.setPartyCreditNo(diffText(changes, "partyCreditNo", c.getPartyCreditNo(), req.partyCreditNo()));
+        c.setPartyAddress(diffText(changes, "partyAddress", c.getPartyAddress(), req.partyAddress()));
+        c.setPartyLegalRep(diffText(changes, "partyLegalRep", c.getPartyLegalRep(), req.partyLegalRep()));
+        c.setPartyContact(diffText(changes, "partyContact", c.getPartyContact(), req.partyContact()));
+        c.setSummary(diffText(changes, "summary", c.getSummary(), req.summary()));
+        if (req.amountInvolved() != null) {
+            if (req.amountInvolved().signum() < 0) throw new BizException(2123, "涉案金额不能为负数");
+            BigDecimal old = nz(c.getAmountInvolved());
+            if (old.compareTo(req.amountInvolved()) != 0) {
+                changes.add(new String[]{"amountInvolved", old.toPlainString(), req.amountInvolved().toPlainString()});
+                c.setAmountInvolved(req.amountInvolved());
+            }
+        }
+        CaseCause cause = causeRepository.findById(c.getCauseId()).orElse(null);
+        if (req.causeId() != null && !req.causeId().equals(c.getCauseId())) {
+            CaseCause next = requireCauseMatch(req.causeId(), c.getPartyType());
+            changes.add(new String[]{"causeId", causeText(cause), causeText(next)});
+            c.setCauseId(next.getId());
+            cause = next;
+        }
+        if (changes.isEmpty()) throw new BizException(2122, "没有任何要素发生变化，无需更正");
+        if (cause != null) {
+            String name = investigatingName(partyName, cause);
+            if (!name.equals(c.getName())) {
+                changes.add(new String[]{"name", c.getName(), name});
+                c.setName(name);
+            }
+        }
+
+        String batchNo = java.util.UUID.randomUUID().toString().replace("-", "");
+        for (String[] ch : changes)
+            jdbc.update("insert into case_correction (case_id, batch_no, field, old_value, new_value, reason, operator)"
+                    + " values (?,?,?,?,?,?,?)", caseId, batchNo, ch[0], ch[1], ch[2], req.reason().trim(), operator);
+        return caseRepository.save(c);
+    }
+
+    public List<Map<String, Object>> corrections(Long caseId) {
+        get(caseId);
+        return jdbc.queryForList("select * from case_correction where case_id = ? order by id desc", caseId);
+    }
+
+    /** 文本要素比对：null 表示未传（保持原值），空串表示清空；变化则记一行并返回新值 */
+    private static String diffText(List<String[]> changes, String field, String oldVal, String reqVal) {
+        if (reqVal == null) return oldVal;
+        String next = reqVal.trim().isEmpty() ? null : reqVal.trim();
+        if (!java.util.Objects.equals(oldVal, next)) changes.add(new String[]{field, oldVal, next});
+        return next;
+    }
+
+    private static String causeText(CaseCause cause) {
+        return cause == null ? null : cause.getItemNo() + ". " + cause.getCategory() + "——" + cause.getDescription();
     }
 
     // ---------- 办案人员 ----------
@@ -791,7 +889,8 @@ public class CaseService {
             "assists|case_assist|id",
             "deliveries|case_delivery|id",
             "executions|case_execution|id",
-            "approvals|biz_approval|id desc");
+            "approvals|biz_approval|id desc",
+            "corrections|case_correction|id desc");
 
     private static final String DETAIL_SQL = buildDetailSql();
 
