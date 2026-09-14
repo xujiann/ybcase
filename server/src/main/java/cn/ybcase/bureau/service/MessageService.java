@@ -189,10 +189,22 @@ public class MessageService {
             send(recipient, kind, title, content, link, dedupKey);
             return;
         }
-        for (String leader : leaders) {
-            send(leader, kind, "【" + roleLabel + "已停用】" + title,
+        // 无启用负责人（空库只有 admin、或负责人临时停用）时退回管理员：否则消息被静默丢弃，
+        // 比投进停用账号的信箱更不可见，而线索核查 15 工作日错过即 2022 失权
+        List<String> targets = leaders.isEmpty() ? enabledAdmins() : leaders;
+        if (targets.isEmpty()) log.warn("期限提醒无人可收：{} {} 已停用且无启用的负责人/管理员（{}）", roleLabel, recipient, title);
+        for (String t : targets) {
+            send(t, kind, "【" + roleLabel + "已停用】" + title,
                     roleLabel + " " + recipient + " 已停用，请移交或指定接手人；" + content,
                     link, dedupKey + "-INACTIVE");
         }
+    }
+
+    private List<String> enabledAdmins() {
+        return jdbc.queryForList("""
+                select u.username from sys_user u
+                join sys_user_role ur on ur.user_id = u.id join sys_role r on r.id = ur.role_id
+                where r.code = 'ADMIN' and u.enabled = true order by u.username""").stream()
+                .map(u -> (String) u.get("username")).toList();
     }
 }

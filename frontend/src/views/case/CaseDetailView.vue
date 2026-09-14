@@ -379,7 +379,7 @@
               <el-descriptions-item label="裁量理由" :span="2">{{ detail.decision.discretionReason || '-' }}</el-descriptions-item>
               <el-descriptions-item label="公开">
                 <template v-if="detail.decision.published">
-                  <span v-if="detail.decision.publishWithdrawn" class="danger">已撤回公开（{{ String(detail.decision.withdrawnAt || '').slice(0, 10) }}）：{{ detail.decision.withdrawReason }}</span>
+                  <span v-if="detail.decision.publishWithdrawn" class="danger">已撤回公开（{{ fmtDate(detail.decision.withdrawnAt) }}）：{{ detail.decision.withdrawReason }}</span>
                   <template v-else>
                     <span>已公开 {{ detail.decision.publishedAt }}</span>
                     <el-button v-if="isLeader" size="small" text type="danger" @click="onPublishWithdraw">撤回公开</el-button>
@@ -830,7 +830,7 @@ import client, { LARGE_TRANSFER } from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import {
   CASE_STATUS, CASE_STATUS_TAG, DECISION_TYPE, DELIVERY_METHOD, DOC_TYPE,
-  EVIDENCE_TYPE, EXCLUSION_REASON, EXEC_KIND, EXEC_METHOD, PARTY_TYPE, REVIEW_OPINION, fmtTime,
+  EVIDENCE_TYPE, EXCLUSION_REASON, EXEC_KIND, EXEC_METHOD, PARTY_TYPE, REVIEW_OPINION, fmtTime, fmtDate,
 } from './labels'
 
 const auth = useAuthStore()

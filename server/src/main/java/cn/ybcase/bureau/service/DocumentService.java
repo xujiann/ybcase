@@ -244,8 +244,12 @@ public class DocumentService {
                             + "\n从轻/减轻情节：" + sv(dd.get("mitigation"))
                             + "\n裁量理由：" + sv(dd.get("discretion_reason"))
                             + "\n政府备案号：" + sv(dd.get("gov_record_no"))
+                            // 撤回是第 48 条第 2 款的履职事实，案卷是复议/诉讼时唯一对外载体，只写"已公开"会与时间轴矛盾
                             + "\n公开：" + (Boolean.TRUE.equals(dd.get("published"))
-                                ? "已公开于 " + dt(dd.get("published_at")) : "未公开"),
+                                ? "已公开于 " + dt(dd.get("published_at"))
+                                    + (Boolean.TRUE.equals(dd.get("publish_withdrawn"))
+                                        ? "，于 " + dt(dd.get("withdrawn_on")) + " 撤回公开（" + sv(dd.get("withdraw_reason")) + "）" : "")
+                                : "未公开"),
                     dt(dd.get("decided_at")), ""));
         }
         for (var r : jdbc.queryForList("""

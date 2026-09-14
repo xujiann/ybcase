@@ -9,16 +9,21 @@ cd /opt/ybcase || exit 1
 
 LOG=/opt/ybcase/healthcheck.log
 STATE=/opt/ybcase/.health-state        # 上次结果：OK 或 FAIL:<epoch of last alert>
-[ -f .env ] && set -a && . ./.env && set +a
-DOMAIN="${DEMO_DOMAIN:-}"
-DISK_LIMIT="${ALERT_DISK_PERCENT:-85}"
-BACKUP_MAX_AGE_H="${ALERT_BACKUP_MAX_AGE_HOURS:-30}"
+# 不能 source .env：口令里一个 $ 就让 set -u 把整个脚本静默杀死（cron 下无人知晓），
+# 含 ( 或引号则其后所有行丢失。只按键名逐个提取，值原样取用（compose 对同一文件也是按字面处理）
+envval() { sed -n "s/^[[:space:]]*$1=//p" .env 2>/dev/null | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
+DOMAIN="$(envval DEMO_DOMAIN)"
+ALERT_WEBHOOK="$(envval ALERT_WEBHOOK)"
+ALERT_WEBHOOK_TYPE="$(envval ALERT_WEBHOOK_TYPE)"
+DISK_LIMIT="$(envval ALERT_DISK_PERCENT)"; DISK_LIMIT="${DISK_LIMIT:-85}"
+BACKUP_MAX_AGE_H="$(envval ALERT_BACKUP_MAX_AGE_HOURS)"; BACKUP_MAX_AGE_H="${BACKUP_MAX_AGE_H:-30}"
 
 problems=()
 
 # ① 公网入口：走真实域名与 TLS，和用户看到的一致。用 config/public（免登录、经反代到 app）
 if [ -n "$DOMAIN" ]; then
-    code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$DOMAIN/api/config/public" 2>/dev/null || echo 000)
+    # curl 传输失败时 -w 仍会打出 000，不能再 || echo 000（否则变成 000000）
+    code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$DOMAIN/api/config/public" 2>/dev/null) || code=000
     [ "$code" = "200" ] || problems+=("公网入口 https://$DOMAIN/api/config/public 返回 $code")
 fi
 

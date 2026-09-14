@@ -54,6 +54,15 @@ export const REVIEW_OPINION: Record<string, string> = {
 }
 
 /** 时间戳展示：后端返回 ISO（带毫秒与时区偏移），直接塞进表格既难读又容易被误读为别的时刻 */
+/** JPA 实体里的 Instant 经 Jackson 恒输出 UTC（尾缀 Z），直接 slice(0,10) 在北京 0-8 点会得到前一天；按浏览器本地时区取日历日 */
+export function fmtDate(v?: string | null): string {
+  if (!v) return '—'
+  const d = new Date(String(v))
+  if (isNaN(d.getTime())) return String(v).slice(0, 10)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
 export function fmtTime(v?: string | null): string {
   if (!v) return '—'
   const s = String(v)
