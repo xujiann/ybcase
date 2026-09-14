@@ -95,4 +95,37 @@ public class ClueService {
     public CaseClue get(Long id) {
         return clueRepository.findById(id).orElseThrow(() -> new BizException(2025, "线索不存在"));
     }
+
+    /**
+     * 分页+关键词检索（线索编号/嫌疑人/内容）+ 受理日期区间。与 CaseService.pageList 同模式
+     * （count + limit/offset，JdbcTemplate 蛇形列名）；线索无数据范围概念，不做 SELF 收窄。
+     */
+    public java.util.Map<String, Object> pageList(String status, String q, LocalDate from, LocalDate to,
+                                                  int page, int size) {
+        StringBuilder where = new StringBuilder(" where 1=1 ");
+        java.util.List<Object> args = new java.util.ArrayList<>();
+        if (status != null && !status.isBlank()) {
+            where.append(" and status = ? ");
+            args.add(status);
+        }
+        if (q != null && !q.isBlank()) {
+            where.append(" and (clue_no ilike ? or suspect_name ilike ? or content ilike ?) ");
+            String like = "%" + q.trim() + "%";
+            args.add(like); args.add(like); args.add(like);
+        }
+        if (from != null) {
+            where.append(" and received_at >= ? ");
+            args.add(from);
+        }
+        if (to != null) {
+            where.append(" and received_at <= ? ");
+            args.add(to);
+        }
+        Long total = jdbc.queryForObject("select count(*) from case_clue" + where, Long.class, args.toArray());
+        args.add(size);
+        args.add((Math.max(page, 1) - 1) * size);
+        java.util.List<java.util.Map<String, Object>> rows = jdbc.queryForList(
+                "select * from case_clue" + where + " order by id desc limit ? offset ?", args.toArray());
+        return java.util.Map.of("total", total == null ? 0 : total, "page", page, "size", size, "rows", rows);
+    }
 }

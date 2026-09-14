@@ -48,6 +48,20 @@ public class CaseController {
         return R.ok(caseService.detail(id));
     }
 
+    /** 案件要素更正（留痕）：办案/负责人/管理员可改，法制不参与要素认定；数据范围由 CaseScopeInterceptor 统一校验 */
+    @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
+    @PutMapping("/{id}/party-info")
+    public R<CaseFile> correctPartyInfo(@PathVariable Long id, @RequestBody CaseService.CorrectionReq req,
+                                        Authentication auth) {
+        return R.ok(caseService.correctPartyInfo(id, req, auth.getName()));
+    }
+
+    /** 要素更正记录（详情接口 corrections 已带回，此处供单独查询） */
+    @GetMapping("/{id}/corrections")
+    public R<List<Map<String, Object>>> corrections(@PathVariable Long id) {
+        return R.ok(caseService.corrections(id));
+    }
+
     /** 案件移交（承办人变更，负责人操作） */
     @PreAuthorize("hasAnyRole('LEADER','ADMIN')")
     @PostMapping("/{id}/transfer-owner")

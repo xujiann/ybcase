@@ -16,6 +16,9 @@
         <el-button @click="$router.push('/case/list')">返回列表</el-button>
       </div>
       <el-descriptions :column="3" border size="small" class="mb">
+        <template #extra>
+          <el-button v-if="canCorrect" size="small" @click="openCorrection">更正要素</el-button>
+        </template>
         <el-descriptions-item label="当事人">{{ c.partyName }}（{{ PARTY_TYPE[c.partyType] }}）</el-descriptions-item>
         <el-descriptions-item label="证照号">{{ c.partyCreditNo || '-' }}</el-descriptions-item>
         <el-descriptions-item label="法定代表人">{{ c.partyLegalRep || '-' }}</el-descriptions-item>
@@ -28,6 +31,61 @@
           {{ CLOSE_REASON[c.closeReason] || c.closeReason }}（{{ c.closedAt }}）　案卷号：{{ c.archiveNo }}
         </el-descriptions-item>
       </el-descriptions>
+      <!-- 要素更正记录（有记录才显示；蛇形列来自详情接口 json_agg） -->
+      <el-collapse v-if="corrections.length" class="mb">
+        <el-collapse-item :title="`更正记录（${corrections.length}）`" name="corrections">
+          <el-table :data="corrections" size="small" border>
+            <el-table-column label="时间" width="140">
+              <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="字段" width="100">
+              <template #default="{ row }">{{ CORRECTION_FIELD[row.field] || row.field }}</template>
+            </el-table-column>
+            <el-table-column prop="old_value" label="原值" show-overflow-tooltip />
+            <el-table-column prop="new_value" label="新值" show-overflow-tooltip />
+            <el-table-column prop="reason" label="更正理由" show-overflow-tooltip />
+            <el-table-column prop="operator" label="操作人" width="100" />
+          </el-table>
+        </el-collapse-item>
+      </el-collapse>
+      <el-dialog v-model="correctionVisible" title="更正案件要素（留痕）" width="640px">
+        <el-form :model="correctionForm" label-width="110px">
+          <el-form-item label="当事人名称">
+            <el-input v-model="correctionForm.partyName" />
+          </el-form-item>
+          <el-form-item label="案由">
+            <el-select v-model="correctionForm.causeId" style="width: 100%" filterable placeholder="按当事人类别筛选">
+              <el-option v-for="x in causes.filter((y) => y.subjectType === c.partyType)" :key="x.id"
+                         :label="`${x.itemNo}. ${x.category}——${x.description}`" :value="x.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="证照/证件号">
+            <el-input v-model="correctionForm.partyCreditNo" />
+          </el-form-item>
+          <el-form-item label="地址">
+            <el-input v-model="correctionForm.partyAddress" />
+          </el-form-item>
+          <el-form-item label="法定代表人">
+            <el-input v-model="correctionForm.partyLegalRep" />
+          </el-form-item>
+          <el-form-item label="联系方式">
+            <el-input v-model="correctionForm.partyContact" />
+          </el-form-item>
+          <el-form-item label="涉案金额">
+            <el-input-number v-model="correctionForm.amountInvolved" :min="0" :precision="2" style="width: 200px" />
+          </el-form-item>
+          <el-form-item label="案情摘要">
+            <el-input v-model="correctionForm.summary" type="textarea" :rows="3" />
+          </el-form-item>
+          <el-form-item label="更正理由" required>
+            <el-input v-model="correctionForm.reason" type="textarea" :rows="2" placeholder="必填：说明录错原因（全过程记录，第4/35条）" />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="correctionVisible = false">取消</el-button>
+          <el-button type="primary" @click="onCorrect" :loading="correcting">提交更正</el-button>
+        </template>
+      </el-dialog>
       <!-- 流程操作：按状态提供合法动作 -->
       <div class="actions">
         <template v-if="c.status === 'INVESTIGATING'">
@@ -1478,6 +1536,60 @@ watch(() => route.params.id, (nv, ov) => {
     load()
   }
 })
+
+// ---------- 案件要素更正（留痕；仅调查阶段，法制不参与要素认定） ----------
+import { fmtTime } from './labels'
+const CORRECTION_FIELD: Record<string, string> = {
+  partyName: '当事人名称', partyCreditNo: '证照号', partyAddress: '地址', partyLegalRep: '法定代表人',
+  partyContact: '联系方式', summary: '案情摘要', amountInvolved: '涉案金额', causeId: '案由', name: '案件名称',
+}
+const corrections = computed<any[]>(() => detail.value.corrections || [])
+const canCorrect = computed(() => ['INVESTIGATING', 'REPORTED'].includes(c.value.status)
+  && !!auth.user?.roles?.some((r: string) => ['HANDLER', 'LEADER', 'ADMIN'].includes(r)))
+const correctionVisible = ref(false)
+const correcting = ref(false)
+const causes = ref<any[]>([])
+const correctionForm = reactive<any>({})
+/** 打开弹窗时的回填快照，提交只发有变化的字段（后端无变化拒 2122） */
+let correctionSnapshot: any = {}
+
+async function openCorrection() {
+  if (!causes.value.length) causes.value = (await client.get('/bureau/causes')).data.data
+  correctionSnapshot = {
+    partyName: c.value.partyName || '', partyCreditNo: c.value.partyCreditNo || '',
+    partyAddress: c.value.partyAddress || '', partyLegalRep: c.value.partyLegalRep || '',
+    partyContact: c.value.partyContact || '', summary: c.value.summary || '',
+    amountInvolved: Number(c.value.amountInvolved || 0), causeId: c.value.causeId,
+  }
+  Object.assign(correctionForm, correctionSnapshot, { reason: '' })
+  correctionVisible.value = true
+}
+
+async function onCorrect() {
+  if (correcting.value) return
+  const body: any = {}
+  for (const k of Object.keys(correctionSnapshot)) {
+    if (correctionForm[k] !== correctionSnapshot[k]) body[k] = correctionForm[k]
+  }
+  if (!Object.keys(body).length) {
+    ElMessage.warning('没有任何要素发生变化')
+    return
+  }
+  if (!String(correctionForm.reason || '').trim()) {
+    ElMessage.warning('请填写更正理由')
+    return
+  }
+  body.reason = correctionForm.reason
+  correcting.value = true
+  try {
+    await client.put(`/bureau/cases/${id.value}/party-info`, body)
+    ElMessage.success('已更正并留痕')
+    correctionVisible.value = false
+    load()
+  } finally {
+    correcting.value = false
+  }
+}
 </script>
 
 <style scoped>
