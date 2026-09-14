@@ -2,6 +2,8 @@
   <div v-loading="loading">
     <el-alert type="info" :closable="false" class="mb"
               title="督办看板：按法定时限自动预警——线索核查15个工作日、法制审核10个工作日、办案期限90日（含延长与扣除）、送达7个工作日、先行登记保存7个工作日、封存30日；决定作出后继续跟到执行终了——缴款期、催告、法院强制执行申请期（缴款期满起3个月，逾期即失权）" />
+    <el-alert v-if="d.holidayMissing?.length" type="error" :closable="false" class="mb"
+              :title="`${d.holidayMissing.join('、')} 年法定节假日表尚未录入：在录入之前，该年度所有按工作日计算的期限只跳周末、不跳节假日，下方工作日口径的预警可能失真。请管理员在「系统管理 → 节假日表」按国办通知批量录入。`" />
     <el-alert v-if="anyTruncated" type="warning" :closable="false" class="mb"
               :title="`部分类别条目较多，每类仅显示最紧急的前 ${d.topN} 条（按期限升序）。完整清单请到对应业务页按条件筛选。`" />
     <el-row :gutter="12">

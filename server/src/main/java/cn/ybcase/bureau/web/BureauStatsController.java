@@ -204,6 +204,9 @@ public class BureauStatsController {
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.seal_expire_at, ev.seal_extended
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.sealed = true and ev.seal_expire_at < current_date + 5 order by ev.seal_expire_at"""));
+        // 节假日表缺年：不是案件预警，是"以上所有工作日口径的预警本身可能算错"的前提告警，
+        // 故单独一个键（年份列表），前端在看板顶部挂红条
+        m.put("holidayMissing", cfg.missingHolidayYears());
         // 前端据此提示"共 N 条，仅显示最紧急的前 N 条"
         m.put("truncated", truncated);
         m.put("topN", top);

@@ -406,6 +406,29 @@ def main():
     finally:
         admin.call("DELETE", f"/bureau/holidays/{hol}")
 
+    step("节假日表：2026 调休上班已种（缺 SHIFT_WORK 会把期限静默往后推）；覆盖度自检；按年批量录入")
+    y2026 = admin.get("/bureau/holidays", params={"year": 2026})
+    ok(any(r["kind"] == "SHIFT_WORK" for r in y2026), "2026 年含调休上班记录")
+    cov = admin.get("/bureau/holidays/coverage")
+    ok(isinstance(cov.get("missingYears"), list), f"覆盖度自检可用（缺年 {cov['missingYears']}）")
+    sup_h = admin.get("/bureau/stats/supervision")
+    ok(isinstance(sup_h.get("holidayMissing"), list), "督办看板带 holidayMissing 键")
+    # 批量：一行类型错整批拒绝，不能录一半
+    admin.post("/bureau/holidays/batch", json=[
+        {"day": "2099-01-01", "kind": "HOLIDAY", "name": "E2E元旦"},
+        {"day": "2099-01-04", "kind": "BAD", "name": "x"}], expect_code=2100)
+    ok(admin.get("/bureau/holidays", params={"year": 2099}) == [], "整批拒绝后 2099 年无残留")
+    try:
+        r = admin.post("/bureau/holidays/batch", json=[
+            {"day": "2099-01-01", "kind": "HOLIDAY", "name": "E2E元旦"},
+            {"day": "2099-01-04", "kind": "SHIFT_WORK", "name": "E2E调休"}])
+        ok(r["count"] == 2, "批量录入 2 条")
+        rows99 = admin.get("/bureau/holidays", params={"year": 2099})
+        ok(len(rows99) == 2 and {x["kind"] for x in rows99} == {"HOLIDAY", "SHIFT_WORK"}, "按年筛选取回 2 条")
+    finally:
+        admin.call("DELETE", "/bureau/holidays/2099-01-01")
+        admin.call("DELETE", "/bureau/holidays/2099-01-04")
+
     step("文书模板渲染：告知书带出当事人与法律依据条文")
     admin.post(f"/bureau/cases/{tcase['id']}/report", json={"content": "调查终结"})
     admin.post(f"/bureau/cases/{tcase['id']}/notice", json={

@@ -58,7 +58,7 @@ cp -r "$SRC/frontend/dist/." "$DEPLOY/dist/"
 # 同步最新的运维脚本与编排配置。
 # 此前只同步了两个脚本，compose/Caddyfile 的改动（时区、working_dir、日志轮转、安全头）
 # 永远到不了线上——源码改了、线上还是旧配置，且从部署日志完全看不出来。
-cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh
+cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$SRC"/deploy/healthcheck.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh "$DEPLOY"/healthcheck.sh
 CADDY_CHANGED=0
 if ! cmp -s "$SRC/deploy/Caddyfile" "$DEPLOY/Caddyfile"; then CADDY_CHANGED=1; fi
 cp "$SRC"/deploy/docker-compose.yml "$SRC"/deploy/Caddyfile "$DEPLOY/"

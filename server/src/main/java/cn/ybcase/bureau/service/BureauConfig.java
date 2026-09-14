@@ -99,6 +99,28 @@ public class BureauConfig {
         return Workdays.plus(from, n, h.off(), h.shiftWork());
     }
 
+    /**
+     * 节假日表覆盖度自检：返回"应有而没有放假记录"的年份。
+     * plusWorkdays 查到空集不报错、直接退化成只跳周末——2027-01-01 起线索核查 15 工作日、
+     * 法制审核 10 工作日、先行登记保存 7 工作日、送达/简易备案 7 工作日全部静默算错，
+     * 且没有任何地方提醒管理员"该维护明年的表了"。当年恒查；次年从 11 月起查
+     * （国办通知通常 11 月发布，且 11-12 月起算的期限已会跨年）。
+     */
+    public List<Integer> missingHolidayYears() {
+        LocalDate today = LocalDate.now();
+        List<Integer> years = new java.util.ArrayList<>();
+        years.add(today.getYear());
+        if (today.getMonthValue() >= 11) years.add(today.getYear() + 1);
+        List<Integer> missing = new java.util.ArrayList<>();
+        for (int y : years) {
+            Integer n = jdbc.queryForObject(
+                    "select count(*) from sys_holiday where kind = 'HOLIDAY' and extract(year from day) = ?",
+                    Integer.class, y);
+            if (n == null || n == 0) missing.add(y);
+        }
+        return missing;
+    }
+
     /** 按当事人类型取阈值（自然人 / 单位：经办机构、定点医药机构、其他主体） */
     public BigDecimal byPartyType(String partyType, String individualKey, String orgKey, String def) {
         return "INDIVIDUAL".equals(partyType) ? decimal(individualKey, def) : decimal(orgKey, def);

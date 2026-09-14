@@ -23,6 +23,7 @@ public class BureauUserInitializer implements ApplicationRunner {
     private final PasswordEncoder passwordEncoder;
     private final EntityManager entityManager;
     private final org.springframework.core.env.Environment env;
+    private final cn.ybcase.bureau.service.BureauConfig config;
 
     @Override
     @Transactional
@@ -49,6 +50,10 @@ public class BureauUserInitializer implements ApplicationRunner {
             }
         }
         linkEnforcersToAccounts();
+        // 启动即报一次节假日覆盖度：运维看日志就能发现"明年的表还没录"，不必等到工作日 8 点的提醒
+        var missing = config.missingHolidayYears();
+        if (!missing.isEmpty())
+            log.warn("法定节假日表缺 {} 年数据：该年度工作日口径的法定期限将只跳周末，请在节假日表页批量录入", missing);
     }
 
     /**

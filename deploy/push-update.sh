@@ -23,10 +23,10 @@ echo "[2/4] 上传到 $HOST:/opt/ybcase/（新 inode，不碰运行中的文件�
 scp "$JAR" "$HOST:/opt/ybcase/ybcase-server.jar.new"
 ssh "$HOST" "rm -rf /opt/ybcase/dist.new"
 scp -r frontend/dist "$HOST:/opt/ybcase/dist.new"          # 目标不存在时 scp -r 才是整目录复制
-scp deploy/upgrade.sh deploy/backup.sh "$HOST:/opt/ybcase/"
+scp deploy/upgrade.sh deploy/backup.sh deploy/healthcheck.sh "$HOST:/opt/ybcase/"
 
 echo "[3/4] 远程：升级前备份 → 留回滚点 → 原子替换 jar → 原地更新 dist 内容（保住 Caddy 挂载的 inode）"
-ssh "$HOST" 'set -e; cd /opt/ybcase; chmod +x upgrade.sh backup.sh
+ssh "$HOST" 'set -e; cd /opt/ybcase; chmod +x upgrade.sh backup.sh healthcheck.sh
   ./backup.sh
   [ -f ybcase-server.jar ] && cp -f ybcase-server.jar ybcase-server.jar.prev
   mv -f ybcase-server.jar.new ybcase-server.jar

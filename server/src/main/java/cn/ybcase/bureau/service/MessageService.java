@@ -31,13 +31,18 @@ public class MessageService {
 
     /** 发给某角色的全部启用用户 */
     public void sendToRole(String roleCode, String kind, String title, String content, String link) {
+        sendToRole(roleCode, kind, title, content, link, null);
+    }
+
+    /** 同上，带去重键（唯一索引按 (username, dedup_key)，同一键对每个收件人各去重一次） */
+    public void sendToRole(String roleCode, String kind, String title, String content, String link, String dedupKey) {
         List<Map<String, Object>> users = jdbc.queryForList("""
                 select u.username from sys_user u
                 join sys_user_role ur on ur.user_id = u.id
                 join sys_role r on r.id = ur.role_id
                 where r.code = ? and u.enabled = true""", roleCode);
         for (var u : users) {
-            send((String) u.get("username"), kind, title, content, link, null);
+            send((String) u.get("username"), kind, title, content, link, dedupKey);
         }
     }
 
@@ -147,6 +152,14 @@ public class MessageService {
                     "反馈「" + r.get("title") + "」已自动关闭",
                     "已解决满 " + autoDays + " 天未确认，系统自动关闭；如未解决请重新提交",
                     "/my/feedback", "FEEDBACK-AUTOCLOSE-" + r.get("id"));
+            n++;
+        }
+        // 节假日表缺年 → 管理员（每月提醒一次直到录入；次年从 11 月起算，见 BureauConfig.missingHolidayYears）
+        for (int year : config.missingHolidayYears()) {
+            sendToRole("ADMIN", "SYSTEM", "【请维护】" + year + " 年法定节假日表尚未录入",
+                    "在录入之前，" + year + " 年内所有按工作日计算的法定期限（线索核查/法制审核/先行登记保存/送达/简易备案）"
+                            + "只跳周末、不跳节假日，期限会算短、督办看板会误报超期。请按国办放假通知在「节假日表」页批量录入。",
+                    "/system/holidays", "HOLIDAY-MISSING-" + year + "-" + today.substring(0, 7));
             n++;
         }
         log.info("期限提醒生成 {} 条", n);

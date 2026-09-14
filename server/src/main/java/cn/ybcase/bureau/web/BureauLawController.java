@@ -48,6 +48,39 @@ public class BureauLawController {
         return R.ok();
     }
 
+    /** 覆盖度自检：缺放假记录的年份（当年恒查，次年 11 月起查）；节假日页红条与督办看板共用 */
+    @GetMapping("/holidays/coverage")
+    public R<Map<String, Object>> holidayCoverage() {
+        return R.ok(Map.of("missingYears", config.missingHolidayYears()));
+    }
+
+    /**
+     * 按年批量录入：一年约 30 条放假 + 若干调休，逐日点选漏录概率高。
+     * 每行 {day, kind, name}，全部校验通过才写库（一条格式错整批拒绝，避免录一半）。
+     */
+    @PostMapping("/holidays/batch")
+    @PreAuthorize("hasRole('ADMIN')")
+    @org.springframework.transaction.annotation.Transactional
+    public R<Map<String, Object>> batchHolidays(@RequestBody List<Map<String, String>> rows) {
+        if (rows == null || rows.isEmpty()) throw new cn.ybcase.bureau.common.BizException(2100, "没有可导入的行");
+        if (rows.size() > 400) throw new cn.ybcase.bureau.common.BizException(2100, "单次最多导入 400 行");
+        List<Object[]> args = new java.util.ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            Map<String, String> r = rows.get(i);
+            java.time.LocalDate day = reqDate(r, "day", "第 " + (i + 1) + " 行日期");
+            String kind = r.getOrDefault("kind", "HOLIDAY");
+            if (!"HOLIDAY".equals(kind) && !"SHIFT_WORK".equals(kind))
+                throw new cn.ybcase.bureau.common.BizException(2100,
+                        "第 " + (i + 1) + " 行类型无效：" + kind + "（须为 HOLIDAY 或 SHIFT_WORK）");
+            args.add(new Object[]{day, kind, r.get("name")});
+        }
+        jdbc.batchUpdate("""
+                insert into sys_holiday (day, kind, name) values (?, ?, ?)
+                on conflict (day) do update set kind = excluded.kind, name = excluded.name""", args);
+        config.evictHolidays();
+        return R.ok(Map.of("count", args.size(), "missingYears", config.missingHolidayYears()));
+    }
+
     @DeleteMapping("/holidays/{day}")
     @PreAuthorize("hasRole('ADMIN')")
     public R<Void> deleteHoliday(@PathVariable String day) {
