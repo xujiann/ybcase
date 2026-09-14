@@ -426,6 +426,18 @@
       </template>
     </el-dialog>
 
+    <!-- 模板生成：库里有 14 种模板，此前用 prompt 让用户手打英文枚举码且只放行 6 种——
+         催告书/中止决定书/先行登记保存决定书等 8 种"系统自己指的路自己堵死"（强执前置报错让做 URGE_LETTER，入口却拒收） -->
+    <el-dialog v-model="dlg.tplPick" title="按模板生成文书" width="460px">
+      <el-select v-model="tplPickType" filterable style="width: 100%" placeholder="选择文书类型（仅列出已配置模板的类型）">
+        <el-option v-for="t in tplOptions" :key="t.doc_type" :label="DOC_TYPE[t.doc_type] || t.doc_type" :value="t.doc_type" />
+      </el-select>
+      <div class="hint" style="margin-top: 8px">生成后进入"制作文书"窗口，可修改正文后保存；模板正文由管理员在「文书模板」页维护。</div>
+      <template #footer>
+        <el-button @click="dlg.tplPick = false">取消</el-button>
+        <el-button type="primary" :disabled="!tplPickType" @click="onRenderTplConfirm">生成</el-button>
+      </template>
+    </el-dialog>
     <el-dialog v-model="dlg.document" title="制作文书" width="600px">
       <el-form label-width="90px">
         <el-form-item label="类型">
@@ -784,8 +796,10 @@ const dlg = reactive<Record<string, boolean>>({
   officer: false, evidence: false, document: false, exclusion: false, report: false,
   notice: false, statement: false, meeting: false, decide: false, deliver: false,
   execution: false, doc: false, catalog: false, hearing: false, review: false, installment: false,
-  apply: false, docDeliver: false, eConsent: false,
+  apply: false, docDeliver: false, eConsent: false, tplPick: false,
 })
+const tplOptions = ref<any[]>([])
+const tplPickType = ref('')
 const eConsentForm = reactive<any>({ receiver: '', channel: '', docNo: '' })
 const uploadCategory = ref('DOC_SCAN')
 /** 附件上限（MB）：与服务端 AttachmentController 的 MAX_SIZE/MAX_AV_SIZE 同口径 */
@@ -852,14 +866,19 @@ async function load() {
 }
 
 async function onRenderTpl() {
-  const { value: docType } = await ElMessageBox.prompt(
-    '文书类型：NOTICE 告知书 / DECISION 决定书 / FINAL_REPORT 终结报告 / ORDER_CORRECT 责令改正 / CLOSE_REPORT 结案报告 / ASSIST_LETTER 协查函',
-    '模板生成', { inputValue: 'NOTICE', inputPattern: /^(NOTICE|DECISION|FINAL_REPORT|ORDER_CORRECT|CLOSE_REPORT|ASSIST_LETTER)$/, inputErrorMessage: '类型无效' })
-  const resp = await client.get(`/bureau/cases/${id.value}/documents/render`, { params: { docType } })
+  // 选项来自 doc_template 表：以后管理员新增模板类型无需改前端
+  if (!tplOptions.value.length) tplOptions.value = (await client.get('/bureau/doc-templates')).data.data || []
+  if (!tplPickType.value) tplPickType.value = tplOptions.value.some((t: any) => t.doc_type === 'NOTICE') ? 'NOTICE' : (tplOptions.value[0]?.doc_type || '')
+  dlg.tplPick = true
+}
+
+async function onRenderTplConfirm() {
+  const resp = await client.get(`/bureau/cases/${id.value}/documents/render`, { params: { docType: tplPickType.value } })
   const d = resp.data.data
   documentForm.docType = d.docType
   documentForm.title = d.title
   documentForm.content = d.content
+  dlg.tplPick = false
   dlg.document = true
 }
 

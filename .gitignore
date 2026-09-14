@@ -11,3 +11,6 @@ deploy/*.jar
 deploy/*.dump
 data/
 __pycache__/
+
+# 并行代理的 git worktree
+.claude/worktrees/
