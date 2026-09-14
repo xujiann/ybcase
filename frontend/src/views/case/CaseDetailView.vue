@@ -823,7 +823,7 @@ import client, { LARGE_TRANSFER } from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import {
   CASE_STATUS, CASE_STATUS_TAG, DECISION_TYPE, DELIVERY_METHOD, DOC_TYPE,
-  EVIDENCE_TYPE, EXCLUSION_REASON, EXEC_KIND, EXEC_METHOD, PARTY_TYPE, REVIEW_OPINION,
+  EVIDENCE_TYPE, EXCLUSION_REASON, EXEC_KIND, EXEC_METHOD, PARTY_TYPE, REVIEW_OPINION, fmtTime,
 } from './labels'
 
 const auth = useAuthStore()
@@ -1538,7 +1538,6 @@ watch(() => route.params.id, (nv, ov) => {
 })
 
 // ---------- 案件要素更正（留痕；仅调查阶段，法制不参与要素认定） ----------
-import { fmtTime } from './labels'
 const CORRECTION_FIELD: Record<string, string> = {
   partyName: '当事人名称', partyCreditNo: '证照号', partyAddress: '地址', partyLegalRep: '法定代表人',
   partyContact: '联系方式', summary: '案情摘要', amountInvolved: '涉案金额', causeId: '案由', name: '案件名称',
