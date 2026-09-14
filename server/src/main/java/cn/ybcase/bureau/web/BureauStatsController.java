@@ -204,6 +204,17 @@ public class BureauStatsController {
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.seal_expire_at, ev.seal_extended
                 from case_evidence ev join case_file cf on cf.id = ev.case_id
                 where ev.sealed = true and ev.seal_expire_at < current_date + 5 order by ev.seal_expire_at"""));
+        // 执法证 30 日内到期/已过期（第16条）：证只在立案/加人那一刻校验，到期前无人知晓，
+        // 办案员上午还在办案、下午立案被 2055 硬拦才发现；顺带给出其名下在办件数（按证号关联办案人员）
+        put.accept("enforcerCertExpiring", jdbc.queryForList("""
+                select e.id, e.name, e.cert_no, e.dept, e.cert_expire_at,
+                       (e.cert_expire_at < current_date) as expired,
+                       (select count(*) from case_officer o join case_file cf on cf.id = o.case_id
+                         where o.cert_no = e.cert_no and o.avoided = false
+                           and cf.status not in ('CLOSED','TERMINATED')) as active_cases
+                from enforcer e
+                where e.enabled = true and e.cert_expire_at < current_date + 30
+                order by e.cert_expire_at, e.id"""));
         // 前端据此提示"共 N 条，仅显示最紧急的前 N 条"
         m.put("truncated", truncated);
         m.put("topN", top);

@@ -869,11 +869,21 @@ public class CaseService {
     /** 分页+关键词检索（案号/案名/当事人），含范围过滤 */
     public Map<String, Object> pageList(String status, String q, int page, int size,
                                         String username, boolean privileged) {
+        return pageList(status, q, null, page, size, username, privileged);
+    }
+
+    /** owner 非空时按承办人收窄（交接清单）；其余条件与旧签名完全一致 */
+    public Map<String, Object> pageList(String status, String q, String owner, int page, int size,
+                                        String username, boolean privileged) {
         StringBuilder where = new StringBuilder(" where 1=1 ");
         List<Object> args = new java.util.ArrayList<>();
         if (status != null && !status.isBlank()) {
             where.append(" and status = ? ");
             args.add(status);
+        }
+        if (owner != null && !owner.isBlank()) {
+            where.append(" and owner_user = ? ");
+            args.add(owner.trim());
         }
         if (q != null && !q.isBlank()) {
             where.append(" and (case_no ilike ? or name ilike ? or party_name ilike ?) ");

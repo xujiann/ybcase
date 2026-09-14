@@ -5,8 +5,10 @@ import cn.ybcase.core.entity.SysRole;
 import cn.ybcase.core.entity.SysUser;
 import cn.ybcase.core.repository.SysRoleRepository;
 import cn.ybcase.core.repository.SysUserRepository;
+import cn.ybcase.core.spi.UserDeactivationGuard;
 import jakarta.validation.constraints.NotBlank;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -26,6 +28,8 @@ public class SysUserController {
     private final SysUserRepository userRepository;
     private final SysRoleRepository roleRepository;
     private final PasswordEncoder passwordEncoder;
+    // 业务模块（server）注册的停用守卫；core 不依赖 server，故经 SPI 反向询问
+    private final ObjectProvider<UserDeactivationGuard> deactivationGuards;
 
     public record UserDto(Long id, String username, String realName, String title,
                           Long deptId, String phone, Boolean enabled, List<String> roleCodes, java.time.Instant lockedUntil) {
@@ -112,6 +116,14 @@ public class SysUserController {
         SysUser u = userRepository.findById(id).orElse(null);
         if (u == null) return R.fail(1103, "用户不存在");
         if ("admin".equals(u.getUsername()) && !enabled) return R.fail(1104, "不能停用内置管理员");
+        // 名下尚有在办事项（如案件）的账号停用后事项无人接手、期限提醒进死信箱：先移交再停用。
+        // 与 update 同理，必须在改任何字段之前返回，否则受管实体会被脏检查刷库
+        if (!enabled) {
+            for (UserDeactivationGuard guard : deactivationGuards) {
+                List<String> blockers = guard.blockers(u.getUsername());
+                if (blockers != null && !blockers.isEmpty()) return R.fail(1105, String.join("；", blockers));
+            }
+        }
         u.setEnabled(enabled);
         // 停用须立即断开在线会话，否则对方手中的令牌可继续使用至过期
         if (!enabled) u.setTokenVersion(u.getTokenVersion() + 1);

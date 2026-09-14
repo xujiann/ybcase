@@ -83,8 +83,11 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import client from '../../api/client'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
+import client, { recentErrors } from '../../api/client'
+
+const router = useRouter()
 
 interface UserRow {
   id: number | null
@@ -164,7 +167,20 @@ async function onUnlock(row: any) {
 }
 
 async function toggleEnabled(row: UserRow) {
-  await client.put(`/system/users/${row.id}/enabled`, null, { params: { enabled: !row.enabled } })
+  try {
+    await client.put(`/system/users/${row.id}/enabled`, null, { params: { enabled: !row.enabled } })
+  } catch (e) {
+    // 1105：名下尚有在办案件，后端拒绝停用并回带案号清单（拦截器已弹错误提示）。
+    // 拦截器抛出的 Error 不带业务码，从最近错误快照里取；给管理员一个直达交接清单的入口
+    const last = recentErrors[recentErrors.length - 1]
+    if (last?.bizCode === 1105) {
+      ElMessageBox.confirm(last.message, '停用受阻：请先移交在办案件', {
+        confirmButtonText: '去移交', cancelButtonText: '知道了', type: 'warning',
+      }).then(() => router.push({ path: '/case/list', query: { owner: row.username } }))
+        .catch(() => { /* 知道了 */ })
+    }
+    return
+  }
   await load()
 }
 

@@ -10,7 +10,9 @@
       <el-table-column prop="dept" label="部门" width="160" />
       <el-table-column label="有效期至" width="130">
         <template #default="{ row }">
-          <span :class="{ danger: row.cert_expire_at < today }">{{ row.cert_expire_at }}</span>
+          <span :class="{ danger: row.cert_expire_at < today, warnText: row.cert_expire_at >= today && row.cert_expire_at < soon }">
+            {{ row.cert_expire_at }}</span>
+          <el-tag v-if="row.cert_expire_at >= today && row.cert_expire_at < soon" type="warning" size="small" style="margin-left: 4px">30日内到期</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="法律职业资格" width="120">
@@ -64,11 +66,12 @@ import client from '../../api/client'
 const rows = ref<any[]>([])
 const loading = ref(false)
 const dlg = ref(false)
-function todayLocal() {
-  const d = new Date()
+function ymd(d: Date) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
-const today = todayLocal()
+const today = ymd(new Date())
+// 与督办看板 enforcerCertExpiring 同口径：30 日内到期即临期
+const soon = ymd(new Date(Date.now() + 30 * 86400000))
 const users = ref<any[]>([])
 const form = reactive<any>({ name: '', certNo: '', dept: '', certExpireAt: '', legalQualified: false, enabled: true, userId: null })
 
