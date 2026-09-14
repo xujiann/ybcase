@@ -1,7 +1,7 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <h3>参数设置<span class="hint">（期限/限额/阈值全部可配；默认=新《行政处罚法》+国家局令第4号，辽宁口径可切换，修改留痕入审计）</span></h3>
+      <h3>参数设置<span class="hint">（期限/限额/阈值全部可配；默认=新《行政处罚法》+国家局令第4号，辽宁口径可切换，修改留痕（可查历史））</span></h3>
       <div>
         <el-input v-model="auditMonth" placeholder="YYYY-MM" style="width: 110px; margin-right: 6px" />
         <el-button size="small" @click="onAuditExport">导出审计日志</el-button>
@@ -17,7 +17,24 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="说明" show-overflow-tooltip />
+      <el-table-column label="历史" width="70">
+        <template #default="{ row }">
+          <el-button size="small" text type="primary" @click="onHistory(row)">历史</el-button>
+        </template>
+      </el-table-column>
     </el-table>
+
+    <el-drawer v-model="historyVisible" :title="`变更历史：${historyKey}`" size="520px">
+      <el-table :data="historyRows" border stripe size="small" v-loading="historyLoading"
+                empty-text="暂无变更记录">
+        <el-table-column label="时间" width="160">
+          <template #default="{ row }">{{ String(row.changed_at || '').replace('T', ' ').slice(0, 19) }}</template>
+        </el-table-column>
+        <el-table-column prop="old_value" label="原值" show-overflow-tooltip />
+        <el-table-column prop="new_value" label="新值" show-overflow-tooltip />
+        <el-table-column prop="changed_by" label="操作人" width="100" />
+      </el-table>
+    </el-drawer>
   </el-card>
 </template>
 
@@ -59,6 +76,22 @@ async function load() {
 async function onSave(row: { key: string; value: string }) {
   await client.put(`/config/${row.key}?value=${encodeURIComponent(row.value)}`)
   ElMessage.success(`已保存 ${row.key}`)
+}
+
+const historyVisible = ref(false)
+const historyLoading = ref(false)
+const historyKey = ref('')
+const historyRows = ref<{ changed_at: string; old_value: string; new_value: string; changed_by: string }[]>([])
+
+async function onHistory(row: { key: string }) {
+  historyKey.value = row.key
+  historyVisible.value = true
+  historyLoading.value = true
+  try {
+    historyRows.value = (await client.get(`/config/${row.key}/history`)).data.data
+  } finally {
+    historyLoading.value = false
+  }
 }
 
 onMounted(load)

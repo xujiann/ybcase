@@ -386,6 +386,14 @@ public class DocumentService {
                         CaseService.CORRECTION_FIELD_LABELS.getOrDefault((String) r.get("field"), (String) r.get("field"))
                                 + " " + nv((String) r.get("old_value")) + "→" + nv((String) r.get("new_value"))
                                 + "（" + r.get("reason") + "）"));
+        // 公开与撤回公开都是第 48 条监督链上的事实：withdrawn_at 是 timestamptz，按业务日历日取 date
+        jdbc.queryForList("""
+                select published_at, (withdrawn_at at time zone 'Asia/Shanghai')::date as withdrawn_at, withdraw_reason
+                from case_decision where case_id = ?""", caseId)
+                .forEach(r -> {
+                    add(events, toDate(r.get("published_at")), "决定公开", "");
+                    add(events, toDate(r.get("withdrawn_at")), "撤回公开", nv((String) r.get("withdraw_reason")));
+                });
         events.sort(Comparator.comparing(e -> (LocalDate) e.get("date")));
         return events;
     }

@@ -34,10 +34,34 @@ public class SysConfigController {
 
     @PutMapping("/{key}")
     @PreAuthorize("hasRole('ADMIN')")
-    public R<Void> update(@PathVariable String key, @RequestParam String value) {
-        int n = jdbc.update("update sys_config set cfg_value = ?, updated_at = now() where cfg_key = ?", value, key);
-        if (n == 0) return R.fail(1401, "配置项不存在");
-        events.publishEvent(new cn.ybcase.core.common.ConfigChangedEvent(key));  // 参数缓存立即失效
+    @org.springframework.transaction.annotation.Transactional
+    public R<Void> update(@PathVariable String key, @RequestParam String value,
+                          org.springframework.security.core.Authentication auth) {
+        // 期限/阈值类参数一改即对全部在办案件生效，审计只记 method/path 不含 query 里的值：
+        // 旧值→新值→操作人须专表留痕（同一事务），否则复议时"当时按 90 还是 60 天算"无从回答
+        var old = jdbc.queryForList("select cfg_value from sys_config where cfg_key = ? for update", key);
+        if (old.isEmpty()) return R.fail(1401, "配置项不存在");
+        String oldValue = (String) old.get(0).get("cfg_value");
+        if (java.util.Objects.equals(oldValue, value)) return R.ok();   // 同值保存不算变更，不留空历史
+        jdbc.update("update sys_config set cfg_value = ?, updated_at = now() where cfg_key = ?", value, key);
+        jdbc.update("insert into sys_config_history (cfg_key, old_value, new_value, changed_by) values (?,?,?,?)",
+                key, oldValue, value, auth.getName());
+        // 参数缓存失效放在提交之后：方法已是事务，若在提交前失效，并发请求会把旧值重新装回缓存
+        org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                new org.springframework.transaction.support.TransactionSynchronization() {
+                    @Override public void afterCommit() {
+                        events.publishEvent(new cn.ybcase.core.common.ConfigChangedEvent(key));
+                    }
+                });
         return R.ok();
+    }
+
+    /** 参数变更历史（最近 100 条，新在前） */
+    @GetMapping("/{key}/history")
+    @PreAuthorize("hasRole('ADMIN')")
+    public R<java.util.List<Map<String, Object>>> history(@PathVariable String key) {
+        return R.ok(jdbc.queryForList("""
+                select id, cfg_key, old_value, new_value, changed_by, changed_at
+                from sys_config_history where cfg_key = ? order by changed_at desc, id desc limit 100""", key));
     }
 }

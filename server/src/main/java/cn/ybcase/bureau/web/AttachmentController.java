@@ -77,24 +77,65 @@ public class AttachmentController {
         return R.ok();
     }
 
+    /** 已作废附件默认不出列表；仅负责人/管理员可用 includeVoided=true 连同作废记录一起查（复核误传处置） */
     @GetMapping("/{id}/attachments")
-    public R<List<Map<String, Object>>> list(@PathVariable Long id, Authentication auth) {
+    public R<List<Map<String, Object>>> list(@PathVariable Long id,
+                                             @RequestParam(defaultValue = "false") boolean includeVoided,
+                                             Authentication auth) {
         caseService.assertInScope(id, auth.getName(), privileged(auth));
+        boolean withVoided = includeVoided && canManageVoided(auth);
         return R.ok(jdbc.queryForList("""
                 select id, document_id, evidence_id, filename, content_type, size_bytes, category,
-                       (file_path is not null) as external, uploaded_by, uploaded_at
-                from case_attachment where case_id = ? order by id""", id));
+                       (file_path is not null) as external, uploaded_by, uploaded_at,
+                       voided, void_reason, voided_by, voided_at
+                from case_attachment where case_id = ? and (voided = false or ?) order by id""", id, withVoided));
+    }
+
+    /**
+     * 附件作废（误传他案材料/传错版本）：只打标不删文件与 bytea——执法留痕要求作废记录可追溯；
+     * 已归档卷宗不得变动；作废权限限上传人本人或负责人/管理员。
+     */
+    @PostMapping("/{id}/attachments/{attachmentId}/void")
+    public R<Void> voidAttachment(@PathVariable Long id, @PathVariable Long attachmentId,
+                                  @RequestBody(required = false) Map<String, String> body, Authentication auth) {
+        String reason = body == null ? null : body.get("reason");
+        if (reason == null || reason.isBlank()) throw new BizException(2130, "须填写作废理由");
+        var rows = jdbc.queryForList(
+                "select case_id, uploaded_by, voided from case_attachment where id = ?", attachmentId);
+        if (rows.isEmpty() || ((Number) rows.get(0).get("case_id")).longValue() != id)
+            throw new BizException(2134, "附件不存在或不属于本案");
+        var cf = jdbc.queryForList("select status, archive_no from case_file where id = ?", id);
+        if (cf.isEmpty()) throw new BizException(2043, "案件不存在");
+        if ("CLOSED".equals(cf.get(0).get("status")) || cf.get(0).get("archive_no") != null)
+            throw new BizException(2131, "案件已立卷归档，卷内材料不得再作废");
+        if (Boolean.TRUE.equals(rows.get(0).get("voided"))) throw new BizException(2132, "该附件已作废");
+        if (!auth.getName().equals(rows.get(0).get("uploaded_by")) && !canManageVoided(auth))
+            throw new BizException(2133, "仅上传人本人或负责人/管理员可作废附件");
+        int n = jdbc.update("""
+                update case_attachment set voided = true, void_reason = ?, voided_by = ?, voided_at = now()
+                where id = ? and voided = false""", reason.trim(), auth.getName(), attachmentId);
+        if (n == 0) throw new BizException(2132, "该附件已作废");   // 并发双击兜底
+        return R.ok();
+    }
+
+    /** 作废附件的查看/下载权限：负责人或管理员（LEGAL 虽可看案件，但不参与附件误传处置） */
+    private static boolean canManageVoided(Authentication auth) {
+        return auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_LEADER") || a.getAuthority().equals("ROLE_ADMIN"));
     }
 
     @GetMapping("/attachments/{attachmentId}/download")
     public ResponseEntity<org.springframework.core.io.Resource> download(
             @PathVariable Long attachmentId, Authentication auth) {
         var rows = jdbc.queryForList(
-                "select case_id, filename, content_type, size_bytes, data, file_path from case_attachment where id = ?", attachmentId);
+                "select case_id, filename, content_type, size_bytes, data, file_path, voided from case_attachment where id = ?", attachmentId);
         if (rows.isEmpty()) return ResponseEntity.notFound().build();
         caseService.assertInScope(((Number) rows.get(0).get("case_id")).longValue(),
                 auth.getName(), privileged(auth));
         var row = rows.get(0);
+        // 作废件（多为误传的他案个人信息）不再向办案员开放，只留给负责人/管理员复核
+        if (Boolean.TRUE.equals(row.get("voided")) && !canManageVoided(auth))
+            throw new BizException(2135, "该附件已作废，仅负责人/管理员可查看");
 
         // 外置文件走流式：音像件上限 200MB，若 readAllBytes 进堆，
         // 768MB 堆上两三个并发下载即 OOM（整个 JVM 挂掉，不只是这个请求失败）

@@ -24,6 +24,7 @@ public class CaseController {
     private final cn.ybcase.bureau.service.EvidenceService evidenceService;
     private final cn.ybcase.bureau.service.ExecutionService executionService;
     private final cn.ybcase.bureau.service.DocumentService documentService;
+    private final cn.ybcase.bureau.service.OversightService oversightService;
     private final CaseFileRepository caseRepository;
 
 
@@ -252,6 +253,15 @@ public class CaseController {
     @PostMapping("/{id}/publish")
     public R<CaseDecision> publish(@PathVariable Long id) {
         return R.ok(caseService.publish(id));
+    }
+
+    /** 撤回公开（行政处罚法第48条第2款：被撤销/变更/确认违法的决定三日内撤回并说明理由） */
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")
+    @PostMapping("/{id}/publish-withdraw")
+    public R<Void> publishWithdraw(@PathVariable Long id, @RequestBody Map<String, String> body,
+                                   org.springframework.security.core.Authentication auth) {
+        oversightService.withdrawPublish(id, body.get("reason"), auth.getName());
+        return R.ok();
     }
 
     /** 重大处罚决定政府备案（辽54条） */

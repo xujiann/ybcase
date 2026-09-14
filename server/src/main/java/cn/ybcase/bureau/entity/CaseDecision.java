@@ -54,6 +54,18 @@ public class CaseDecision {
 
     private LocalDate publishedAt;
 
+    /** 公开撤回（行政处罚法第48条第2款）：不回改 published，保留"曾公开"事实与超期证据 */
+    @Column(nullable = false)
+    private Boolean publishWithdrawn = false;
+
+    private java.time.Instant withdrawnAt;
+
+    @Column(columnDefinition = "text")
+    private String withdrawReason;
+
+    @Column(length = 64)
+    private String withdrawnBy;
+
     /** 从轻/减轻/不予处罚情形（辽55条） */
     @Column(length = 512)
     private String mitigation;

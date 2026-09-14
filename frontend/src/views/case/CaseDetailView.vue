@@ -249,9 +249,10 @@
               <template #default="{ row }">{{ (row.size_bytes / 1024).toFixed(1) }} KB</template>
             </el-table-column>
             <el-table-column prop="uploaded_by" label="上传人" width="100" />
-            <el-table-column label="下载" width="80">
+            <el-table-column label="操作" width="130">
               <template #default="{ row }">
                 <el-button size="small" text type="primary" @click="onDownload(row)">下载</el-button>
+                <el-button size="small" text type="danger" @click="onVoidAttachment(row)">作废</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -377,7 +378,13 @@
               <el-descriptions-item label="从轻/减轻情形">{{ detail.decision.mitigation || '-' }}</el-descriptions-item>
               <el-descriptions-item label="裁量理由" :span="2">{{ detail.decision.discretionReason || '-' }}</el-descriptions-item>
               <el-descriptions-item label="公开">
-                <span v-if="detail.decision.published">已公开 {{ detail.decision.publishedAt }}</span>
+                <template v-if="detail.decision.published">
+                  <span v-if="detail.decision.publishWithdrawn" class="danger">已撤回公开（{{ String(detail.decision.withdrawnAt || '').slice(0, 10) }}）：{{ detail.decision.withdrawReason }}</span>
+                  <template v-else>
+                    <span>已公开 {{ detail.decision.publishedAt }}</span>
+                    <el-button v-if="isLeader" size="small" text type="danger" @click="onPublishWithdraw">撤回公开</el-button>
+                  </template>
+                </template>
                 <el-button v-else size="small" type="warning" @click="onPublish">公开（7日内）</el-button>
               </el-descriptions-item>
               <el-descriptions-item label="政府备案" :span="2">
@@ -1588,6 +1595,24 @@ async function onCorrect() {
   } finally {
     correcting.value = false
   }
+}
+
+/** 附件作废：只打标不删文件（执法留痕），列表默认不再显示；限上传人本人或负责人，已归档案卷不可 */
+async function onVoidAttachment(row: any) {
+  const { value } = await ElMessageBox.prompt(`作废理由（如：误传他案材料／版本错误重传）— ${row.filename}`, '附件作废',
+    { inputPattern: /\S+/, inputErrorMessage: '必填', type: 'warning' })
+  await client.post(`/bureau/cases/${id.value}/attachments/${row.id}/void`, { reason: value })
+  ElMessage.success('附件已作废（记录保留，列表不再显示）')
+  load()
+}
+
+/** 撤回公开：决定被复议/诉讼撤销、变更或确认违法后三日内撤回（行政处罚法第48条第2款），公示导出即不再包含 */
+async function onPublishWithdraw() {
+  const { value } = await ElMessageBox.prompt('撤回公开的理由（撤销/变更/确认违法的复议决定或判决文号）', '撤回公开',
+    { inputPattern: /\S+/, inputErrorMessage: '必填', type: 'warning' })
+  await client.post(`/bureau/cases/${id.value}/publish-withdraw`, { reason: value })
+  ElMessage.success('已撤回公开')
+  load()
 }
 </script>
 
