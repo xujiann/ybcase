@@ -1744,6 +1744,121 @@ def main():
     ok(all(r["cert_no"] != _cert for r in admin.get("/bureau/stats/supervision")["enforcerCertExpiring"]),
        "停用后不再预警")
 
+    # ============ ops：参数变更留痕 / 附件作废 / 处罚决定公开撤回 / 审计查询补全（V28） ============
+    ops_juzhang = Api("juzhang")
+    ops_banban = Api("banban")
+    ops_fazhi = Api("fazhi")
+    ops_officers = [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                    {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]
+
+    step("参数变更留痕：改两次 → 历史 +2 且旧值/新值衔接；同值保存不写；改回；办案员不可查")
+    _ops_orig = next(r for r in admin.get("/config/all") if r["key"] == "org_short")["value"]
+    _ops_h0 = len(admin.get("/config/org_short/history"))
+    admin.call("PUT", "/config/org_short", params={"value": _ops_orig + "甲"})
+    admin.call("PUT", "/config/org_short", params={"value": _ops_orig + "乙"})
+    _ops_hist = admin.get("/config/org_short/history")
+    ok(len(_ops_hist) == _ops_h0 + 2
+       and _ops_hist[0]["old_value"] == _ops_orig + "甲" and _ops_hist[0]["new_value"] == _ops_orig + "乙"
+       and _ops_hist[1]["old_value"] == _ops_orig and _ops_hist[1]["new_value"] == _ops_orig + "甲"
+       and _ops_hist[0]["changed_by"] == "admin" and _ops_hist[0]["changed_at"],
+       f"历史 {len(_ops_hist)} 条，最新 {_ops_hist[0]['old_value']} → {_ops_hist[0]['new_value']}（admin）")
+    admin.call("PUT", "/config/org_short", params={"value": _ops_orig + "乙"})
+    ok(len(admin.get("/config/org_short/history")) == _ops_h0 + 2, "同值保存不写历史")
+    admin.call("PUT", "/config/org_short", params={"value": _ops_orig})
+    ok(next(r for r in admin.get("/config/all") if r["key"] == "org_short")["value"] == _ops_orig, "参数已改回")
+    ops_banban.get("/config/org_short/history", expect_code=403)
+
+    step("附件作废：理由必填(2130)/非上传人且非负责人拒(2133)/不属本案拒(2134)/作废后列表不见/负责人 includeVoided 可见/下载受限(2135)/重复拒(2132)")
+    _ops_ac = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "附件作废测试医院",
+        "partyType": "PROVIDER", "summary": "附件作废回路", "amountInvolved": 1000, "officers": ops_officers})
+    _ops_r = requests.post(f"{BASE}/bureau/cases/{_ops_ac['id']}/attachments", timeout=15,
+                           files={"file": ("误传病历.txt", "他案病历".encode("utf-8"), "text/plain")},
+                           headers={"Authorization": f"Bearer {ops_banban.token}"})
+    assert _ops_r.json()["code"] == 0, _ops_r.text
+    _ops_att = ops_banban.get(f"/bureau/cases/{_ops_ac['id']}/attachments")[0]
+    ok(_ops_att["uploaded_by"] == "banban" and _ops_att["voided"] is False, "附件已登记（voided=false）")
+    ops_banban.post(f"/bureau/cases/{_ops_ac['id']}/attachments/{_ops_att['id']}/void",
+                    json={"reason": " "}, expect_code=2130)
+    ops_fazhi.post(f"/bureau/cases/{_ops_ac['id']}/attachments/{_ops_att['id']}/void",
+                   json={"reason": "误传"}, expect_code=2133)   # 法制可看案件但不是上传人/负责人
+    _ops_ac2 = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "附件作废他案医院",
+        "partyType": "PROVIDER", "summary": "他案", "amountInvolved": 1000, "officers": ops_officers})
+    ops_juzhang.post(f"/bureau/cases/{_ops_ac2['id']}/attachments/{_ops_att['id']}/void",
+                     json={"reason": "误传"}, expect_code=2134)
+    ops_banban.post(f"/bureau/cases/{_ops_ac['id']}/attachments/{_ops_att['id']}/void",
+                    json={"reason": "误传他案参保人病历"})
+    ok(ops_banban.get(f"/bureau/cases/{_ops_ac['id']}/attachments") == [], "作废后默认列表不见")
+    ok(ops_banban.get(f"/bureau/cases/{_ops_ac['id']}/attachments", params={"includeVoided": "true"}) == [],
+       "办案员 includeVoided 仍不见")
+    _ops_v = ops_juzhang.get(f"/bureau/cases/{_ops_ac['id']}/attachments", params={"includeVoided": "true"})
+    ok(len(_ops_v) == 1 and _ops_v[0]["voided"] is True and _ops_v[0]["void_reason"] == "误传他案参保人病历"
+       and _ops_v[0]["voided_by"] == "banban" and _ops_v[0]["voided_at"], "负责人 includeVoided 可见作废记录")
+    _ops_dl = requests.get(f"{BASE}/bureau/cases/attachments/{_ops_att['id']}/download", timeout=15,
+                           headers={"Authorization": f"Bearer {ops_banban.token}"})
+    ok(_ops_dl.json()["code"] == 2135, "办案员下载作废件拒 2135")
+    _ops_dl2 = requests.get(f"{BASE}/bureau/cases/attachments/{_ops_att['id']}/download", timeout=15,
+                            headers={"Authorization": f"Bearer {ops_juzhang.token}"})
+    ok(_ops_dl2.status_code == 200 and _ops_dl2.content.decode("utf-8") == "他案病历", "负责人仍可下载复核（文件未删）")
+    ops_juzhang.post(f"/bureau/cases/{_ops_ac['id']}/attachments/{_ops_att['id']}/void",
+                     json={"reason": "再作废"}, expect_code=2132)
+
+    step("审计查询：不带分页仍返数组（旧契约）；带 page/size 返 {total,page,size,rows}；path/requestId/from-to 过滤；月导出含请求号")
+    _ops_legacy = admin.get("/audit/logs")
+    ok(isinstance(_ops_legacy, list) and len(_ops_legacy) > 0, f"旧契约数组 {len(_ops_legacy)} 条")
+    _ops_pg = admin.get("/audit/logs", params={"page": 1, "size": 5, "path": "/attachments"})
+    ok(isinstance(_ops_pg, dict) and _ops_pg["total"] >= 1 and _ops_pg["page"] == 1 and _ops_pg["size"] == 5
+       and 1 <= len(_ops_pg["rows"]) <= 5 and all("/attachments" in r["path"] for r in _ops_pg["rows"]),
+       f"分页+路径过滤 total={_ops_pg['total']}")
+    _ops_rid = next((r["request_id"] for r in _ops_pg["rows"] if r.get("request_id")), None)
+    ok(_ops_rid, "审计行带 request_id")
+    _ops_byrid = admin.get("/audit/logs", params={"requestId": _ops_rid, "page": 1, "size": 10})
+    ok(_ops_byrid["total"] >= 1 and all(r["request_id"] == _ops_rid for r in _ops_byrid["rows"]), "按请求号精确查")
+    _ops_rng = admin.get("/audit/logs", params={"from": str(today), "to": str(today), "page": 1, "size": 1})
+    ok(_ops_rng["total"] >= _ops_pg["total"] and len(_ops_rng["rows"]) == 1, f"今日闭区间 total={_ops_rng['total']}")
+    ok(admin.get("/audit/logs", params={"from": str(today + datetime.timedelta(days=1)), "page": 1})["total"] == 0,
+       "明日起无记录")
+    admin.get("/audit/logs", params={"from": "2026/01/01", "page": 1}, expect_code=2139)
+    ok(admin.get("/audit/logs", params={"page": 1, "size": 9999})["size"] == 500, "size 上限 500")
+    _ops_csv = requests.get(f"{BASE}/bureau/audit/export", params={"month": str(today)[:7]}, timeout=15,
+                            headers={"Authorization": f"Bearer {admin.token}"})
+    _ops_head = _ops_csv.content.decode("utf-8").splitlines()[0]
+    ok(_ops_csv.status_code == 200 and _ops_head.endswith("时间,请求号"), f"月导出表头：{_ops_head}")
+
+    step("公开撤回：未公开拒(2136) → 最短路径公开 → 办案员拒(403)/理由必填(2138) → 撤回 → 重复拒(2137)/导出排除/时间轴/详情字段")
+    _ops_pc = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "公开撤回测试医院",
+        "partyType": "PROVIDER", "summary": "撤回公开回路", "amountInvolved": 5000, "officers": ops_officers})
+    ops_juzhang.post(f"/bureau/cases/{_ops_pc['id']}/publish-withdraw", json={"reason": "x"}, expect_code=2136)
+    admin.post(f"/bureau/cases/{_ops_pc['id']}/report", json={"content": "调查终结"})
+    admin.post(f"/bureau/cases/{_ops_pc['id']}/notice", json={"content": "拟罚", "proposedFine": 5000, "proposedRecoup": 0})
+    admin.post(f"/bureau/cases/{_ops_pc['id']}/statement", json={"statementWaived": True})
+    admin.post(f"/bureau/cases/{_ops_pc['id']}/decide", json={
+        "decisionType": "PUNISH", "fineAmount": 5000, "content": "罚款5000元", "discretionReason": "一般情形"})
+    admin.post(f"/bureau/cases/{_ops_pc['id']}/deliver", json={
+        "method": "DIRECT", "deliveredAt": str(today), "receiver": "法定代表人"})
+    ops_juzhang.post(f"/bureau/cases/{_ops_pc['id']}/publish-withdraw", json={"reason": "x"}, expect_code=2136)  # 已决定未公开
+    _ops_pub = admin.post(f"/bureau/cases/{_ops_pc['id']}/publish")
+    ok(_ops_pub["published"] is True and _ops_pub["publishWithdrawn"] is False, "已公开（publishWithdrawn=false）")
+    ok(any(r["decision_no"] == _ops_pub["decisionNo"] for r in admin.get("/bureau/decisions/publish-export")),
+       "公示导出含该决定")
+    ops_banban.post(f"/bureau/cases/{_ops_pc['id']}/publish-withdraw", json={"reason": "x"}, expect_code=403)
+    ops_juzhang.post(f"/bureau/cases/{_ops_pc['id']}/publish-withdraw", json={"reason": ""}, expect_code=2138)
+    ops_juzhang.post(f"/bureau/cases/{_ops_pc['id']}/publish-withdraw",
+                     json={"reason": "复议决定撤销（示复决〔2026〕1号）"})
+    _ops_dec = admin.get(f"/bureau/cases/{_ops_pc['id']}")["decision"]
+    ok(_ops_dec["published"] is True and _ops_dec["publishedAt"] == str(today)
+       and _ops_dec["publishWithdrawn"] is True and _ops_dec["withdrawnBy"] == "juzhang"
+       and _ops_dec["withdrawnAt"] and _ops_dec["withdrawReason"].startswith("复议决定撤销"),
+       "撤回字段落库且 published/publishedAt 原样保留")
+    ops_juzhang.post(f"/bureau/cases/{_ops_pc['id']}/publish-withdraw", json={"reason": "再撤"}, expect_code=2137)
+    ok(not any(r["decision_no"] == _ops_pub["decisionNo"] for r in admin.get("/bureau/decisions/publish-export")),
+       "公示导出已排除撤回决定")
+    _ops_kinds = [e["kind"] for e in admin.get(f"/bureau/cases/{_ops_pc['id']}/timeline")]
+    ok("决定公开" in _ops_kinds and "撤回公开" in _ops_kinds, "时间轴含「决定公开」与「撤回公开」")
+    admin.post(f"/bureau/cases/{_ops_pc['id']}/publish", expect_code=2042)   # 撤回后不能靠重新公开洗白日期
+
     print(f"\n=== 医保案件查办 E2E 全部通过（{step_no} 步）===")
 
 
