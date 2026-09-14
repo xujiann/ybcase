@@ -1,0 +1,90 @@
+    # ============ 人员变动闭环（staff）：离职停用 / 案件交接 / 执法证到期 ============
+    # 合并说明：督办看板新增第 17 类 enforcerCertExpiring，请把 "enforcerCertExpiring" 追加进
+    # 上方"统计与督办"步骤的 _WARN_KEYS 列表（键集合断言与"每类不超过 topN"断言均会自动覆盖到它）。
+    # "承办人已停用时期限提醒转负责人"一项无法经 API 构造（停用守卫 + 移交守卫已把"停用账号名下有在办案件"
+    # 这个状态堵死），由 StaffIntegrationTest 用 jdbc 直改数据覆盖。
+    import time as _time
+    _sfx = str(int(_time.time()))[-6:]
+    _ju = Api("juzhang")
+    _fz = Api("fazhi")
+    _bb = Api("banban")
+
+    step("人员变动：建 HANDLER 账号并移交一案给他")
+    _hd = f"lz{_sfx}"
+    admin.post("/system/users", json={"username": _hd, "password": "Init12345",
+                                      "realName": "离职测试", "roleCodes": ["HANDLER"]})
+    _hd_id = next(u["id"] for u in admin.get("/system/users", params={"size": 200})["records"]
+                  if u["username"] == _hd)
+    _sc = admin.post("/bureau/cases", json={
+        "causeId": cause13["id"], "procedureType": "NORMAL",
+        "partyName": f"人员变动测试医院{_sfx}", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"},
+                     {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}],
+        "amountInvolved": 1000, "summary": "人员变动闭环"})
+    admin.post(f"/bureau/cases/{_sc['id']}/transfer-owner", json={"newOwner": _hd})
+    ok(admin.get(f"/bureau/cases/{_sc['id']}")["caseFile"]["ownerUser"] == _hd, "案件已在离职人员名下")
+
+    step("停用前置校验：名下有在办案件拒 1105 并回带案号，账号不被改动")
+    _resp = requests.put(f"{BASE}/system/users/{_hd_id}/enabled", params={"enabled": "false"},
+                         headers={"Authorization": f"Bearer {admin.token}"}, timeout=15).json()
+    ok(_resp["code"] == 1105 and _sc["caseNo"] in _resp["message"], f"停用被拦：{_resp['message']}")
+    ok(next(u for u in admin.get("/system/users", params={"size": 200})["records"]
+            if u["username"] == _hd)["enabled"] is True, "被拦后账号仍为启用")
+
+    step("承办人清单：LEADER/LEGAL/ADMIN 可见其 1 件在办；HANDLER 403；接收候选")
+    _own = next(o for o in _ju.get("/bureau/owners") if o["username"] == _hd)
+    ok(_own["active_cases"] == 1 and _own["overdue_cases"] == 0 and _own["enabled"] is True
+       and _own["real_name"] == "离职测试", f"承办人清单条目：{_own}")
+    ok(any(o["username"] == _hd for o in _fz.get("/bureau/owners")), "法制可读承办人清单")
+    _bb.get("/bureau/owners", expect_code=403)
+    _cands = _ju.get("/bureau/owners/candidates")
+    ok(any(c["username"] == "banban" for c in _cands) and all(c["username"] != "admin" for c in _cands),
+       "接收候选含 banban（HANDLER）、不含 admin（无办案角色）")
+    _bb.get("/bureau/owners/candidates", expect_code=403)
+
+    step("批量移交负例：同人 2111、无案 2110、越界 2112、接收人不存在 2081；HANDLER 403")
+    _ju.post("/bureau/owners/transfer", json={"fromOwner": _hd, "toOwner": _hd}, expect_code=2111)
+    _ju.post("/bureau/owners/transfer", json={"fromOwner": "nobody" + _sfx, "toOwner": "banban"}, expect_code=2110)
+    _ju.post("/bureau/owners/transfer", json={"fromOwner": _hd, "toOwner": "banban", "caseIds": [999999999]},
+             expect_code=2112)
+    _ju.post("/bureau/owners/transfer", json={"fromOwner": _hd, "toOwner": "nobody" + _sfx}, expect_code=2081)
+    _bb.post("/bureau/owners/transfer", json={"fromOwner": _hd, "toOwner": "banban"}, expect_code=403)
+    ok(admin.get(f"/bureau/cases/{_sc['id']}")["caseFile"]["ownerUser"] == _hd, "负例均未改动承办人")
+
+    step("批量移交正例：名下全部在办案件移交 banban，接收人收消息，随后停用成功")
+    _bb_unread0 = _bb.get("/bureau/messages/unread-count")
+    _tr = _ju.post("/bureau/owners/transfer", json={"fromOwner": _hd, "toOwner": "banban"})
+    ok(_tr["count"] == 1 and _tr["caseNos"] == [_sc["caseNo"]], f"移交 {_tr['count']} 件：{_tr['caseNos']}")
+    ok(_bb.get("/bureau/messages/unread-count") > _bb_unread0, "接收人收到移交消息")
+    admin.call("PUT", f"/system/users/{_hd_id}/enabled?enabled=false")
+    ok(next(u for u in admin.get("/system/users", params={"size": 200})["records"]
+            if u["username"] == _hd)["enabled"] is False, "移交后停用成功")
+    ok(all(c["username"] != _hd for c in _ju.get("/bureau/owners/candidates")), "停用账号不再是接收候选")
+
+    step("案件列表按承办人过滤：?owner=banban 含该案；不传 owner 旧契约不变")
+    _pl = admin.get("/bureau/cases", params={"owner": "banban", "page": 1, "size": 100})
+    ok(any(r["id"] == _sc["id"] for r in _pl["rows"]) and all(r["owner_user"] == "banban" for r in _pl["rows"]),
+       f"banban 名下 {_pl['total']} 件，含移交案")
+    ok(admin.get("/bureau/cases", params={"owner": _hd, "page": 1})["total"] == 0, "原承办人名下已无案件")
+    ok(isinstance(admin.get("/bureau/cases", params={"owner": _hd}), dict), "仅传 owner 也走分页结构")
+    ok(isinstance(admin.get("/bureau/cases"), list), "不传参数仍返回数组（旧契约）")
+
+    step("执法证临期预警：20 天后到期的证进入督办看板第 17 类 enforcerCertExpiring，停用后复原")
+    _cert = f"STF{_sfx}"
+    _exp = str(today + datetime.timedelta(days=20))
+    admin.post("/bureau/enforcers", json={"name": "临期执法员", "certNo": _cert, "dept": "基金监督管理处",
+                                          "certExpireAt": _exp})
+    _sup = admin.get("/bureau/stats/supervision")
+    ok("enforcerCertExpiring" in _sup and isinstance(_sup["enforcerCertExpiring"], list),
+       "看板含 enforcerCertExpiring 键")
+    _hit = next((r for r in _sup["enforcerCertExpiring"] if r["cert_no"] == _cert), None)
+    ok(_hit is not None, "20 天后到期的证在临期清单中")
+    ok(all(k in _hit for k in ("name", "cert_no", "cert_expire_at", "active_cases", "expired")), "记录结构完整")
+    ok(_hit["expired"] is False and _hit["active_cases"] == 0 and _hit["name"] == "临期执法员"
+       and _hit["cert_expire_at"] == _exp, f"临期记录：{_hit}")
+    ok(len(_sup["enforcerCertExpiring"]) <= _sup["topN"], "第 17 类同样受 topN 上界约束")
+    # 复原：台账无删除接口，停用该证即从看板消失
+    admin.post("/bureau/enforcers", json={"name": "临期执法员", "certNo": _cert, "dept": "基金监督管理处",
+                                          "certExpireAt": _exp, "enabled": False})
+    ok(all(r["cert_no"] != _cert for r in admin.get("/bureau/stats/supervision")["enforcerCertExpiring"]),
+       "停用后不再预警")

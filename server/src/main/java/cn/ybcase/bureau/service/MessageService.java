@@ -54,29 +54,32 @@ public class MessageService {
         String today = LocalDate.now().toString();
         int n = 0;
 
-        // 线索核查临期/超期 → 登记人
+        // 承办人/登记人已停用时的兜底收件人：全部启用的负责人（只查一次）
+        List<String> leaders = enabledLeaders();
+        // 线索核查临期/超期 → 登记人（已停用则转负责人）
         for (var r : jdbc.queryForList("""
-                select id, clue_no, suspect_name, deadline_at, created_by from case_clue
-                where status = 'PENDING' and deadline_at <= current_date + ?::int""", ahead)) {
+                select c.id, c.clue_no, c.suspect_name, c.deadline_at, c.created_by, su.enabled
+                from case_clue c left join sys_user su on su.username = c.created_by
+                where c.status = 'PENDING' and c.deadline_at <= current_date + ?::int""", ahead)) {
             if (r.get("created_by") == null) continue;
             boolean overdue = ((java.sql.Date) r.get("deadline_at")).toLocalDate().isBefore(LocalDate.now());
-            send((String) r.get("created_by"), "DEADLINE",
+            sendOrEscalate((String) r.get("created_by"), r.get("enabled"), leaders, "登记人", "DEADLINE",
                     (overdue ? "【超期】" : "【临期】") + "线索核查 " + r.get("clue_no"),
                     r.get("suspect_name") + "，核查期限 " + r.get("deadline_at"),
                     "/case/clues", "CLUE-" + r.get("id") + "-" + today);
             n++;
         }
-        // 办案期限临期/超期 → 承办人
+        // 办案期限临期/超期 → 承办人（已停用则转负责人）
         for (var r : jdbc.queryForList("""
-                select cf.id, cf.case_no, cf.owner_user,
+                select cf.id, cf.case_no, cf.owner_user, su.enabled,
                        cf.deadline_at + coalesce((select sum(coalesce(e.end_at, current_date) - e.start_at)::int from case_period_exclusion e
                                                   where e.case_id = cf.id), 0) as eff
-                from case_file cf
+                from case_file cf left join sys_user su on su.username = cf.owner_user
                 where cf.status in ('INVESTIGATING','REPORTED','NOTIFIED') and cf.owner_user is not null""")) {
             LocalDate eff = ((java.sql.Date) r.get("eff")).toLocalDate();
             if (eff.isAfter(LocalDate.now().plusDays(ahead))) continue;
             boolean overdue = eff.isBefore(LocalDate.now());
-            send((String) r.get("owner_user"), "DEADLINE",
+            sendOrEscalate((String) r.get("owner_user"), r.get("enabled"), leaders, "承办人", "DEADLINE",
                     (overdue ? "【超期】" : "【临期】") + "办案期限 " + r.get("case_no"),
                     "有效期限 " + eff + "（如需延长请提交审批申请）",
                     "/case/detail/" + r.get("id"), "CASE-" + r.get("id") + "-" + today);
@@ -87,12 +90,13 @@ public class MessageService {
         // 而强执申请期是全流程唯一"错过即失权、罚没款再也追不回"的期限，必须主动推送而非等人来看看板
         int payDays = config.intVal("payment_days", 15);
         for (var r : jdbc.queryForList("""
-                select cf.id, cf.case_no, cf.owner_user,
+                select cf.id, cf.case_no, cf.owner_user, su.enabled,
                        cf.delivered_at + ?::int as pay_deadline,
                        ((cf.delivered_at + ?::int) + interval '3 month')::date - current_date as days_left,
                        exists (select 1 from case_document doc
                                where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER') as urged
                 from case_file cf join case_decision d on d.case_id = cf.id
+                left join sys_user su on su.username = cf.owner_user
                 where cf.status = 'DELIVERED' and cf.delivered_at is not null
                   and cf.owner_user is not null and cf.court_enforce_applied = false
                   -- 与看板 paymentOverdue 完全同口径：此前用 <= current_date + ahead（提前5天开闸），
@@ -125,8 +129,8 @@ public class MessageService {
             String dedup = daysLeft < 0
                     ? "EXEC-LAPSED-" + r.get("id")
                     : "EXEC-" + r.get("id") + "-" + today;
-            send((String) r.get("owner_user"), "DEADLINE", title, body,
-                    "/case/detail/" + r.get("id"), dedup);
+            sendOrEscalate((String) r.get("owner_user"), r.get("enabled"), leaders, "承办人", "DEADLINE",
+                    title, body, "/case/detail/" + r.get("id"), dedup);
             n++;
         }
         // 待批审批单 → 负责人
@@ -164,5 +168,31 @@ public class MessageService {
         }
         log.info("期限提醒生成 {} 条", n);
         return n;
+    }
+
+    private List<String> enabledLeaders() {
+        return jdbc.queryForList("""
+                select u.username from sys_user u
+                join sys_user_role ur on ur.user_id = u.id join sys_role r on r.id = ur.role_id
+                where r.code = 'LEADER' and u.enabled = true order by u.username""").stream()
+                .map(u -> (String) u.get("username")).toList();
+    }
+
+    /**
+     * 期限提醒的收件规则：收件人启用则直发；已停用（或账号已不存在）则转发全部启用负责人。
+     * 此前按 owner_user/created_by 直发不判 enabled，而同一方法里的审批提醒却判了——停用账号的
+     * 临期/超期消息全部投进无人看的信箱，直到超期才被看板发现。负责人副本去重键加后缀，与本人的键区分。
+     */
+    private void sendOrEscalate(String recipient, Object enabled, List<String> leaders, String roleLabel,
+                                String kind, String title, String content, String link, String dedupKey) {
+        if (Boolean.TRUE.equals(enabled)) {
+            send(recipient, kind, title, content, link, dedupKey);
+            return;
+        }
+        for (String leader : leaders) {
+            send(leader, kind, "【" + roleLabel + "已停用】" + title,
+                    roleLabel + " " + recipient + " 已停用，请移交或指定接手人；" + content,
+                    link, dedupKey + "-INACTIVE");
+        }
     }
 }

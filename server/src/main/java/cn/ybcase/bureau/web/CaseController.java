@@ -32,13 +32,14 @@ public class CaseController {
                      @RequestParam(required = false) Integer page,
                      @RequestParam(defaultValue = "20") int size,
                      @RequestParam(required = false) String q,
+                     @RequestParam(required = false) String owner,
                      Authentication auth) {
-        // 未传 page 且未开数据范围时保持旧契约（E2E/既有前端）；否则走分页（含范围过滤）
-        if (page == null && q == null && !caseService.scopedSelf(privileged(auth))) {
+        // 未传 page/q/owner 且未开数据范围时保持旧契约（E2E/既有前端）；否则走分页（含范围过滤）
+        if (page == null && q == null && owner == null && !caseService.scopedSelf(privileged(auth))) {
             return R.ok(status == null ? caseRepository.findTop200ByOrderByIdDesc()
                     : caseRepository.findTop200ByStatusOrderByIdDesc(status));
         }
-        return R.ok(caseService.pageList(status, q, page == null ? 1 : page, Math.min(size, 100),
+        return R.ok(caseService.pageList(status, q, owner, page == null ? 1 : page, Math.min(size, 100),
                 auth.getName(), privileged(auth)));
     }
 

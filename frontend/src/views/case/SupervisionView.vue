@@ -59,6 +59,21 @@
           </el-table>
         </el-card>
         <el-card class="mb">
+          <h4>执法证 30 日内到期/已过期（第16条） <el-tag type="warning" size="small">{{ d.enforcerCertExpiring?.length || 0 }}</el-tag></h4>
+          <el-table :data="d.enforcerCertExpiring" size="small" border @row-click="() => $router.push('/system/enforcers')">
+            <el-table-column prop="name" label="姓名" width="100" />
+            <el-table-column prop="cert_no" label="执法证号" width="130" />
+            <el-table-column label="有效期至" width="170">
+              <template #default="{ row }">
+                {{ row.cert_expire_at }}
+                <el-tag :type="row.expired ? 'danger' : 'warning'" size="small">{{ row.expired ? '已过期' : '临期' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="active_cases" label="名下在办" width="90" align="right" />
+          </el-table>
+          <div class="hint">证过期后该人员不能再被列为办案人员（立案/加人被 2055 拦截）；有在办案件的请提前换证或安排交接。</div>
+        </el-card>
+        <el-card class="mb">
           <h4>协查逾期未复函（第34条 15日） <el-tag type="danger" size="small">{{ d.assistOverdue?.length || 0 }}</el-tag></h4>
           <el-table :data="d.assistOverdue" size="small" border @row-click="(r: any) => $router.push(`/case/detail/${r.case_id}`)">
             <el-table-column prop="case_no" label="案号" width="160" />
