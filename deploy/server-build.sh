@@ -59,8 +59,13 @@ cd "$DEPLOY" && ./upgrade.sh --skip-backup
 sudo docker compose up -d
 # Caddyfile 是 Caddy 启动时载入的，bind mount 文件内容变化 compose 察觉不到——
 # 此前反代/安全头/资源缓存的改动同步到了部署目录却从未生效。有变才 reload（不断连）。
-if [ "$CADDY_CHANGED" = 1 ]; then
-  echo "Caddyfile 有变更，热重载 Caddy"
-  sudo docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile \
-    || sudo docker compose restart caddy
+# 不再用 cmp 结果做门控：一次部署中重载未触发而 HSTS 未生效，隔离测试却证明 cmp 判定正确，
+# 原因未能定位。caddy reload 对未变的配置是幂等空操作且不断连，故每次部署无条件执行并回显结果，
+# 让"配置是否生效"不再依赖任何判断分支。
+[ "$CADDY_CHANGED" = 1 ] && echo "Caddyfile 有变更" || echo "Caddyfile 无变更（仍执行幂等重载）"
+if sudo docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/tmp/caddy-reload.log 2>&1; then
+  echo "Caddy 已重载"
+else
+  echo "!! caddy reload 失败，改为重启 caddy："; tail -5 /tmp/caddy-reload.log
+  sudo docker compose restart caddy
 fi
