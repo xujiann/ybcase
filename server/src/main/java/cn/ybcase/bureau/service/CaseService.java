@@ -165,10 +165,13 @@ public class CaseService {
         c.setSummary(diffText(changes, "summary", c.getSummary(), req.summary()));
         if (req.amountInvolved() != null) {
             if (req.amountInvolved().signum() < 0) throw new BizException(2123, "涉案金额不能为负数");
+            // 列是 numeric(14,2)：不先归一到 2 位小数，2500.505 会留下"2500.51→2500.505"的更正记录而库里仍是 2500.51，
+            // 留痕与事实不符且每次重提都算"有变化"
+            BigDecimal amt = req.amountInvolved().setScale(2, java.math.RoundingMode.HALF_UP);
             BigDecimal old = nz(c.getAmountInvolved());
-            if (old.compareTo(req.amountInvolved()) != 0) {
-                changes.add(new String[]{"amountInvolved", old.toPlainString(), req.amountInvolved().toPlainString()});
-                c.setAmountInvolved(req.amountInvolved());
+            if (old.compareTo(amt) != 0) {
+                changes.add(new String[]{"amountInvolved", old.toPlainString(), amt.toPlainString()});
+                c.setAmountInvolved(amt);
             }
         }
         CaseCause cause = causeRepository.findById(c.getCauseId()).orElse(null);

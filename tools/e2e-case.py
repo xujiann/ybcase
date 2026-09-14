@@ -1857,9 +1857,9 @@ def main():
        "公示导出已排除撤回决定")
     _ops_kinds = [e["kind"] for e in admin.get(f"/bureau/cases/{_ops_pc['id']}/timeline")]
     ok("决定公开" in _ops_kinds and "撤回公开" in _ops_kinds, "时间轴含「决定公开」与「撤回公开」")
-    _ops_cat = admin.get(f"/bureau/cases/{_ops_pc['id']}/archive-catalog")
-    _ops_cat_txt = str(_ops_cat)
-    ok("撤回公开（" in _ops_cat_txt, "卷内目录决定书条目载明撤回公开（案卷是复议/诉讼时唯一对外载体）")
+    _ops_full = admin.get(f"/bureau/cases/{_ops_pc['id']}/archive-full")["documents"]
+    ok(any(e.get("doc_type") == "DECISION" and "撤回公开（" in (e.get("content") or "") for e in _ops_full),
+       "卷宗合成的决定书条目载明撤回公开（案卷是复议/诉讼时唯一对外载体；目录接口不带正文）")
     admin.post(f"/bureau/cases/{_ops_pc['id']}/publish", expect_code=2042)   # 撤回后不能靠重新公开洗白日期
 
     print(f"\n=== 医保案件查办 E2E 全部通过（{step_no} 步）===")

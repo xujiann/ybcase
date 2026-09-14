@@ -228,7 +228,8 @@ public class DocumentService {
         for (var dd : jdbc.queryForList("""
                 select decision_type, decision_no, fine_amount, recoup_amount, confiscate_amount,
                        other_measures, content, decided_at, mitigation, discretion_reason,
-                       gov_record_no, published, published_at
+                       gov_record_no, published, published_at,
+                       publish_withdrawn, (withdrawn_at at time zone 'Asia/Shanghai')::date as withdrawn_on, withdraw_reason
                 from case_decision where case_id = ? order by id""", caseId)) {
             String dno = sv(dd.get("decision_no"));
             out.add(entry("DECISION",
