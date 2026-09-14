@@ -10,9 +10,19 @@ DEPLOY=/opt/ybcase
 export GIT_SSH_COMMAND="ssh -i /root/.ssh/ybcase_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
 echo "[1/5] 拉取最新源码 → $SRC"
-if [ -d "$SRC/.git" ]; then
+if [ "${1:-}" = "--no-pull" ]; then
+    echo "  （已由上一轮拉取到 $(git -C "$SRC" rev-parse --short HEAD)，跳过）"
+elif [ -d "$SRC/.git" ]; then
+    BEFORE=$(git -C "$SRC" rev-parse HEAD)
     git -C "$SRC" fetch --depth 1 origin main
     git -C "$SRC" reset --hard origin/main
+    # bash 是按字节偏移逐行读脚本的：本脚本自己也在仓库里，reset 之后磁盘上的文件已换，
+    # 继续执行等于按旧偏移读新文件——轻则跳过几行，重则执行半截命令。
+    # 只要源码有更新，就用新版本的脚本重新执行一次（--no-pull 防止递归）。
+    if [ "${1:-}" != "--no-pull" ] && [ "$BEFORE" != "$(git -C "$SRC" rev-parse HEAD)" ]; then
+        echo "  源码已更新（$BEFORE → $(git -C "$SRC" rev-parse --short HEAD)），以新版脚本重新执行"
+        exec bash "$SRC/deploy/server-build.sh" --no-pull
+    fi
 else
     git clone --depth 1 git@github.com:xujiann/ybcase.git "$SRC"
 fi
