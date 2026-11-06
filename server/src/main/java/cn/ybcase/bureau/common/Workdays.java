@@ -20,11 +20,14 @@ public final class Workdays {
         int added = 0;
         while (added < n) {
             d = d.plusDays(1);
-            boolean weekend = d.getDayOfWeek() == DayOfWeek.SATURDAY || d.getDayOfWeek() == DayOfWeek.SUNDAY;
-            boolean working = (!weekend || shiftWork.contains(d)) && !holidays.contains(d);
-            if (working) added++;
+            if (isWorkingDay(d, holidays, shiftWork)) added++;
         }
         return d;
+    }
+
+    public static boolean isWorkingDay(LocalDate day, java.util.Set<LocalDate> holidays, java.util.Set<LocalDate> shiftWork) {
+        boolean weekend = day.getDayOfWeek() == DayOfWeek.SATURDAY || day.getDayOfWeek() == DayOfWeek.SUNDAY;
+        return (!weekend || shiftWork.contains(day)) && !holidays.contains(day);
     }
 
     /** 加处罚款测算（第55条：每日3%，累计不超过罚款数额）——纯函数，供单元测试 */

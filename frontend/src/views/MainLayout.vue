@@ -7,7 +7,7 @@
       <div class="logo">案件查办系统</div>
       <el-menu router :default-active="$route.path" background-color="#1c2b45" text-color="#c7d0dc" active-text-color="#409eff"
                @select="onMenuSelect">
-        <el-menu-item index="/dashboard">
+        <el-menu-item v-if="!isAgency" index="/dashboard">
           <el-icon><HomeFilled /></el-icon><span>工作台</span>
         </el-menu-item>
         <el-sub-menu v-for="dir in auth.menuTree" :key="dir.id" :index="dir.path || String(dir.id)">
@@ -23,14 +23,14 @@
     <el-container>
       <el-header class="header">
         <el-icon v-if="isMobile" class="hamburger" @click="menuOpen = !menuOpen"><Menu /></el-icon>
-        <el-input v-model="searchQ" :placeholder="isMobile ? '搜索案号/当事人' : '全局搜索：案号/案名/当事人/线索'" clearable
+        <el-input v-if="canUseBureau" v-model="searchQ" :placeholder="isMobile ? '搜索案号/当事人' : '全局搜索：案号/案名/当事人/线索'" clearable
                   class="search-box" @keyup.enter="onSearch">
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
-        <el-tooltip content="反馈问题或需求" placement="bottom">
+        <el-tooltip v-if="canUseBureau" content="反馈问题或需求" placement="bottom">
           <el-icon style="cursor: pointer; font-size: 20px; margin-right: 20px" @click="openFeedback"><ChatDotRound /></el-icon>
         </el-tooltip>
-        <el-badge :value="unread" :hidden="!unread" style="margin-right: 20px">
+        <el-badge v-if="canUseBureau" :value="unread" :hidden="!unread" style="margin-right: 20px">
           <el-icon style="cursor: pointer; font-size: 20px" @click="openMessages"><Bell /></el-icon>
         </el-badge>
         <el-dropdown @command="onCommand">
@@ -62,8 +62,9 @@
           <el-button type="primary" @click="onChangePassword">保存</el-button>
         </template>
       </el-dialog>
-      <el-dialog v-model="fbVisible" title="反馈问题或需求（10 秒提交，上下文自动附带）" width="560px">
-        <el-form label-width="70px">
+      <el-dialog v-model="fbVisible" title="反馈问题或需求（10 秒提交，上下文自动附带）" width="560px"
+                 :close-on-click-modal="!fbSaving" :close-on-press-escape="!fbSaving" :show-close="!fbSaving">
+        <el-form label-width="70px" :disabled="fbSaving">
           <el-form-item label="类型">
             <el-radio-group v-model="fb.kind">
               <el-radio value="BUG">问题缺陷</el-radio>
@@ -88,9 +89,9 @@
           <span v-if="recentErrors.length">（含 request-id，开发可直接定位服务端日志）</span>
         </div>
         <template #footer>
-          <el-button text @click="fbVisible = false; router.push('/my/feedback')">我的反馈</el-button>
-          <el-button @click="fbVisible = false">取消</el-button>
-          <el-button type="primary" @click="onSubmitFeedback">提交</el-button>
+          <el-button text :disabled="fbSaving" @click="fbVisible = false; router.push('/my/feedback')">我的反馈</el-button>
+          <el-button :disabled="fbSaving" @click="fbVisible = false">取消</el-button>
+          <el-button type="primary" :loading="fbSaving" @click="onSubmitFeedback">提交</el-button>
         </template>
       </el-dialog>
 
@@ -103,7 +104,7 @@
           <div><el-tag size="small" :type="m.kind === 'DEADLINE' ? 'danger' : 'warning'">
             {{ m.kind === 'DEADLINE' ? '期限' : m.kind === 'APPROVAL' ? '审批' : '系统' }}</el-tag>
             <b style="margin-left: 6px">{{ m.title }}</b></div>
-          <div class="hint">{{ m.content || '' }}　{{ m.created_at?.slice(0, 16).replace('T', ' ') }}</div>
+          <div class="hint">{{ m.content || '' }}　{{ formatLocalDateTime(m.created_at) }}</div>
         </div>
         <p v-if="!messages.length" class="hint">暂无消息</p>
       </el-drawer>
@@ -125,17 +126,20 @@
         </el-table>
       </el-dialog>
       <el-main class="main">
-        <router-view />
+        <router-view v-if="auth.user && !auth.user.mustChangePassword && (!isAgency || $route.path === '/agency/agreements')" />
       </el-main>
     </el-container>
   </el-container>
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import client, { recentErrors } from '../api/client'
+import { formatLocalDateTime } from '../api/dates'
+import { businessReadAccess } from '../api/caseWriteAccess'
+import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../api/sessionExpiry'
 import { iconOf } from '../icons'
 import { useAuthStore } from '../stores/auth'
 
@@ -144,6 +148,11 @@ const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'd
 
 const router = useRouter()
 const auth = useAuthStore()
+const isAgency = computed(() => !!auth.user?.roles.includes('AGENCY'))
+const canUseBureau = computed(() => !isAgency.value && businessReadAccess(auth.user?.roles))
+watch(() => [isAgency.value, route.path], () => {
+  if (isAgency.value && route.path !== '/agency/agreements') void router.replace('/agency/agreements')
+}, { immediate: true })
 const pwdVisible = ref(false)
 const pwdForced = ref(false)
 const pwdForm = reactive({ oldPassword: '', newPassword: '', confirm: '' })
@@ -158,9 +167,58 @@ watch(() => auth.user?.mustChangePassword, (v) => {
 const searchQ = ref('')
 const searchVisible = ref(false)
 const searchResult = ref<any>({})
+let searchSequence = 0
+function searchIdentity() {
+  return JSON.stringify([auth.user?.username, auth.user?.mustChangePassword, [...(auth.user?.roles || [])].sort()])
+}
+function clearSearch() {
+  searchSequence++
+  searchResult.value = {}
+  searchVisible.value = false
+}
+watch(searchQ, clearSearch, { flush: 'sync' })
+watch(() => [auth.token, auth.user, searchIdentity()], clearSearch, { flush: 'sync' })
+watch(searchVisible, visible => {
+  if (!visible) {
+    searchSequence++
+    searchResult.value = {}
+  }
+}, { flush: 'sync' })
 const unread = ref(0)
 const msgVisible = ref(false)
 const messages = ref<any[]>([])
+let messageLoadSeq = 0, messageActionSeq = 0, messageGeneration = 0
+function messageIdentity() {
+  return JSON.stringify([auth.user?.id, auth.user?.username, auth.user?.mustChangePassword, [...(auth.user?.roles || [])].sort()])
+}
+function clearMessages() {
+  messageGeneration++; messageLoadSeq++; messageActionSeq++
+  messages.value = []
+  unread.value = 0
+  msgVisible.value = false
+}
+watch(() => [auth.token, auth.user, messageIdentity()], clearMessages, { flush: 'sync' })
+watch(msgVisible, visible => {
+  if (!visible) {
+    messageGeneration++; messageLoadSeq++; messageActionSeq++
+    messages.value = []
+  }
+}, { flush: 'sync' })
+
+// Deliberate actions still reach the request client after expiration so it can
+// redirect to login. Only their callbacks may apply data in the captured session.
+function messageContext() {
+  const token = localStorage.getItem('bureau_token') || ''
+  if (layoutDisposed || !auth.user || auth.user.mustChangePassword || !canUseBureau.value
+      || !token || token !== auth.token) return null
+  const stamp = sessionExpiry.capture(token), identity = messageIdentity(), generation = messageGeneration
+  return () => {
+    const currentToken = localStorage.getItem('bureau_token') || ''
+    return !layoutDisposed && generation === messageGeneration && identity === messageIdentity()
+      && token === auth.token && token === currentToken && canUseBureau.value && !auth.user?.mustChangePassword
+      && sessionExpiry.isCurrent(stamp, currentToken) && !sessionExpiry.isExpired(stamp, currentToken)
+  }
+}
 
 // 手机端（≤768px）：侧边栏收进抽屉，汉堡按钮开合
 const isMobile = ref(window.innerWidth <= 768)
@@ -173,100 +231,259 @@ function onMenuSelect() {
   if (isMobile.value) menuOpen.value = false  // 手机上点菜单跳转后自动收起
 }
 
-async function refreshUnread() {
-  try {
-    unread.value = (await client.get('/bureau/messages/unread-count', { headers: { 'X-Background': '1' } })).data.data
-  } catch { /* 未登录等场景忽略 */ }
+let unreadTimer: number | undefined
+let expiryTimer: number | undefined
+let unreadGeneration = 0, unreadBusy = false, layoutMounted = false, layoutDisposed = false
+
+function stopSessionTimers() {
+  unreadGeneration++
+  unreadBusy = false
+  if (unreadTimer !== undefined) window.clearInterval(unreadTimer)
+  if (expiryTimer !== undefined) window.clearTimeout(expiryTimer)
+  unreadTimer = undefined; expiryTimer = undefined
 }
 
+function startSessionTimers() {
+  stopSessionTimers()
+  if (!layoutMounted || layoutDisposed || !auth.user) return
+  const token = localStorage.getItem('bureau_token') || ''
+  if (!token || token !== auth.token) return
+  const stamp = sessionExpiry.capture(token)
+  if (sessionExpiry.isExpired(stamp, token)) return
+  if (!auth.user.mustChangePassword && canUseBureau.value) {
+    refreshUnread()
+    unreadTimer = window.setInterval(refreshUnread, 60000)
+  }
+  // Keep the existing pre-expiry reminder bound to this sign-in, and dispose it
+  // together with polling. A delayed callback cannot warn a different account.
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')))
+    const msLeft = Number(payload.exp) * 1000 - Date.now() - 10 * 60 * 1000
+    if (Number.isFinite(msLeft) && msLeft > 0 && msLeft <= 2147483647) {
+      expiryTimer = window.setTimeout(() => {
+        const currentToken = localStorage.getItem('bureau_token') || ''
+        if (!layoutDisposed && sessionExpiry.isCurrent(stamp, currentToken)
+            && !sessionExpiry.isExpired(stamp, currentToken))
+          ElMessage.warning('登录将在 10 分钟后过期，请及时保存正在填写的内容')
+      }, msLeft)
+    }
+  } catch { /* 令牌格式异常时不提示，实际授权仍由服务端校验 */ }
+}
+
+watch(() => [auth.token, messageIdentity(), canUseBureau.value], startSessionTimers, { flush: 'sync' })
+const onSessionExpired = () => { stopSessionTimers(); clearSearch(); clearMessages(); invalidateFeedback() }
+
+async function refreshUnread() {
+  if (!auth.user || auth.user.mustChangePassword || !canUseBureau.value) return
+  const token = localStorage.getItem('bureau_token') || ''
+  if (layoutDisposed || unreadBusy || !token || token !== auth.token) return
+  const stamp = sessionExpiry.capture(token)
+  if (sessionExpiry.isExpired(stamp, token)) return
+  const generation = unreadGeneration, identity = messageIdentity()
+  unreadBusy = true
+  try {
+    const value = (await client.get('/bureau/messages/unread-count', { headers: { 'X-Background': '1' } })).data.data
+    const currentToken = localStorage.getItem('bureau_token') || ''
+    if (layoutDisposed || generation !== unreadGeneration || identity !== messageIdentity() || token !== auth.token
+        || !sessionExpiry.isCurrent(stamp, currentToken) || sessionExpiry.isExpired(stamp, currentToken)) return
+    unread.value = value
+  } catch { /* 未登录等场景忽略 */ }
+  finally { if (generation === unreadGeneration) unreadBusy = false }
+}
+
+async function reloadMessages() {
+  if (!canUseBureau.value) return false
+  const current = messageContext()
+  if (!current) return false
+  const seq = ++messageLoadSeq
+  messages.value = []
+  try {
+    const data = (await client.get('/bureau/messages')).data.data
+    if (seq !== messageLoadSeq || !current()) return false
+    messages.value = data
+    return true
+  } catch {
+    // The client reports the error; failed refreshes keep no old scoped rows.
+    return false
+  }
+}
 async function openMessages() {
-  messages.value = (await client.get('/bureau/messages')).data.data
-  msgVisible.value = true
+  if (!canUseBureau.value) return
+  if (await reloadMessages()) msgVisible.value = true
 }
 
 async function onOpenMessage(m: any) {
+  if (!canUseBureau.value) return
+  const current = messageContext()
+  if (!current || !messages.value.includes(m)) return
+  const action = ++messageActionSeq
+  const selected = () => action === messageActionSeq && current() && messages.value.includes(m)
   if (!m.read_at) {
-    await client.post(`/bureau/messages/${m.id}/read`)
+    try { await client.post(`/bureau/messages/${m.id}/read`) }
+    catch { return }
+    if (!selected()) return
     m.read_at = new Date().toISOString()
     refreshUnread()
   }
-  if (m.link) {
+  if (selected() && m.link) {
     msgVisible.value = false
     router.push(m.link)
   }
 }
 
 async function onReadAll() {
-  await client.post('/bureau/messages/read-all')
-  messages.value.forEach((m) => { if (!m.read_at) m.read_at = new Date().toISOString() })
-  refreshUnread()
+  if (!canUseBureau.value) return
+  const current = messageContext()
+  if (!current) return
+  const action = ++messageActionSeq
+  try { await client.post('/bureau/messages/read-all') }
+  catch { return }
+  if (action !== messageActionSeq || !current()) return
+  await Promise.allSettled([reloadMessages(), refreshUnread()])
 }
 
 async function onSearch() {
-  if (searchQ.value.trim().length < 2) return
-  const resp = await client.get('/bureau/search', { params: { q: searchQ.value.trim() } })
-  searchResult.value = resp.data.data
-  searchVisible.value = true
+  if (!canUseBureau.value) return
+  clearSearch()
+  const query = searchQ.value.trim(), token = localStorage.getItem('bureau_token') || ''
+  if (layoutDisposed || auth.user?.mustChangePassword || query.length < 2
+      || !token || token !== auth.token) return
+  const stamp = sessionExpiry.capture(token), identity = searchIdentity(), sequence = searchSequence
+  const current = () => {
+    const currentToken = localStorage.getItem('bureau_token') || ''
+    return !layoutDisposed && sequence === searchSequence && query === searchQ.value.trim()
+      && token === auth.token && token === currentToken && identity === searchIdentity()
+      && canUseBureau.value && !auth.user?.mustChangePassword
+      && sessionExpiry.isCurrent(stamp, currentToken) && !sessionExpiry.isExpired(stamp, currentToken)
+  }
+  try {
+    const resp = await client.get('/bureau/search', { params: { q: query } })
+    if (!current()) return
+    searchResult.value = resp.data.data
+    searchVisible.value = true
+  } catch {
+    // The request client reports errors and handles deliberate actions after session expiry.
+    if (current()) clearSearch()
+  }
 }
 
 const fbVisible = ref(false)
 const fb = reactive<any>({ kind: 'BUG', title: '', content: '', screenshotBase64: '' })
+const fbSaving = ref(false)
+let feedbackGeneration = 0, feedbackSubmitSequence = 0, feedbackShotSequence = 0
+let feedbackOwner = ''
+
+function feedbackIdentity() {
+  return JSON.stringify([auth.user?.id, auth.user?.username, auth.user?.mustChangePassword, [...(auth.user?.roles || [])].sort()])
+}
+function invalidateFeedback() {
+  feedbackGeneration++; feedbackSubmitSequence++; feedbackShotSequence++
+  fbSaving.value = false
+}
+watch(fbVisible, invalidateFeedback, { flush: 'sync' })
+watch(() => [auth.token, auth.user, feedbackIdentity()], () => {
+  invalidateFeedback()
+  fbVisible.value = false
+}, { flush: 'sync' })
+
+function feedbackContext() {
+  const token = localStorage.getItem('bureau_token') || ''
+  if (layoutDisposed || !auth.user || auth.user.mustChangePassword || !canUseBureau.value
+      || !token || token !== auth.token) return null
+  const stamp = sessionExpiry.capture(token), identity = feedbackIdentity(), generation = feedbackGeneration
+  return () => {
+    const currentToken = localStorage.getItem('bureau_token') || ''
+    return !layoutDisposed && fbVisible.value && generation === feedbackGeneration && identity === feedbackIdentity()
+      && token === auth.token && token === currentToken && canUseBureau.value && !auth.user?.mustChangePassword
+      && sessionExpiry.isCurrent(stamp, currentToken) && !sessionExpiry.isExpired(stamp, currentToken)
+  }
+}
+function feedbackSnapshot() {
+  return JSON.stringify([fb.kind, fb.title, fb.content, fb.screenshotBase64])
+}
 
 function openFeedback() {
+  if (!canUseBureau.value || !feedbackContext()) return
+  const owner = JSON.stringify([auth.user?.id, auth.user?.username])
+  // Keep an unsaved draft for its owner on expiry; another account starts empty.
+  if (feedbackOwner && feedbackOwner !== owner)
+    Object.assign(fb, { kind: 'BUG', title: '', content: '', screenshotBase64: '' })
+  feedbackOwner = owner
   fbVisible.value = true
 }
 
 function onPasteShot(e: ClipboardEvent) {
+  if (!fbVisible.value || fbSaving.value) return
+  const current = feedbackContext()
+  if (!current || !current()) return
   const item = Array.from(e.clipboardData?.items || []).find((i) => i.type.startsWith('image/'))
-  if (!item) return
+  const file = item?.getAsFile()
+  if (!file) return
+  const sequence = ++feedbackShotSequence
   const reader = new FileReader()
-  reader.onload = () => { fb.screenshotBase64 = reader.result as string }
-  reader.readAsDataURL(item.getAsFile()!)
+  reader.onload = () => {
+    if (sequence === feedbackShotSequence && current() && !fbSaving.value)
+      fb.screenshotBase64 = reader.result as string
+  }
+  reader.readAsDataURL(file)
 }
 
 async function onSubmitFeedback() {
+  if (!canUseBureau.value || !fbVisible.value || fbSaving.value) return
+  const current = feedbackContext()
+  if (!current) return
   if (!fb.title.trim() || !fb.content.trim()) {
     ElMessage.warning('标题与描述必填')
     return
   }
+  const sequence = ++feedbackSubmitSequence, snapshot = feedbackSnapshot()
+  feedbackShotSequence++
+  fbSaving.value = true
   const lastErr = recentErrors[recentErrors.length - 1]
-  await client.post('/bureau/feedback', {
-    kind: fb.kind, title: fb.title, content: fb.content,
-    pageRoute: route.path,
-    caseRef: route.path.startsWith('/case/detail/') ? route.path.split('/').pop() : null,
-    appVersion, userAgent: navigator.userAgent.slice(0, 250),
-    requestId: lastErr?.requestId || null,
-    recentErrors: recentErrors.length ? JSON.stringify(recentErrors) : null,
-    screenshotBase64: fb.screenshotBase64 || null,
-  })
-  ElMessage.success('已提交，处理进展会通过站内消息通知您')
-  fbVisible.value = false
-  fb.title = ''
-  fb.content = ''
-  fb.screenshotBase64 = ''
+  try {
+    // A deliberate action after expiry still reaches the client for its login flow.
+    await client.post('/bureau/feedback', {
+      kind: fb.kind, title: fb.title, content: fb.content,
+      pageRoute: route.path,
+      caseRef: route.path.startsWith('/case/detail/') ? route.path.split('/').pop() : null,
+      appVersion, userAgent: navigator.userAgent.slice(0, 250),
+      requestId: lastErr?.requestId || null,
+      recentErrors: recentErrors.length ? JSON.stringify(recentErrors) : null,
+      screenshotBase64: fb.screenshotBase64 || null,
+    })
+    if (sequence !== feedbackSubmitSequence || !current() || snapshot !== feedbackSnapshot()) return
+    ElMessage.success('已提交，处理进展会通过站内消息通知您')
+    fbVisible.value = false
+    fb.title = ''
+    fb.content = ''
+    fb.screenshotBase64 = ''
+  } finally {
+    if (sequence === feedbackSubmitSequence) fbSaving.value = false
+  }
 }
 
-let unreadTimer: number | undefined
-const on500 = () => { fb.kind = 'BUG'; fbVisible.value = true }
+const on500 = () => {
+  if (canUseBureau.value && !fbSaving.value && !fbVisible.value) { fb.kind = 'BUG'; openFeedback() }
+}
 
 onMounted(() => {
+  layoutMounted = true
+  window.addEventListener(SESSION_EXPIRED_EVENT, onSessionExpired)
   if (!auth.user) auth.fetchMe().catch(() => {})
-  refreshUnread()
-  unreadTimer = window.setInterval(refreshUnread, 60000)  // 轻量轮询未读数
-  // 令牌临期提醒：解析 JWT exp（无需密钥），到期前 10 分钟提示保存，避免长表单写到一半被 401
-  try {
-    const payload = JSON.parse(atob((localStorage.getItem('bureau_token') || '').split('.')[1] || ''))
-    const msLeft = payload.exp * 1000 - Date.now() - 10 * 60 * 1000
-    if (msLeft > 0) window.setTimeout(() => ElMessage.warning('登录将在 10 分钟后过期，请及时保存正在填写的内容'), msLeft)
-  } catch { /* 令牌格式异常时不提示 */ }
+  else startSessionTimers()
   // 系统级错误发生时自动弹反馈框（预填 BUG 类型）
   window.addEventListener('ybcase-api-500', on500)
   window.addEventListener('resize', onResize)
 })
 
 onUnmounted(() => {
+  layoutDisposed = true
+  clearSearch()
+  clearMessages()
+  invalidateFeedback()
   // 登出/卸载须清理，否则轮询累积并在登出后持续打 401
-  if (unreadTimer) window.clearInterval(unreadTimer)
+  stopSessionTimers()
+  window.removeEventListener(SESSION_EXPIRED_EVENT, onSessionExpired)
   window.removeEventListener('ybcase-api-500', on500)
   window.removeEventListener('resize', onResize)
 })

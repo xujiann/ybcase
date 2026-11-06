@@ -20,7 +20,21 @@ public class MockSignatureProvider implements SignatureProvider {
 
     @Override
     public boolean verify(String content, String contentHash, String signature) {
-        return sha256(content).equals(contentHash);
+        // The historical MOCK digest is sha256(hash + "|" + signer). Without its recorded signer
+        // the signature itself cannot be checked; a matching content hash alone is not verification.
+        return false;
+    }
+
+    @Override
+    public boolean verify(String content, String contentHash, String signature, String signer, String provider) {
+        if (content == null || contentHash == null || signature == null || signer == null || signer.isBlank()
+                || !"MOCK".equals(provider)) return false;
+        String actualHash = sha256(content);
+        return same(actualHash, contentHash) && same(sha256(actualHash + "|" + signer), signature);
+    }
+
+    private static boolean same(String expected, String supplied) {
+        return MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8));
     }
 
     private static String sha256(String s) {

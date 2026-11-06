@@ -43,7 +43,7 @@ onMounted(async () => {
 })
 
 async function onLogin() {
-  if (!form.username || !form.password) return
+  if (loading.value || !form.username || !form.password) return
   loading.value = true
   try {
     await auth.login(form.username, form.password)

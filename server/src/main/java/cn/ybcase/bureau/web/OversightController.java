@@ -23,29 +23,39 @@ public class OversightController {
     private final OversightService oversightService;
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.CaseService caseService;
+    private final cn.ybcase.bureau.service.SourceAttachmentAccess sourceAccess;
+    private final cn.ybcase.bureau.service.SourceHistoryService history;
 
 
     // 行政检查
     @GetMapping("/inspections")
-    public R<List<Map<String, Object>>> inspections() {
-        return R.ok(jdbc.queryForList("""
-                select i.*, li.name as item_name from inspection i
-                left join law_enforce_item li on li.id = i.item_id order by i.id desc limit 200"""));
+    public R<?> inspections(@RequestParam(required = false) Integer page,
+                            @RequestParam(defaultValue = "20") int size,
+                            @RequestParam(required = false) String q, Authentication auth) {
+        return R.ok(history.list(cn.ybcase.bureau.service.SourceHistoryService.Kind.INSPECTIONS, page, size, q, auth.getName()));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     @PostMapping("/inspections")
     public R<Map<String, Object>> createInspection(@RequestBody OversightService.InspectionReq req,
                                                    Authentication auth) {
-        return R.ok(oversightService.createInspection(req, auth.getName()));
+        return R.ok(oversightService.createInspectionForCurrentActor(req, auth.getName()));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     @PostMapping("/inspections/{id}/complete")
-    public R<Void> completeInspection(@PathVariable Long id, @RequestBody Map<String, Object> body) {
-        oversightService.completeInspection(id, (String) body.get("result"),
-                Boolean.TRUE.equals(body.get("violationFound")));
+    public R<Void> completeInspection(@PathVariable Long id, @RequestBody Map<String, Object> body, Authentication auth) {
+        if (!(body.get("result") instanceof String result))
+            throw new cn.ybcase.bureau.common.BizException(2063, "须填写文本形式的检查结果");
+        Object violation = body.get("violationFound");
+        if (violation != null && !(violation instanceof Boolean))
+            throw new cn.ybcase.bureau.common.BizException(2063, "是否发现违法行为须为布尔值");
+        // Preserve the existing false default for omitted/null flags, without accepting other types.
+        oversightService.completeInspection(id, result, Boolean.TRUE.equals(violation), auth.getName());
         return R.ok();
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     @PostMapping("/inspections/{id}/to-clue")
     public R<CaseClue> toClue(@PathVariable Long id, Authentication auth) {
         return R.ok(oversightService.inspectionToClue(id, auth.getName()));
@@ -53,23 +63,16 @@ public class OversightController {
 
     // 举报奖励（举报人信息严格保密，条例35条：仅监督岗可见明文）
     @GetMapping("/rewards")
-    public R<List<Map<String, Object>>> rewards(Authentication auth) {
-        List<Map<String, Object>> rows = jdbc.queryForList("""
-                select r.*, c.clue_no, c.suspect_name from reward r
-                join case_clue c on c.id = r.clue_id order by r.id desc limit 200""");
-        if (!privileged(auth)) {
-            // 非监督岗一律脱敏：举报人姓名保留首字、联系方式隐去
-            for (var r : rows) {
-                String nm = (String) r.get("reporter_name");
-                r.put("reporter_name", nm == null || nm.isEmpty() ? nm : nm.charAt(0) + "**");
-                r.put("reporter_contact", r.get("reporter_contact") == null ? null : "***");
-            }
-        }
-        return R.ok(rows);
+    public R<?> rewards(@RequestParam(required = false) Integer page,
+                        @RequestParam(defaultValue = "20") int size,
+                        @RequestParam(required = false) String q, Authentication auth) {
+        return R.ok(history.list(cn.ybcase.bureau.service.SourceHistoryService.Kind.REWARDS, page, size, q, auth.getName()));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     @PostMapping("/rewards")
-    public R<Void> createReward(@RequestBody OversightService.RewardReq req) {
+    public R<Void> createReward(@RequestBody OversightService.RewardReq req, Authentication auth) {
+        sourceAccess.assertRead("CLUE", req.clueId(), auth.getName());
         oversightService.createReward(req);
         return R.ok();
     }
@@ -103,12 +106,14 @@ public class OversightController {
         return R.ok(jdbc.queryForList("select * from case_installment where case_id = ? order by seq", id));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     @PostMapping("/cases/{id}/installments")
     public R<Void> addInstallment(@PathVariable Long id, @RequestBody OversightService.InstallmentReq req) {
         oversightService.addInstallment(id, req);
         return R.ok();
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     @PostMapping("/installments/{id}/pay")
     public R<Void> payInstallment(@PathVariable Long id, Authentication auth) {
         // 该路径不含 caseId，拦截器覆盖不到，此处按分期所属案件补范围校验
@@ -122,6 +127,7 @@ public class OversightController {
 
     // 专家评审
     @PostMapping("/cases/{id}/expert-reviews")
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     public R<Void> startExpertReview(@PathVariable Long id, @RequestBody Map<String, String> body) {
         oversightService.startExpertReview(id, body.get("experts"),
                 optDate(body, "startedAt", "评审开始日期"));
@@ -129,6 +135,7 @@ public class OversightController {
     }
 
     @PostMapping("/cases/{id}/expert-reviews/{reviewId}/end")
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     public R<Void> endExpertReview(@PathVariable Long id, @PathVariable Long reviewId,
                                    @RequestBody Map<String, String> body) {
         oversightService.endExpertReview(id, reviewId, body.get("opinion"),

@@ -15,6 +15,7 @@ import java.util.List;
 public class DbUserDetailsService implements UserDetailsService {
 
     private final SysUserRepository userRepository;
+    private final cn.ybcase.core.repository.SysDeptRepository departmentRepository;
 
     @Override
     public AuthUser loadUserByUsername(String username) throws UsernameNotFoundException {
@@ -23,7 +24,9 @@ public class DbUserDetailsService implements UserDetailsService {
         List<SimpleGrantedAuthority> authorities = user.getRoles().stream()
                 .map(r -> new SimpleGrantedAuthority("ROLE_" + r.getCode()))
                 .toList();
-        return new AuthUser(user.getUsername(), user.getPassword(), user.getEnabled(),
-                user.getTokenVersion(), user.getId(), authorities);
+        boolean departmentEnabled = user.getDeptId() == null
+                || departmentRepository.findById(user.getDeptId()).map(dept -> Boolean.TRUE.equals(dept.getEnabled())).orElse(false);
+        return new AuthUser(user.getUsername(), user.getPassword(), Boolean.TRUE.equals(user.getEnabled()) && departmentEnabled,
+                user.getTokenVersion(), user.getId(), Boolean.TRUE.equals(user.getMustChangePassword()), authorities);
     }
 }

@@ -45,6 +45,9 @@ public class CaseDecision {
     @Column(nullable = false, columnDefinition = "text")
     private String content;
 
+    @Column(columnDefinition = "text")
+    private String penaltyBasis;
+
     @Column(nullable = false)
     private LocalDate decidedAt;
 

@@ -19,9 +19,16 @@ public class MessageService {
 
     private final JdbcTemplate jdbc;
     private final BureauConfig config;
+    private final ExecutionAlerts executionAlerts;
+    private final SourceAttachmentAccess sourceAccess;
+    private final cn.ybcase.core.security.AdminWriteAccess administratorAccess;
+    private final MaterialAccess materialAccess;
 
     /** 发消息（dedupKey 非空时同人同键幂等——SQL 层 on conflict，无异常路径，事务安全） */
     public void send(String username, String kind, String title, String content, String link, String dedupKey) {
+        // Titles are derived summaries; keep source records intact while respecting the notification column.
+        if (title != null && title.codePointCount(0, title.length()) > 255)
+            title = title.substring(0, title.offsetByCodePoints(0, 255));
         jdbc.update("""
                 insert into sys_message (username, kind, title, content, link, dedup_key)
                 values (?,?,?,?,?,?)
@@ -46,10 +53,57 @@ public class MessageService {
         }
     }
 
+    public void sendApprovalRequest(long approvalId, String title, String content) {
+        for (String leader : enabledLeaders()) {
+            var scope = sourceAccess.approvalDepartmentPredicate("a", leader);
+            var args = new java.util.ArrayList<Object>();
+            args.add(approvalId);
+            args.addAll(scope.args());
+            if (Boolean.TRUE.equals(jdbc.queryForObject(
+                    "select exists(select 1 from biz_approval a where a.id=? and " + scope.sql() + ")",
+                    Boolean.class, args.toArray())))
+                send(leader, "APPROVAL", title, content, "/case/approvals", "APPROVAL-REQUEST-" + approvalId);
+        }
+    }
+
     /** 期限提醒生成：每工作日早8点自动跑；也可由管理员手动触发（E2E/补跑） */
-    @Scheduled(cron = "0 0 8 * * MON-FRI")
+    @Scheduled(cron = "0 0 8 * * *", zone = "Asia/Shanghai")
+    public void scheduledReminders() {
+        if (config.isWorkingDay(LocalDate.now())) self.getObject().generateReminders();
+    }
+
+    private final org.springframework.beans.factory.ObjectProvider<MessageService> self;
+
     @Transactional
     public int generateReminders() {
+        return generateReminders(false);
+    }
+
+    @Transactional
+    public int generateRemindersForAdministrator() {
+        return generateReminders(true);
+    }
+
+    private int generateReminders(boolean administrator) {
+        // Both entry points take this gate before any notification insert. It prevents a
+        // manual run holding feedback locks from waiting on a scheduled run's dedup key.
+        jdbc.queryForList("select pg_advisory_xact_lock(2026102803)");
+        int autoDays = config.intVal("feedback_autoclose_days", 7);
+        var closingFeedback = jdbc.queryForList("""
+                select id, username, title from feedback
+                where status = 'RESOLVED' and handled_at <= now() - make_interval(days => ?)
+                order by id""", autoDays);
+        if (administrator) {
+            // Feedback handlers use feedback -> actor. Acquire every affected source
+            // before the actor, so account changes and feedback handling cannot invert it.
+            if (!closingFeedback.isEmpty()) {
+                var ids = closingFeedback.stream().map(row -> row.get("id")).toArray();
+                jdbc.queryForList("select id from feedback where id in ("
+                        + String.join(",", java.util.Collections.nCopies(ids.length, "?"))
+                        + ") order by id for update", ids);
+            }
+            administratorAccess.requireCurrentAdmin();
+        }
         int ahead = config.intVal("reminder_days_ahead", 5);
         String today = LocalDate.now().toString();
         int n = 0;
@@ -88,70 +142,42 @@ public class MessageService {
         // 执行阶段（第52-55条/行政强制法53-54条）→ 承办人
         // 办案期限那段把 DELIVERED 排除在外，决定书送达后系统就不再替办案人计时；
         // 而强执申请期是全流程唯一"错过即失权、罚没款再也追不回"的期限，必须主动推送而非等人来看看板
-        int payDays = config.intVal("payment_days", 15);
-        for (var r : jdbc.queryForList("""
-                select cf.id, cf.case_no, cf.owner_user, su.enabled,
-                       cf.delivered_at + ?::int as pay_deadline,
-                       ((cf.delivered_at + ?::int) + interval '3 month')::date - current_date as days_left,
-                       exists (select 1 from case_document doc
-                               where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER') as urged
-                from case_file cf join case_decision d on d.case_id = cf.id
-                left join sys_user su on su.username = cf.owner_user
-                where cf.status = 'DELIVERED' and cf.delivered_at is not null
-                  and cf.owner_user is not null and cf.court_enforce_applied = false
-                  -- 与看板 paymentOverdue 完全同口径：此前用 <= current_date + ahead（提前5天开闸），
-                  -- 而文案档位只按 days_left 分，缴款期未届满的案件必然落到"届满未缴清"那一档，是误报
-                  and cf.delivered_at + ?::int < current_date
-                  -- 已批准暂缓/分期的按 case_installment 履行，不在催缴之列
-                  and cf.defer_approved = false
-                  and (coalesce((select sum(e.amount) from case_execution e
-                                 where e.case_id = cf.id and e.kind = 'FINE'), 0) < d.fine_amount
-                    or coalesce((select sum(e.amount) from case_execution e
-                                 where e.case_id = cf.id and e.kind = 'RECOUP'), 0) < d.recoup_amount
-                    or coalesce((select sum(e.amount) from case_execution e
-                                 where e.case_id = cf.id and e.kind = 'CONFISCATE'), 0) < d.confiscate_amount)""",
-                payDays, payDays, payDays)) {
-            long daysLeft = ((Number) r.get("days_left")).longValue();
-            boolean urged = Boolean.TRUE.equals(r.get("urged"));
-            // 只有强执申请期临期(30日内)/已过时才升级为紧急提示，否则是常规催缴
-            String title = daysLeft < 0
-                    ? "【已失权】强制执行申请期已过 " + r.get("case_no")
-                    : daysLeft <= 30
-                        ? "【紧急】强制执行申请期剩 " + daysLeft + " 天 " + r.get("case_no")
-                        : "【催缴】缴款期届满未缴清 " + r.get("case_no");
-            String body = "缴款期限 " + r.get("pay_deadline")
-                    + (urged ? "；已下达催告书" : "；尚未下达催告书（申请强执的法定前置，须先制作 URGE_LETTER 并满 "
-                        + config.intVal("court_urge_days", 10) + " 日）")
-                    + (daysLeft < 0 ? "。申请期已过，罚没款不能再通过法院强制执行追缴，请说明情况另行处理。"
-                        : "。逾期未申请将丧失强制执行权。");
-            // 已失权是终局事实、不会再变，按天翻新去重键会让它每个工作日永久重发；
-            // 改为全生命周期只发一次（未失权的催缴仍按天提醒）
-            String dedup = daysLeft < 0
-                    ? "EXEC-LAPSED-" + r.get("id")
+        for (var r : executionAlerts.rows(LocalDate.now())) {
+            LocalDate payment = ExecutionAlerts.date(r.get("pay_deadline"));
+            if (payment == null || !LocalDate.now().isAfter(payment) || r.get("owner_user") == null) continue;
+            LocalDate application = ExecutionAlerts.date(r.get("apply_deadline"));
+            Long daysLeft = r.get("days_left") == null ? null : ((Number)r.get("days_left")).longValue();
+            String title = daysLeft != null && daysLeft < 0 ? "【请法制核实】已过登记的申请期限 " + r.get("case_no")
+                    : daysLeft != null && daysLeft <= 30 ? "【临期】法院申请期限 " + r.get("case_no")
+                    : "【催缴】缴款期届满未缴清 " + r.get("case_no");
+            String body = "缴款期限 " + payment
+                    + (application == null ? "；法定救济期限尚未确认或救济处理中，不推定已失权"
+                                          : "；登记的法院申请期限 " + application)
+                    + (r.get("urged_at") == null ? "；尚无催告送达记录" : "；催告送达日 " + r.get("urged_at"));
+            String dedup = daysLeft != null && daysLeft < 0 ? "EXEC-LAPSED-" + r.get("id")
                     : "EXEC-" + r.get("id") + "-" + today;
-            sendOrEscalate((String) r.get("owner_user"), r.get("enabled"), leaders, "承办人", "DEADLINE",
-                    title, body, "/case/detail/" + r.get("id"), dedup);
+            sendOrEscalate((String)r.get("owner_user"),r.get("enabled"),leaders,"承办人","DEADLINE",
+                    title,body,"/case/detail/" + r.get("id"),dedup);
             n++;
         }
         // 待批审批单 → 负责人
-        Integer pending = jdbc.queryForObject(
-                "select count(*) from biz_approval where status = 'PENDING'", Integer.class);
-        if (pending != null && pending > 0) {
-            for (var u : jdbc.queryForList("""
-                    select u.username from sys_user u
-                    join sys_user_role ur on ur.user_id = u.id join sys_role r on r.id = ur.role_id
-                    where r.code = 'LEADER' and u.enabled = true""")) {
-                send((String) u.get("username"), "APPROVAL", "有 " + pending + " 张审批单待裁决",
-                        null, "/case/approvals", "PENDING-APPROVALS-" + today);
+        for (String leader : leaders) {
+            var scope = sourceAccess.approvalDepartmentPredicate("a", leader);
+            Long pending = jdbc.queryForObject("select count(*) from biz_approval a where a.status='PENDING' and "
+                    + scope.sql(), Long.class, scope.args().toArray());
+            if (pending != null && pending > 0) {
+                var department = materialAccess.departmentScope(leader);
+                String prefix = department.district() ? "DISTRICT-" + department.deptId() + "-" : "";
+                send(leader, "APPROVAL", "有 " + pending + " 张审批单待裁决",
+                        null, "/case/approvals", prefix + "PENDING-APPROVALS-" + today);
                 n++;
             }
         }
         // 已解决反馈超期未确认 → 自动关闭并告知提交人
-        int autoDays = config.intVal("feedback_autoclose_days", 7);
-        for (var r : jdbc.queryForList("""
-                select id, username, title from feedback
-                where status = 'RESOLVED' and handled_at <= now() - make_interval(days => ?)""", autoDays)) {
-            jdbc.update("update feedback set status = 'CLOSED' where id = ? and status = 'RESOLVED'", r.get("id"));
+        for (var r : closingFeedback) {
+            int closed = jdbc.update("update feedback set status = 'CLOSED' where id = ? and status = 'RESOLVED'"
+                    + " and handled_at <= now() - make_interval(days => ?)", r.get("id"), autoDays);
+            if (closed == 0) continue; // Another handler changed the state while the reminder transaction waited.
             send((String) r.get("username"), "SYSTEM",
                     "反馈「" + r.get("title") + "」已自动关闭",
                     "已解决满 " + autoDays + " 天未确认，系统自动关闭；如未解决请重新提交",
@@ -170,11 +196,86 @@ public class MessageService {
         return n;
     }
 
+    /** Re-evaluate source access at read time: recipients may have lost a case or supervisory role. */
+    private SourceAttachmentAccess.ReadPredicate visible(String username) {
+        String caseId = "(select msg_case.id from case_file msg_case where msg_case.id::text=substring(m.link from '^/case/detail/([0-9]+)(?:[/?#].*)?$'))";
+        String clueId = "(select msg_clue.id from case_clue msg_clue where msg_clue.id::text=substring(m.dedup_key from '^CLUE-([0-9]+)-'))";
+        var caseScope = sourceAccess.caseReadPredicate(caseId, username);
+        var clueScope = sourceAccess.clueReadPredicate(clueId, username);
+        var approvalCase = sourceAccess.caseReadPredicate("msg_approval.case_id", username);
+        var approvalClue = sourceAccess.clueReadPredicate("msg_approval.clue_id", username);
+        var approvalDepartment = sourceAccess.approvalDepartmentPredicate("msg_approval", username);
+        var args = new java.util.ArrayList<Object>(); args.add(username);
+        args.addAll(caseScope.args()); args.addAll(clueScope.args()); args.addAll(approvalCase.args()); args.addAll(approvalClue.args());
+        args.addAll(approvalDepartment.args());
+        String sql = "m.username=? and (coalesce(m.link,'') !~ '^/case/detail/' or " + caseScope.sql() + ")"
+            + " and (coalesce(m.dedup_key,'') !~ '^CLUE-' or " + clueScope.sql() + ")"
+            + " and (m.kind<>'APPROVAL' or m.title !~ '^审批单 #' or exists (select 1 from biz_approval msg_approval"
+            + " where msg_approval.id::text=substring(m.title from '^审批单 #([0-9]+)')"
+            + " and (msg_approval.case_id is null or " + approvalCase.sql() + ")"
+            + " and (msg_approval.clue_id is null or " + approvalClue.sql() + ")"
+            + " and " + approvalDepartment.sql() + "))";
+        if (!sourceAccess.hasRole(username, "ADMIN")) sql += " and coalesce(m.link,'') not like '/system/%'";
+        if (!sourceAccess.hasRole(username, "ADMIN", "LEADER"))
+            sql += " and not (coalesce(m.link,'')='/case/approvals' and m.title like '有 % 张审批单待裁决')";
+        var department = materialAccess.departmentScope(username);
+        if (department.district()) {
+            var approval = sourceAccess.approvalDepartmentPredicate("request", username);
+            sql += " and (m.kind<>'APPROVAL' or m.title not like '新审批单：%' or exists (select 1 from biz_approval request"
+                    + " where request.id::text=substring(m.dedup_key from '^APPROVAL-REQUEST-([0-9]+)$')"
+                    + " and " + approval.sql() + "))"
+                    + " and (m.kind<>'APPROVAL' or m.title not like '有 % 张审批单待裁决' or m.dedup_key like ?)";
+            args.addAll(approval.args());
+            args.add("DISTRICT-" + department.deptId() + "-PENDING-APPROVALS-%");
+        }
+        return new SourceAttachmentAccess.ReadPredicate(sql, List.copyOf(args));
+    }
+
+    /** Personal inbox checks and source visibility belong to the returned data's snapshot. */
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public List<Map<String,Object>> inbox(String username) {
+        requirePersonalActor(username, false);
+        var scope = visible(username);
+        return jdbc.queryForList("select m.id,m.kind,m.title,m.content,m.link,m.created_at,m.read_at from sys_message m where "
+                + scope.sql() + " order by (m.read_at is null) desc,m.id desc limit 50", scope.args().toArray());
+    }
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public Long unread(String username) {
+        requirePersonalActor(username, false);
+        var scope = visible(username);
+        return jdbc.queryForObject("select count(*) from sys_message m where m.read_at is null and " + scope.sql(), Long.class, scope.args().toArray());
+    }
+    @Transactional
+    public void markRead(String username, Long id) {
+        requirePersonalActor(username, true);
+        var scope = visible(username); var args = new java.util.ArrayList<Object>(scope.args()); args.add(id);
+        jdbc.update("update sys_message m set read_at=now() where m.read_at is null and " + scope.sql() + " and m.id=?", args.toArray());
+    }
+    @Transactional
+    public void markAllRead(String username) {
+        requirePersonalActor(username, true);
+        var scope = visible(username);
+        jdbc.update("update sys_message m set read_at=now() where m.read_at is null and " + scope.sql(), scope.args().toArray());
+    }
+
+    /** No additional business-role requirement for personal messages or internal domain callers. */
+    private void requirePersonalActor(String username, boolean write) {
+        var auth = org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || !auth.isAuthenticated() || "anonymousUser".equals(auth.getPrincipal())) return;
+        if (!username.equals(auth.getName())) throw new cn.ybcase.bureau.common.BizException(403, "仅可处理本人的消息");
+        // Message writers use actor -> message, matching reminder inserts. They never lock a source case.
+        if (write) materialAccess.lockActor(username, false);
+        else materialAccess.readActor(username);
+    }
+
     private List<String> enabledLeaders() {
         return jdbc.queryForList("""
                 select u.username from sys_user u
                 join sys_user_role ur on ur.user_id = u.id join sys_role r on r.id = ur.role_id
-                where r.code = 'LEADER' and u.enabled = true order by u.username""").stream()
+                where r.code = 'LEADER' and u.enabled = true
+                  and (u.dept_id is null
+                       or exists (select 1 from sys_dept d where d.id=u.dept_id and d.enabled))
+                order by u.username""").stream()
                 .map(u -> (String) u.get("username")).toList();
     }
 
@@ -204,7 +305,10 @@ public class MessageService {
         return jdbc.queryForList("""
                 select u.username from sys_user u
                 join sys_user_role ur on ur.user_id = u.id join sys_role r on r.id = ur.role_id
-                where r.code = 'ADMIN' and u.enabled = true order by u.username""").stream()
+                where r.code = 'ADMIN' and u.enabled = true
+                  and (u.dept_id is null
+                       or exists (select 1 from sys_dept d where d.id=u.dept_id and d.enabled))
+                order by u.username""").stream()
                 .map(u -> (String) u.get("username")).toList();
     }
 }

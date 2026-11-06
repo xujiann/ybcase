@@ -17,6 +17,7 @@ public class SysConfigController {
 
     private final JdbcTemplate jdbc;
     private final org.springframework.context.ApplicationEventPublisher events;
+    private final cn.ybcase.core.security.AdminWriteAccess adminWrites;
 
     /** 公开配置白名单：仅登录页所需的机构信息，其余参数一律须登录（防口径参数匿名泄露） */
     private static final java.util.Set<String> PUBLIC_KEYS =
@@ -41,6 +42,9 @@ public class SysConfigController {
         // 旧值→新值→操作人须专表留痕（同一事务），否则复议时"当时按 90 还是 60 天算"无从回答
         var old = jdbc.queryForList("select cfg_value from sys_config where cfg_key = ? for update", key);
         if (old.isEmpty()) return R.fail(1401, "配置项不存在");
+        adminWrites.requireCurrentAdmin();
+        if (value == null || value.indexOf('\0') >= 0 || value.codePointCount(0, value.length()) > 255)
+            return R.fail(1402, "参数值不能含空字符且不能超过255字");
         String oldValue = (String) old.get(0).get("cfg_value");
         if (java.util.Objects.equals(oldValue, value)) return R.ok();   // 同值保存不算变更，不留空历史
         jdbc.update("update sys_config set cfg_value = ?, updated_at = now() where cfg_key = ?", value, key);

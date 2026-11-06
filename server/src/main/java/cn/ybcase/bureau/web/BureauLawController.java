@@ -18,6 +18,8 @@ public class BureauLawController {
 
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.BureauConfig config;
+    private final cn.ybcase.bureau.service.MaterialAccess materialAccess;
+    private static final long HOLIDAY_WRITE_LOCK = 2026102801L;
 
     @GetMapping("/enforce-items")
     public R<List<Map<String, Object>>> enforceItems() {
@@ -38,13 +40,15 @@ public class BureauLawController {
 
     @PostMapping("/holidays")
     @PreAuthorize("hasRole('ADMIN')")
-    public R<Void> addHoliday(@RequestBody Map<String, String> body) {
-        // 先解析成 LocalDate：交给 ?::date 由数据库解析，格式错会变成 500
+    @org.springframework.transaction.annotation.Transactional
+    public R<Void> addHoliday(@RequestBody Map<String, Object> body) {
+        Object[] row = holidayRow(body, "");
+        lockHolidayWriter();
         jdbc.update("""
                 insert into sys_holiday (day, kind, name) values (?, ?, ?)
                 on conflict (day) do update set kind = excluded.kind, name = excluded.name""",
-                reqDate(body, "day", "日期"), body.getOrDefault("kind", "HOLIDAY"), body.get("name"));
-        config.evictHolidays();  // 工作日推算缓存须立即反映新节假日
+                row);
+        invalidateHolidaysAfterCommit();
         return R.ok();
     }
 
@@ -61,39 +65,62 @@ public class BureauLawController {
     @PostMapping("/holidays/batch")
     @PreAuthorize("hasRole('ADMIN')")
     @org.springframework.transaction.annotation.Transactional
-    public R<Map<String, Object>> batchHolidays(@RequestBody List<Map<String, String>> rows) {
+    public R<Map<String, Object>> batchHolidays(@RequestBody List<Map<String, Object>> rows) {
         if (rows == null || rows.isEmpty()) throw new cn.ybcase.bureau.common.BizException(2100, "没有可导入的行");
         if (rows.size() > 400) throw new cn.ybcase.bureau.common.BizException(2100, "单次最多导入 400 行");
         List<Object[]> args = new java.util.ArrayList<>();
         for (int i = 0; i < rows.size(); i++) {
-            Map<String, String> r = rows.get(i);
-            java.time.LocalDate day = reqDate(r, "day", "第 " + (i + 1) + " 行日期");
-            String kind = r.getOrDefault("kind", "HOLIDAY");
-            if (!"HOLIDAY".equals(kind) && !"SHIFT_WORK".equals(kind))
-                throw new cn.ybcase.bureau.common.BizException(2100,
-                        "第 " + (i + 1) + " 行类型无效：" + kind + "（须为 HOLIDAY 或 SHIFT_WORK）");
-            String name = r.get("name");
-            if (name != null && name.length() > 64)
-                throw new cn.ybcase.bureau.common.BizException(2100, "第 " + (i + 1) + " 行名称超过 64 字");
-            args.add(new Object[]{day, kind, name});
+            args.add(holidayRow(rows.get(i), "第 " + (i + 1) + " 行"));
         }
+        lockHolidayWriter();
         jdbc.batchUpdate("""
                 insert into sys_holiday (day, kind, name) values (?, ?, ?)
                 on conflict (day) do update set kind = excluded.kind, name = excluded.name""", args);
         // 方法在事务内：提交前失效缓存会被并发的 plusWorkdays 用未提交的旧表重新装回（TTL 30s 内期限算错），
         // 与 SysConfigController.update 同一模式，改为提交后失效
-        org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
-                new org.springframework.transaction.support.TransactionSynchronization() {
-                    @Override public void afterCommit() { config.evictHolidays(); }
-                });
+        invalidateHolidaysAfterCommit();
         return R.ok(Map.of("count", args.size(), "missingYears", config.missingHolidayYears()));
     }
 
     @DeleteMapping("/holidays/{day}")
     @PreAuthorize("hasRole('ADMIN')")
+    @org.springframework.transaction.annotation.Transactional
     public R<Void> deleteHoliday(@PathVariable String day) {
-        jdbc.update("delete from sys_holiday where day = ?", reqDate(Map.of("day", day), "day", "日期"));
-        config.evictHolidays();
+        Object date = holidayRow(Map.of("day", day), "")[0];
+        lockHolidayWriter();
+        jdbc.update("delete from sys_holiday where day = ?", date);
+        invalidateHolidaysAfterCommit();
         return R.ok();
+    }
+
+    private void lockHolidayWriter() {
+        // All three maintenance paths share this gate, including inserts for absent dates.
+        // Acquire it before the actor lock so queued requests recheck their live identity.
+        jdbc.execute("select pg_advisory_xact_lock(" + HOLIDAY_WRITE_LOCK + ")");
+        materialAccess.requireCurrentRoles("ADMIN");
+    }
+
+    private Object[] holidayRow(Map<String, Object> row, String label) {
+        if (row == null || !(row.get("day") instanceof String value)
+                || !value.trim().matches("[0-9]{4}-[0-9]{2}-[0-9]{2}"))
+            throw new cn.ybcase.bureau.common.BizException(2100, label + "日期格式须为 yyyy-MM-dd");
+        var day = reqDate(row, "day", label + "日期");
+        if (day.getYear() < 1)
+            throw new cn.ybcase.bureau.common.BizException(2100, label + "日期年份须大于0");
+        Object kind = row.containsKey("kind") ? row.get("kind") : "HOLIDAY";
+        if (!(kind instanceof String) || !("HOLIDAY".equals(kind) || "SHIFT_WORK".equals(kind)))
+            throw new cn.ybcase.bureau.common.BizException(2100, label + "类型须为 HOLIDAY 或 SHIFT_WORK");
+        Object name = row.get("name");
+        if (name != null && (!(name instanceof String text) || text.indexOf('\0') >= 0
+                || text.codePointCount(0, text.length()) > 64))
+            throw new cn.ybcase.bureau.common.BizException(2100, label + "名称须为不超过64字的文本");
+        return new Object[]{day, kind, name};
+    }
+
+    private void invalidateHolidaysAfterCommit() {
+        org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                new org.springframework.transaction.support.TransactionSynchronization() {
+                    @Override public void afterCommit() { config.evictHolidays(); }
+                });
     }
 }

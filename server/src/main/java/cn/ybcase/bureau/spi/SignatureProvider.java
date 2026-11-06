@@ -9,4 +9,12 @@ public interface SignatureProvider {
 
     /** 验签：内容未被篡改且签章有效 */
     boolean verify(String content, String contentHash, String signature);
+
+    /**
+     * Verify a stored signature with its recorded identity/provider context. Existing external providers
+     * keep their three-argument implementation; formats requiring this context override this method.
+     */
+    default boolean verify(String content, String contentHash, String signature, String signer, String provider) {
+        return verify(content, contentHash, signature);
+    }
 }

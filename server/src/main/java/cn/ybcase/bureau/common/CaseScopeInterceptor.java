@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
+import org.springframework.util.NumberUtils;
 import org.springframework.web.servlet.HandlerInterceptor;
 import org.springframework.web.servlet.HandlerMapping;
 
@@ -44,11 +45,10 @@ public class CaseScopeInterceptor implements HandlerInterceptor {
 
     private static Long parseId(Object raw) {
         if (raw == null) return null;
-        String s = raw.toString();
-        if (s.isEmpty() || !s.chars().allMatch(Character::isDigit)) return null;
         try {
-            return Long.parseLong(s);
-        } catch (NumberFormatException e) {
+            // Match Spring MVC's String-to-Long conversion, including signed and hexadecimal values.
+            return NumberUtils.parseNumber(raw.toString(), Long.class);
+        } catch (IllegalArgumentException e) {
             return null;
         }
     }

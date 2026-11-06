@@ -14,6 +14,7 @@ import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 案件办理核心服务。法定规则硬校验（错误码 2xxx），依据《医疗保障行政处罚程序暂行规定》（国家医保局令第4号）：
@@ -29,6 +30,7 @@ public class CaseService {
     private final CaseFileRepository caseRepository;
     private final CaseCauseRepository causeRepository;
     private final CaseReviewRepository reviewRepository;
+    private final ReviewMaterialService reviewMaterials;
     private final CaseNoticeRepository noticeRepository;
     private final CaseDecisionRepository decisionRepository;
     private final ClueService clueService;
@@ -38,30 +40,159 @@ public class CaseService {
     private final ProcedureService procedureService;
     private final BizSeqService seqService;
     private final ExecutionService executionService;
+    private final ExecutionDeadlines executionDeadlines;
+    private final SourceAttachmentAccess sourceAttachmentAccess;
+    private final WorkflowUserAccess workflowUsers;
+    private final EnforcerRegistryAccess enforcerRegistry;
+    private final MaterialAccess materialAccess;
     private final MessageService messageService;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+    private final jakarta.persistence.EntityManager entityManager;
 
     // ---------- 立案 ----------
 
     public record OfficerReq(String name, String certNo, String duty) {}
+
+    public record JurisdictionReq(String type, String basis, String violationPlace, String treatmentPlace,
+                                  String insuredPlace, String designatedNo, String disputeNote) {}
+    public record JurisdictionUpdateReq(JurisdictionReq jurisdiction, String reason) {}
+
+    public static final Map<String, String> JURISDICTION_TYPE_LABELS = Map.of(
+            "PENDING", "待补录", "LOCAL", "本辖区事实", "TRANSFERRED", "移送受理",
+            "DESIGNATED", "指定管辖", "OTHER", "其他依据");
+
+    /** Normalize once at submission and again at approval; no inferred jurisdiction or default legal conclusion. */
+    public static JurisdictionReq normalizeJurisdiction(JurisdictionReq req) {
+        if (req == null) return new JurisdictionReq("PENDING", null, null, null, null, null, null);
+        String type = jurisdictionText(req.type(), 24, "管辖分类");
+        type = type == null ? "PENDING" : type.toUpperCase(java.util.Locale.ROOT);
+        if (!JURISDICTION_TYPE_LABELS.containsKey(type)) throw new BizException(2145, "管辖分类无效");
+        String basis = jurisdictionText(req.basis(), 2000, "管辖依据");
+        String violation = jurisdictionText(req.violationPlace(), 255, "违法行为地");
+        String treatment = jurisdictionText(req.treatmentPlace(), 255, "就医地");
+        String insured = jurisdictionText(req.insuredPlace(), 255, "参保地");
+        String designated = jurisdictionText(req.designatedNo(), 128, "指定管辖文号");
+        String dispute = jurisdictionText(req.disputeNote(), 2000, "管辖争议及处理情况");
+        if (!"PENDING".equals(type) && basis == null) throw new BizException(2145, "选择管辖分类后须填写管辖依据");
+        if ("LOCAL".equals(type) && violation == null && treatment == null && insured == null)
+            throw new BizException(2145, "本辖区事实须至少记录违法行为地、就医地或参保地之一");
+        if ("DESIGNATED".equals(type) && designated == null) throw new BizException(2145, "指定管辖须填写指定管辖文号");
+        return new JurisdictionReq(type, basis, violation, treatment, insured, designated, dispute);
+    }
+
+    private static String jurisdictionText(String value, int max, String label) {
+        if (value == null) return null;
+        if (value.length() > max) throw new BizException(2145, label + "不能超过" + max + "字");
+        return value.isBlank() ? null : value.trim();
+    }
+
+    private static JurisdictionReq jurisdictionFacts(CaseFile c) {
+        return new JurisdictionReq(c.getJurisdictionType(), c.getJurisdictionBasis(), c.getViolationPlace(),
+                c.getTreatmentPlace(), c.getInsuredPlace(), c.getDesignatedNo(), c.getJurisdictionDisputeNote());
+    }
+
+    public JurisdictionReq jurisdictionSnapshot(Long caseId) {
+        return jurisdictionFacts(get(caseId));
+    }
+
+    private static void applyJurisdiction(CaseFile c, JurisdictionReq j) {
+        c.setJurisdictionType(j.type());
+        c.setJurisdictionBasis(j.basis());
+        c.setViolationPlace(j.violationPlace());
+        c.setTreatmentPlace(j.treatmentPlace());
+        c.setInsuredPlace(j.insuredPlace());
+        c.setDesignatedNo(j.designatedNo());
+        c.setJurisdictionDisputeNote(j.disputeNote());
+    }
+
+    public record InstitutionReq(String code, String ownership, String grade, String kind) {
+        public InstitutionReq(String code, String ownership, String grade) {
+            this(code, ownership, grade, null);
+        }
+    }
+
+    static InstitutionReq normalizeInstitution(String partyType, InstitutionReq institution) {
+        if (institution == null) return null;
+        if (!"PROVIDER".equals(partyType))
+            throw new BizException(2026, "仅定点医药机构可以填写机构信息");
+        if (!validReportText(institution.code(), 64)
+                || !Set.of("PUBLIC", "SOCIAL").contains(java.util.Objects.toString(institution.ownership(), ""))
+                || !Set.of("TERTIARY", "SECONDARY", "PRIMARY", "UNGRADED").contains(java.util.Objects.toString(institution.grade(), "")))
+            throw new BizException(2026, "请填写有效的机构编码、性质和等级");
+        if (institution.kind() != null && !Set.of("MEDICAL", "SINGLE_PHARMACY", "CHAIN_PHARMACY").contains(institution.kind()))
+            throw new BizException(2026, "机构类型无效");
+        return new InstitutionReq(institution.code().strip(), institution.ownership(), institution.grade(), institution.kind());
+    }
+
+    private static boolean validReportText(String text, int max) {
+        return text != null && !text.isBlank() && text.length() <= max && text.indexOf(0) < 0;
+    }
 
     public record CaseCreateReq(Long clueId, Long causeId, String procedureType,
                                 String partyName, String partyType, String partyCreditNo,
                                 String partyAddress, String partyLegalRep, String partyContact,
                                 String summary, BigDecimal amountInvolved,
                                 List<OfficerReq> officers, String clueVerifyResult,
-                                Long enforceItemId, LocalDate violationEndDate, Boolean healthHarm) {}
+                                Long enforceItemId, LocalDate violationEndDate, Boolean healthHarm,
+                                JurisdictionReq jurisdiction, InstitutionReq institution,
+                                Boolean reportingDetailsRequired) {
+        public CaseCreateReq(Long clueId, Long causeId, String procedureType, String partyName, String partyType,
+                             String partyCreditNo, String partyAddress, String partyLegalRep, String partyContact,
+                             String summary, BigDecimal amountInvolved, List<OfficerReq> officers, String clueVerifyResult,
+                             Long enforceItemId, LocalDate violationEndDate, Boolean healthHarm, JurisdictionReq jurisdiction) {
+            this(clueId, causeId, procedureType, partyName, partyType, partyCreditNo, partyAddress, partyLegalRep,
+                    partyContact, summary, amountInvolved, officers, clueVerifyResult, enforceItemId, violationEndDate,
+                    healthHarm, jurisdiction, null, null);
+        }
+        /** Existing Java callers and API payloads remain compatible. */
+        public CaseCreateReq(Long clueId, Long causeId, String procedureType, String partyName, String partyType,
+                             String partyCreditNo, String partyAddress, String partyLegalRep, String partyContact,
+                             String summary, BigDecimal amountInvolved, List<OfficerReq> officers, String clueVerifyResult,
+                             Long enforceItemId, LocalDate violationEndDate, Boolean healthHarm) {
+            this(clueId, causeId, procedureType, partyName, partyType, partyCreditNo, partyAddress, partyLegalRep,
+                    partyContact, summary, amountInvolved, officers, clueVerifyResult, enforceItemId, violationEndDate,
+                    healthHarm, null);
+        }
+    }
 
     @Transactional
     public CaseFile create(CaseCreateReq req, String username) {
         // 按执法证号去重计数：重复填同一人不算两人（第16条）
         if (req.officers() == null
-                || req.officers().stream().map(OfficerReq::certNo).filter(java.util.Objects::nonNull)
-                       .map(String::trim).distinct().count() < 2)
+                || req.officers().stream().anyMatch(o -> o == null || o.name() == null || o.name().isBlank()
+                    || o.certNo() == null || o.certNo().isBlank())
+                || req.officers().stream().map(OfficerReq::certNo).map(String::trim).distinct().count() < 2)
             throw new BizException(2002, "执法人员不得少于两人（第16条），且须为不同执法证号");
+        if (req.procedureType() != null && !List.of("NORMAL", "SUMMARY").contains(req.procedureType()))
+            throw new BizException(2026, "程序类型须为普通程序或简易程序");
         CaseCause cause = requireCauseMatch(req.causeId(), req.partyType());
+        JurisdictionReq jurisdiction = normalizeJurisdiction(req.jurisdiction());
+        InstitutionReq institution = normalizeInstitution(req.partyType(), req.institution());
+        // Source before actors: the same order is used by approval and existing case transfers.
+        if (req.clueId() != null) {
+            jdbc.queryForList("select id from case_clue where id=? for update", req.clueId());
+            sourceAttachmentAccess.lockInspectionsForAdoption(req.clueId());
+        }
+        enforcerRegistry.lockRegistry();
+        // Direct filing and approval execution both have a responsible-role HTTP actor.
+        // Approval execution may create a case for a different applicant, so acquire both users together.
+        var filingActors = workflowUsers.lockUsers(username, currentPrincipalName());
+        WorkflowUserAccess.User owner = workflowUsers.requireFiling(username == null ? null : filingActors.get(username));
+        var filingApprover = materialAccess.requireCurrentRoles("LEADER", "ADMIN");
+        if ((owner.district() && owner.deptId() == null)
+                || (filingApprover != null && filingApprover.district()
+                    && (filingApprover.deptId() == null || !filingApprover.deptId().equals(owner.deptId()))))
+            throw new BizException(2080, "立案申请不在当前区市县机构范围内");
+        // Recheck scope after any actor-lock wait: previous roles must not grant current access.
+        if (req.clueId() != null) {
+            sourceAttachmentAccess.clueForFiling(req.clueId(), username, false);
+            var sourceDept = jdbc.queryForObject("select owner_dept_id from case_clue where id=?", Long.class, req.clueId());
+            if (sourceDept != null && owner.accountCategory() != null && !sourceDept.equals(owner.deptId()))
+                throw new BizException(2080, "跨机构线索请完成机构交接后再立案");
+        }
 
         CaseFile c = new CaseFile();
+        applyJurisdiction(c, jurisdiction);
         LocalDate today = LocalDate.now();
         // 第6条：追责时效——违法行为终了起2年（涉生命健康且有危害后果5年）未被发现不再处罚
         // 不填终了日即完全绕过时效检查，故提供强制开关（默认开启，历史数据迁移期可关）
@@ -85,32 +216,45 @@ public class CaseService {
         c.setPartyName(req.partyName());
         c.setPartyType(req.partyType());
         c.setPartyCreditNo(req.partyCreditNo());
+        if (institution != null) {
+            c.setInstitutionCode(institution.code());
+            c.setInstitutionOwnership(institution.ownership());
+            c.setInstitutionGrade(institution.grade());
+            c.setInstitutionKind(institution.kind());
+        }
         c.setPartyAddress(req.partyAddress());
         c.setPartyLegalRep(req.partyLegalRep());
         c.setPartyContact(req.partyContact());
         c.setSummary(req.summary());
-        c.setAmountInvolved(req.amountInvolved() == null ? BigDecimal.ZERO : req.amountInvolved());
+        c.setAmountInvolved(cn.ybcase.bureau.common.Money.nonNegative(req.amountInvolved(), "涉案金额"));
         c.setFiledAt(today);
         c.setDeadlineAt(today.plusDays(config.intVal("case_deadline_days", 90)));  // 第45条：立案之日起九十日（可配）
         c.setCreatedBy(username);
         c.setOwnerUser(username);  // 承办人=立案申请人（可移交）
-        var deptRows = jdbc.queryForList("select dept_id from sys_user where username = ?", username);
-        if (!deptRows.isEmpty() && deptRows.get(0).get("dept_id") != null)
-            c.setOwnerDeptId(((Number) deptRows.get(0).get("dept_id")).longValue());
+        c.setOwnerDeptId(owner.deptId());
+        boolean reportingRequired = Boolean.TRUE.equals(req.reportingDetailsRequired())
+                || owner.accountCategory() != null;
+        if (reportingRequired && "PROVIDER".equals(c.getPartyType()) && institution == null)
+            throw new BizException(2026, "请填写机构编码、性质和等级");
+        c.setReportingDetailsRequired(reportingRequired);
+        var officerUsers = procedureService.validateAndResolveEnforcers(req.officers());
         caseRepository.save(c);
 
         for (OfficerReq o : req.officers()) {
-            procedureService.validateEnforcer(o.name(), o.certNo());  // 第16条：执法资格台账校验
             jdbc.update("insert into case_officer (case_id, name, cert_no, duty, user_id) values (?,?,?,?,?)",
                     c.getId(), o.name(), o.certNo(), o.duty() == null ? "MEMBER" : o.duty(),
-                    resolveOfficerUserId(o.name(), o.certNo()));
+                    officerUsers.get(o.certNo()));
         }
-        if (req.clueId() != null) clueService.markFiled(req.clueId(), req.clueVerifyResult());
+        if (req.clueId() != null) {
+            clueService.markFiled(req.clueId(), req.clueVerifyResult());
+            sourceAttachmentAccess.adoptClue(req.clueId(), c.getId());
+        }
         return c;
     }
 
     /** 案由主体与当事人类别一致性（2001）：立案与案由更正共用同一口径 */
     private CaseCause requireCauseMatch(Long causeId, String partyType) {
+        if (causeId == null) throw new BizException(2026, "请选择案由");
         CaseCause cause = causeRepository.findById(causeId)
                 .orElseThrow(() -> new BizException(2026, "案由不存在"));
         if (!cause.getSubjectType().equals(partyType))
@@ -126,10 +270,70 @@ public class CaseService {
     // ---------- 案件要素更正（留痕，局令第4/35条） ----------
 
     /** 更正记录 field 列 → 中文名（大事记与前端共用同一份） */
-    public static final Map<String, String> CORRECTION_FIELD_LABELS = Map.of(
-            "partyName", "当事人名称", "partyCreditNo", "证照号", "partyAddress", "地址",
-            "partyLegalRep", "法定代表人", "partyContact", "联系方式", "summary", "案情摘要",
-            "amountInvolved", "涉案金额", "causeId", "案由", "name", "案件名称");
+    public static final Map<String, String> CORRECTION_FIELD_LABELS = Map.ofEntries(
+            Map.entry("partyName", "当事人名称"), Map.entry("partyCreditNo", "证照号"), Map.entry("partyAddress", "地址"),
+            Map.entry("partyLegalRep", "法定代表人"), Map.entry("partyContact", "联系方式"), Map.entry("summary", "案情摘要"),
+            Map.entry("amountInvolved", "涉案金额"), Map.entry("causeId", "案由"), Map.entry("name", "案件名称"),
+            Map.entry("jurisdictionType", "管辖分类"), Map.entry("jurisdictionBasis", "管辖依据"),
+            Map.entry("violationPlace", "违法行为地"), Map.entry("treatmentPlace", "就医地"), Map.entry("insuredPlace", "参保地"),
+            Map.entry("designatedNo", "指定管辖文号"), Map.entry("jurisdictionDisputeNote", "管辖争议及处理情况"));
+
+    @Transactional
+    public CaseFile updateJurisdiction(Long caseId, JurisdictionUpdateReq req, String operator) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        CaseFile c = get(caseId);
+        if (!List.of("INVESTIGATING", "REPORTED", "NOTIFIED").contains(c.getStatus()))
+            throw new BizException(2145, "仅在办案件可补录或更正管辖事实；已决定案件须按相应程序办理");
+        if (req == null || req.jurisdiction() == null) throw new BizException(2145, "须提供管辖事实");
+        String reason = jurisdictionText(req.reason(), 1000, "补录/更正理由");
+        if (reason == null) throw new BizException(2145, "须填写管辖事实补录/更正理由");
+        JurisdictionReq next = normalizeJurisdiction(req.jurisdiction());
+        JurisdictionReq old = jurisdictionFacts(c);
+        String[][] fields = {
+                {"jurisdictionType", old.type(), next.type()}, {"jurisdictionBasis", old.basis(), next.basis()},
+                {"violationPlace", old.violationPlace(), next.violationPlace()}, {"treatmentPlace", old.treatmentPlace(), next.treatmentPlace()},
+                {"insuredPlace", old.insuredPlace(), next.insuredPlace()}, {"designatedNo", old.designatedNo(), next.designatedNo()},
+                {"jurisdictionDisputeNote", old.disputeNote(), next.disputeNote()}};
+        List<String[]> changes = java.util.Arrays.stream(fields)
+                .filter(f -> !java.util.Objects.equals(f[1], f[2])).toList();
+        if (changes.isEmpty()) throw new BizException(2122, "没有任何管辖事实发生变化，无需更正");
+        String batch = java.util.UUID.randomUUID().toString().replace("-", "");
+        for (String[] f : changes)
+            jdbc.update("insert into case_correction(case_id,batch_no,field,old_value,new_value,reason,operator) values(?,?,?,?,?,?,?)",
+                    caseId, batch, f[0], f[1], f[2], reason, operator);
+        applyJurisdiction(c, next);
+        // Approved filing payloads are immutable snapshots; corrections only change current facts and append history.
+        return caseRepository.save(c);
+    }
+
+    private List<Map<String, Object>> jurisdictionHistory(Long id) {
+        return jdbc.queryForList("""
+                select * from case_correction where case_id = ? and field in
+                ('jurisdictionType','jurisdictionBasis','violationPlace','treatmentPlace','insuredPlace','designatedNo','jurisdictionDisputeNote')
+                order by id desc""", id);
+    }
+
+    private static Map<String, Object> jurisdictionMaterial(String key, String label, boolean present, String message) {
+        return Map.of("key", key, "label", label, "present", present, "message", message);
+    }
+
+    private static List<Map<String, Object>> jurisdictionMaterials(JurisdictionReq j) {
+        List<Map<String, Object>> items = new java.util.ArrayList<>();
+        boolean pending = "PENDING".equals(j.type());
+        items.add(jurisdictionMaterial("type", "管辖事实分类", !pending, pending ? "待补录管辖事实，请核实后完善" : "已记录事实分类，请核实相关依据"));
+        items.add(jurisdictionMaterial("basis", "管辖依据说明", j.basis() != null, "请记录管辖依据，并注明相关材料或文号"));
+        if ("LOCAL".equals(j.type()) || pending)
+            items.add(jurisdictionMaterial("places", "违法行为地/就医地/参保地", j.violationPlace() != null || j.treatmentPlace() != null || j.insuredPlace() != null,
+                    "至少记录与本案相关的一处地点；地点本身不自动确定管辖权"));
+        if ("DESIGNATED".equals(j.type()))
+            items.add(jurisdictionMaterial("designatedNo", "指定管辖文号", j.designatedNo() != null, "核对指定管辖文件及文号"));
+        if ("TRANSFERRED".equals(j.type()))
+            items.add(jurisdictionMaterial("transferBasis", "移送受理情况说明", j.basis() != null, "请在依据中记录移送来源、相关文号及受理情况"));
+        if (j.disputeNote() != null)
+            items.add(jurisdictionMaterial("disputeNote", "管辖争议及处理记录", true, "已记录争议与处理情况，按实际程序核实"));
+        return items;
+    }
 
     /** 字段为空 = 不更正；传空串 = 清空（partyName 除外，不允许清空） */
     public record CorrectionReq(String partyName, String partyCreditNo, String partyAddress,
@@ -143,6 +347,8 @@ public class CaseService {
      */
     @Transactional
     public CaseFile correctPartyInfo(Long caseId, CorrectionReq req, String operator) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         if (!"INVESTIGATING".equals(c.getStatus()) && !"REPORTED".equals(c.getStatus()))
             throw new BizException(2120, "案件当前状态（" + c.getStatus()
@@ -197,7 +403,9 @@ public class CaseService {
         return caseRepository.save(c);
     }
 
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public List<Map<String, Object>> corrections(Long caseId) {
+        materialAccess.requireCurrentCaseReader(caseId);
         get(caseId);
         return jdbc.queryForList("select * from case_correction where case_id = ? order by id desc", caseId);
     }
@@ -218,31 +426,28 @@ public class CaseService {
 
     @Transactional
     public void addOfficer(Long caseId, OfficerReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
         requireActive(get(caseId));
-        procedureService.validateEnforcer(req.name(), req.certNo());
+        if (req == null || req.name() == null || req.name().isBlank() || req.certNo() == null || req.certNo().isBlank())
+            throw new BizException(2002, "办案人员须填写姓名和执法证号");
+        enforcerRegistry.lockRegistry();
+        // Certificate paths share registry -> actors -> certificate rows with creation/review.
+        materialAccess.requireCurrentCaseWriter(caseId);
+        var officerUsers = procedureService.validateAndResolveEnforcers(List.of(req));
         Integer dup = jdbc.queryForObject(
                 "select count(*) from case_officer where case_id = ? and cert_no = ? and avoided = false",
                 Integer.class, caseId, req.certNo());
         if (dup != null && dup > 0) throw new BizException(2002, "该执法证号已在本案办案人员名单中");
         jdbc.update("insert into case_officer (case_id, name, cert_no, duty, user_id) values (?,?,?,?,?)",
                 caseId, req.name(), req.certNo(), req.duty() == null ? "MEMBER" : req.duty(),
-                resolveOfficerUserId(req.name(), req.certNo()));
-    }
-
-    /**
-     * 办案人员 → 系统账号：只认执法证台账里维护的权威映射（按证号）。
-     * 不按姓名兜底——"重名唯一"只保证 sys_user 内不重名，会把另一岗位的同名账号误绑，
-     * 凭空给它本案数据权限。解析不到就留空，由管理员在执法证台账补映射（数据范围从严）。
-     */
-    private Long resolveOfficerUserId(String name, String certNo) {
-        var byCert = jdbc.queryForList(
-                "select user_id from enforcer where cert_no = ? and user_id is not null", certNo);
-        return byCert.isEmpty() ? null : ((Number) byCert.get(0).get("user_id")).longValue();
+                officerUsers.get(req.certNo()));
     }
 
     /** 回避（第5条）：主动回避或当事人申请，分级批准；回避后在册执法人员仍不得少于两人 */
     @Transactional
     public void avoidOfficer(Long caseId, Long officerId, String reason, String applicant, String decidedBy) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         requireActive(get(caseId));
         Integer active = jdbc.queryForObject(
                 "select count(distinct cert_no) from case_officer where case_id = ? and avoided = false and id <> ?",
@@ -273,14 +478,29 @@ public class CaseService {
 
     @Transactional
     public void addDocument(Long caseId, DocumentReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         CaseGuards.requireNotArchived(c);
+        if (req == null) throw new BizException(2100, "请填写文书材料");
+        documentText(req.docType(), "文书类型", 32, true);
+        documentText(req.title(), "文书标题", 255, true);
+        documentText(req.content(), "文书正文", Integer.MAX_VALUE, true);
+        documentText(req.maker(), "制作人", 64, false);
+        documentText(req.note(), "文书备注", 255, false);
         jdbc.update("""
                 insert into case_document (case_id, doc_type, title, content, made_at, maker, signed, note, due_at)
                 values (?,?,?,?,?,?,?,?,?)""",
                 caseId, req.docType(), req.title(), req.content(),
                 req.madeAt() != null ? req.madeAt() : LocalDate.now(),
                 req.maker(), Boolean.TRUE.equals(req.signed()), req.note(), req.dueAt());
+    }
+
+    private static void documentText(String value, String label, int max, boolean required) {
+        if (required && (value == null || value.isBlank())) throw new BizException(2100, "请填写" + label);
+        if (value != null && value.indexOf('\0') >= 0) throw new BizException(2100, label + "含无效字符");
+        if (value != null && value.codePointCount(0, value.length()) > max)
+            throw new BizException(2100, label + "不能超过" + max + "个字符");
     }
 
     // ---------- 期限扣除（第45条） ----------
@@ -291,6 +511,8 @@ public class CaseService {
      *  办案人被引向"留空、事后补登"，但此前既无补登接口、开放行也不计入期限——鉴定期扣除会整段丢失 */
     @Transactional
     public void endExclusion(Long caseId, Long exclusionId, LocalDate endAt) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         var rows = jdbc.queryForList(
                 "select start_at, end_at from case_period_exclusion where id = ? and case_id = ?", exclusionId, caseId);
@@ -300,14 +522,24 @@ public class CaseService {
         LocalDate start = ((java.sql.Date) rows.get(0).get("start_at")).toLocalDate();
         if (endAt.isBefore(start)) throw new BizException(2032, "结束日期不得早于起始日期（" + start + "）");
         if (endAt.isAfter(LocalDate.now())) throw new BizException(2032, "结束日期不得晚于今天");
-        long span = ChronoUnit.DAYS.between(start, endAt) + 1;
+        if (endAt.isAfter(exclusionCutoff(c)))
+            throw new BizException(2032, "结束日期不得晚于调查办理结束日期（" + exclusionCutoff(c) + "）");
+        long span = ChronoUnit.DAYS.between(start, endAt);
         int max = config.intVal("exclusion_max_days", 180);
         if (span > max) throw new BizException(2032, "扣除天数（" + span + "日）超过上限 " + max + " 日");
+        Integer overlap = jdbc.queryForObject("""
+                select count(*) from case_period_exclusion
+                where case_id = ? and id <> ? and coalesce(end_at, current_date) > ? and start_at < ?""",
+                Integer.class, caseId, exclusionId, start, endAt);
+        if (overlap != null && overlap > 0)
+            throw new BizException(2032, "结束日期与其他已登记扣除区间重叠，请核实实际起止日期");
         jdbc.update("update case_period_exclusion set end_at = ? where id = ?", endAt, exclusionId);
     }
 
     @Transactional
     public void addExclusion(Long caseId, ExclusionReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         requireActive(c);
         if (!List.of("TEST", "APPRAISE", "HEARING", "ANNOUNCE", "EXPERT").contains(req.reason()))
@@ -325,7 +557,7 @@ public class CaseService {
             // 填一个远期结束日即可一次性扣掉上限天数（默认180日），等于绕开"延期须负责人批准"
             if (req.endAt().isAfter(LocalDate.now()))
                 throw new BizException(2032, "结束日期不得晚于今天；事由尚未结束的请留空结束日期，结束后再补登");
-            long span = ChronoUnit.DAYS.between(req.startAt(), req.endAt()) + 1;
+            long span = ChronoUnit.DAYS.between(req.startAt(), req.endAt());
             int max = config.intVal("exclusion_max_days", 180);
             if (span > max)
                 throw new BizException(2032, "单次不计入期限的天数（" + span + "日）超过上限 " + max + " 日，请核实起止日期");
@@ -333,7 +565,7 @@ public class CaseService {
         // 区间重叠会被重复扣除，等于凭空延长期限
         Integer overlap = jdbc.queryForObject("""
                 select count(*) from case_period_exclusion
-                where case_id = ? and coalesce(end_at, current_date) >= ? and start_at <= ?""",
+                where case_id = ? and (end_at is null or (end_at > ? and start_at < ?))""",
                 Integer.class, caseId, req.startAt(), req.endAt() == null ? LocalDate.now() : req.endAt());
         if (overlap != null && overlap > 0)
             throw new BizException(2032, "该时间段与已登记的不计入期限区间重叠，不得重复扣除");
@@ -345,9 +577,12 @@ public class CaseService {
 
     @Transactional
     public CaseFile suspend(Long caseId, String reason) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
         CaseFile c = get(caseId);
         if (!"INVESTIGATING".equals(c.getStatus())) throw new BizException(2033, "仅调查中的案件可中止（第42条）");
         if (reason == null || reason.isBlank()) throw new BizException(2033, "中止须载明法定情形并经负责人批准（第42条）");
+        requireExclusionsClosed(caseId);
         c.setStatus("SUSPENDED");
         c.setSuspendReason(reason);
         c.setSuspendedAt(LocalDate.now());
@@ -357,9 +592,11 @@ public class CaseService {
     /** 中止原因消除后立即恢复调查；中止期间顺延办案期限 */
     @Transactional
     public CaseFile resume(Long caseId) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
         CaseFile c = get(caseId);
         if (!"SUSPENDED".equals(c.getStatus())) throw new BizException(2034, "案件不在中止状态");
-        long suspendedDays = ChronoUnit.DAYS.between(c.getSuspendedAt(), LocalDate.now());
+        long suspendedDays = suspensionAdditionalDays(caseId, c.getSuspendedAt(), LocalDate.now());
         c.setDeadlineAt(c.getDeadlineAt().plusDays(suspendedDays));
         c.setStatus("INVESTIGATING");
         c.setSuspendReason(null);
@@ -369,10 +606,13 @@ public class CaseService {
 
     @Transactional
     public CaseFile terminate(Long caseId, String reason) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
         CaseFile c = get(caseId);
         if (List.of("DECIDED", "DELIVERED", "CLOSED", "TERMINATED").contains(c.getStatus()))
             throw new BizException(2035, "已决定/已结案的案件不可终止调查（第47条）");
         if (reason == null || reason.isBlank()) throw new BizException(2035, "终止须载明法定情形并经负责人批准（第47条）");
+        requireExclusionsClosed(caseId);
         // 第47条：终止调查的，已采取的强制措施应当同时解除
         jdbc.update("update case_evidence set sealed = false, register_hold = false where case_id = ?", caseId);
         c.setStatus("TERMINATED");
@@ -385,6 +625,8 @@ public class CaseService {
 
     @Transactional
     public CaseFile extend(Long caseId, int days, String reason) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
         CaseFile c = get(caseId);
         requireActive(c);
         if (days <= 0) throw new BizException(2009, "延长天数须为正数");
@@ -408,13 +650,53 @@ public class CaseService {
 
     // ---------- 调查终结（第36条） ----------
 
+    public record ViolationFinding(LocalDate start, LocalDate end, String facts, BigDecimal amount) {}
+    public record ReportReq(String content, ViolationFinding finding) {}
+
+    private static boolean validFinding(ViolationFinding finding) {
+        if (finding.start() == null || finding.end() == null || finding.start().isAfter(finding.end())
+                || finding.end().isAfter(LocalDate.now()) || !validReportText(finding.facts(), 12000)
+                || finding.amount() == null) return false;
+        try {
+            cn.ybcase.bureau.common.Money.nonNegative(finding.amount(), "认定违法违规金额");
+            return true;
+        } catch (BizException e) {
+            return false;
+        }
+    }
+
+    private static void applyFinding(CaseFile c, ViolationFinding finding) {
+        c.setConfirmedViolationStart(finding.start());
+        c.setConfirmedViolationEnd(finding.end());
+        c.setConfirmedViolationFacts(finding.facts().strip());
+        c.setConfirmedViolationAmount(finding.amount());
+    }
+
     @Transactional
     public CaseFile report(Long caseId, String reportContent, String maker) {
+        return report(caseId, new ReportReq(reportContent, null), maker);
+    }
+
+    @Transactional
+    public CaseFile report(Long caseId, ReportReq req, String maker) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         if (!"INVESTIGATING".equals(c.getStatus())) throw new BizException(2004, "仅调查中的案件可出具调查终结报告");
         if ("SUMMARY".equals(c.getProcedureType())) throw new BizException(2004, "简易程序无需调查终结报告，可直接当场决定");
+        String reportContent = req.content();
         if (reportContent == null || reportContent.isBlank())
             throw new BizException(2004, "调查终结报告须包含当事人情况/案件来源/事实证据/性质/处理意见（第36条）");
+        if (c.isReportingDetailsRequired() && req.finding() == null)
+            throw new BizException(2004, "调查终结须确认违法发生期间、事实和金额");
+        if (req.finding() != null) {
+            if (!validFinding(req.finding()))
+                throw new BizException(2004, "请填写有效的违法发生起止日期、认定事实和金额");
+            applyFinding(c, req.finding());
+            reportContent += "\n\n违法发生期间：" + c.getConfirmedViolationStart() + " 至 " + c.getConfirmedViolationEnd()
+                    + "\n认定违法事实：" + c.getConfirmedViolationFacts()
+                    + "\n认定违法违规金额：" + c.getConfirmedViolationAmount().toPlainString() + " 元";
+        }
         addDocument(caseId, new DocumentReq("FINAL_REPORT", c.getCaseNo() + " 案件调查终结报告",
                 reportContent, LocalDate.now(), maker, false, null, null));
         c.setStatus("REPORTED");
@@ -426,6 +708,8 @@ public class CaseService {
 
     @Transactional
     public CaseReview submitReview(Long caseId, String requiredReason) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         if (!List.of("REPORTED", "NOTIFIED").contains(c.getStatus()))
             throw new BizException(2036, "法制审核在调查终结后、作出决定前进行（第37条）");
@@ -436,30 +720,59 @@ public class CaseService {
         // 国家第40条：10个工作日；辽41条：7日+3——参数化
         r.setDeadlineAt(config.plusByUnit(LocalDate.now(),
                 config.intVal("legal_review_days", 10), "legal_review_day_unit"));
+        var material = reviewMaterials.capture(caseId);
+        r.setMaterialSnapshot(material.json());
+        r.setMaterialFingerprint(material.fingerprint());
         return reviewRepository.save(r);
     }
 
     @Transactional
-    public CaseReview doReview(Long reviewId, String reviewer, String opinionType, String opinion) {
+    public CaseReview doReview(Long reviewId, String username, String opinionType, String opinion) {
         CaseReview r = reviewRepository.findById(reviewId)
                 .orElseThrow(() -> new BizException(2037, "审核记录不存在"));
-        if (r.getReviewedAt() != null) throw new BizException(2037, "该审核已办结");
+        CaseGuards.lockWritable(jdbc, r.getCaseId());
+        if (jdbc.queryForObject("select reviewed_at is not null from case_review where id = ?", Boolean.class, reviewId))
+            throw new BizException(2037, "该审核已办结");
+        if (!List.of("REPORTED", "NOTIFIED").contains(get(r.getCaseId()).getStatus()))
+            throw new BizException(2036, "仅决定前的案件可办理法制审核");
+        Long latest = jdbc.queryForObject("select max(id) from case_review where case_id = ?", Long.class, r.getCaseId());
+        if (!r.getId().equals(latest))
+            throw new BizException(2150, "该审核申请已被新的送审申请替代，请办理最新申请");
+        if (!reviewMaterials.matches(r))
+            throw new BizException(2150, "送审材料已变更或历史审核未绑定材料，请重新提交法制审核");
+        enforcerRegistry.lockRegistry();
+        if (username == null || username.isBlank()) throw new BizException(2070, "审核账号不存在或已停用");
+        var actor = workflowUsers.lockUsers(username, currentPrincipalName()).get(username);
+        if (actor == null || !actor.enabled()) throw new BizException(2070, "审核账号不存在或已停用");
+        Long actorId = actor.id();
+        String reviewer = jdbc.queryForObject("select real_name from sys_user where id=?", String.class, actorId);
+        var certificates = enforcerRegistry.lockReviewCertificates(actorId, r.getCaseId());
         if (!List.of("AGREE", "CONTINUE", "CHANGE", "CORRECT", "OTHER").contains(opinionType))
             throw new BizException(2037, "审核意见类型须为 同意/继续调查/变更/纠正/其他（第39条）");
         // 第37条：办案人员不得作为审核人员
-        List<Map<String, Object>> officers = jdbc.queryForList(
-                "select name from case_officer where case_id = ?", r.getCaseId());
-        if (officers.stream().anyMatch(o -> o.get("name").equals(reviewer)))
+        var officers = jdbc.queryForList("select cert_no, user_id from case_officer where case_id=?", r.getCaseId());
+        boolean participant = officers.stream().anyMatch(o -> {
+            var certificate = certificates.get((String) o.get("cert_no"));
+            return o.get("user_id") instanceof Number number && actorId.longValue() == number.longValue()
+                    || certificate != null && actorId.equals(certificate.userId());
+        });
+        if (participant)
             throw new BizException(2038, "同一案件的办案人员不得作为法制审核人员（第37条）");
+        if (actor.roles().stream().noneMatch(java.util.Set.of("LEGAL", "ADMIN")::contains))
+            throw new BizException(2070, "当前账号不具备法制审核岗位");
+        // Keep established self-review/qualification codes; additionally reject a revoked HTTP session.
+        materialAccess.requireCurrentCaseRoles(r.getCaseId(), "LEGAL", "ADMIN");
         // 辽41条：从事案件审核的人员应通过法律职业资格考试（参数开关，比对执法证台账）
         if (config.bool("review_legal_qualified_required", true)) {
-            Integer qualified = jdbc.queryForObject(
-                    "select count(*) from enforcer where name = ? and legal_qualified = true and enabled = true",
-                    Integer.class, reviewer);
-            if (qualified == null || qualified == 0)
+            boolean qualified = certificates.values().stream().anyMatch(certificate -> actorId.equals(certificate.userId())
+                    && certificate.enabled() && certificate.legalQualified() && certificate.expiresAt() != null
+                    && !certificate.expiresAt().isBefore(LocalDate.now()));
+            if (!qualified)
                 throw new BizException(2070, "审核人 " + reviewer + " 未在台账中登记法律职业资格（辽41条）");
         }
         r.setReviewer(reviewer);
+        r.setReviewerUserId(actorId);
+        r.setOperator(username);
         r.setOpinionType(opinionType);
         r.setOpinion(opinion);
         r.setReviewedAt(LocalDate.now());
@@ -484,6 +797,8 @@ public class CaseService {
 
     @Transactional
     public CaseNotice notify(Long caseId, NoticeReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         // REPORTED 首次告知；NOTIFIED 允许再次告知（辽52条：改变原认定的事实/证据/依据须重新履行告知程序）
         if (!List.of("REPORTED", "NOTIFIED").contains(c.getStatus()))
@@ -502,19 +817,19 @@ public class CaseService {
         // 否则当事人申请听证后只要以同额再告知一次，2075 守卫即失效
         if (prev != null && Boolean.TRUE.equals(prev.getHearingRequested())) {
             n.setHearingRequested(true);
-            n.setHearingHeldAt(prev.getHearingHeldAt());
+            n.setHearingHeldAt(procedureService.heldHearingDate(caseId));
         }
         n.setChangeReason(req.changeReason());
         n.setCaseId(caseId);
         n.setNotifiedAt(LocalDate.now());
         n.setContent(req.content());
-        n.setProposedFine(nz(req.proposedFine()));
-        n.setProposedRecoup(nz(req.proposedRecoup()));
+        n.setProposedFine(cn.ybcase.bureau.common.Money.nonNegative(req.proposedFine(), "拟罚款"));
+        n.setProposedRecoup(cn.ybcase.bureau.common.Money.nonNegative(req.proposedRecoup(), "拟追回金额"));
         // 陈述申辩期限（辽44条：告知须载明期限与逾期后果；0=不启用）
         int stmtDays = config.intVal("statement_deadline_days", 3);
         if (stmtDays > 0) n.setStatementDeadline(LocalDate.now().plusDays(stmtDays));
         // 拟罚款达到听证标准（按当事人类型分档，辽46条）：告知听证权利
-        n.setProposedConfiscate(nz(req.proposedConfiscate()));
+        n.setProposedConfiscate(cn.ybcase.bureau.common.Money.nonNegative(req.proposedConfiscate(), "拟没收金额"));
         n.setHearingEntitled(punitiveAmount(nz(req.proposedFine()), nz(req.proposedConfiscate()))
                 .compareTo(config.byPartyType(c.getPartyType(),
                         "hearing_threshold_individual", "hearing_threshold_org", "100000")) >= 0);
@@ -530,6 +845,8 @@ public class CaseService {
 
     @Transactional
     public CaseNotice recordStatement(Long caseId, StatementReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseGuards.requireNotArchived(get(caseId));
         CaseNotice n = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
                 .orElseThrow(() -> new BizException(2006, "尚未作出处罚告知"));
@@ -553,9 +870,7 @@ public class CaseService {
             n.setHearingRequested(req.hearingRequested());
         }
         if (req.hearingHeldAt() != null) {
-            if (!Boolean.TRUE.equals(n.getHearingRequested()))
-                throw new BizException(2039, "当事人未申请听证");
-            n.setHearingHeldAt(req.hearingHeldAt());
+            throw new BizException(2141, "听证举行日期须通过听证流程登记，不能在陈述申辩中直接填写");
         }
         return noticeRepository.save(n);
     }
@@ -566,6 +881,8 @@ public class CaseService {
 
     @Transactional
     public void addMeeting(Long caseId, MeetingReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseGuards.requireNotArchived(get(caseId));
         if (req.attendees() == null || req.attendees().isBlank())
             throw new BizException(2047, "须记录集体讨论参加人员（第44条）");
@@ -580,108 +897,241 @@ public class CaseService {
 
     public record DecisionReq(String decisionType, BigDecimal fineAmount, BigDecimal recoupAmount,
                               BigDecimal confiscateAmount, String otherMeasures, String content,
-                              String mitigation, String discretionReason) {}
+                              String mitigation, String discretionReason, String penaltyBasis,
+                              ViolationFinding finding) {
+        public DecisionReq(String decisionType, BigDecimal fineAmount, BigDecimal recoupAmount,
+                           BigDecimal confiscateAmount, String otherMeasures, String content,
+                           String mitigation, String discretionReason) {
+            this(decisionType, fineAmount, recoupAmount, confiscateAmount, otherMeasures, content,
+                    mitigation, discretionReason, null, null);
+        }
+    }
+
+    public record CloseReq(String closeReport) {}
+    public record PreflightReq(String action, DecisionReq decision, CloseReq close) {}
+    public record PreflightItem(String key, String label, boolean passed, String message, String role) {}
+    public record PreflightResult(String action, boolean ready, List<PreflightItem> items) {}
+
+    private record CheckedItem(PreflightItem item, int code, String failureMessage) {}
+
+    /** The same read-only checks drive previews and locked writes; no trial writes or number allocation. */
+    private static final class Checklist {
+        private final java.util.ArrayList<CheckedItem> checks = new java.util.ArrayList<>();
+
+        void check(String key, String label, boolean passed, int code, String message, String role) {
+            check(key, label, passed, code, message, role, message);
+        }
+
+        void check(String key, String label, boolean passed, int code, String message, String role, String failureMessage) {
+            checks.add(new CheckedItem(new PreflightItem(key, label, passed,
+                    passed ? "已满足" : message, role), code, failureMessage));
+        }
+
+        BigDecimal money(String key, String label, BigDecimal amount) {
+            try {
+                BigDecimal value = cn.ybcase.bureau.common.Money.nonNegative(amount, label);
+                check(key, label, true, 2140, "", "HANDLER");
+                return value;
+            } catch (BizException e) {
+                check(key, label, false, e.code, e.getMessage(), "HANDLER");
+                return null;
+            }
+        }
+
+        void requireReady() {
+            for (CheckedItem c : checks) {
+                if (!c.item().passed()) throw new BizException(c.code(), c.failureMessage());
+            }
+        }
+
+        PreflightResult result(String action) {
+            return new PreflightResult(action, checks.stream().allMatch(c -> c.item().passed()),
+                    checks.stream().map(CheckedItem::item).toList());
+        }
+    }
+
+    private record DecisionChecks(Checklist checklist, BigDecimal fine, BigDecimal recoup, BigDecimal confiscate) {}
+
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public PreflightResult preflight(Long caseId, PreflightReq req) {
+        materialAccess.requireCurrentCaseReader(caseId);
+        if (req == null || !("DECIDE".equals(req.action()) || "CLOSE".equals(req.action())))
+            throw new BizException(2144, "前置检查操作须为 DECIDE 或 CLOSE");
+        CaseFile c = get(caseId);
+        return "DECIDE".equals(req.action()) ? decisionChecks(c, req.decision()).checklist().result("DECIDE")
+                : closeChecks(c, req.close()).result("CLOSE");
+    }
+
+    private DecisionChecks decisionChecks(CaseFile c, DecisionReq req) {
+        Long caseId = c.getId();
+        Checklist out = new Checklist();
+        out.check("writable", "案卷尚未封卷", !"CLOSED".equals(c.getStatus()) && c.getArchiveNo() == null,
+                2031, "案件已立卷归档，不可再增删卷内材料", "LEADER");
+        out.check("no_decision", "尚未作出处理决定", decisionRepository.findByCaseId(caseId).isEmpty(),
+                2040, "该案已作出处理决定", "LEADER");
+        out.check("exclusions_closed", "期限扣除事由已登记结束日期", exclusionsClosed(caseId),
+                2032, "仍有未结束的期限扣除事由或专家评审，请先登记结束日期", "HANDLER");
+        if (req == null) {
+            out.check("decision_draft", "处理决定草稿", false, 2144, "请填写拟作出的处理决定", "HANDLER");
+            req = new DecisionReq(null, null, null, null, null, null, null, null);
+        }
+        boolean validType = req.decisionType() != null && List.of("PUNISH", "NO_PUNISH", "NOT_ESTABLISHED",
+                "TRANSFER_ADMIN", "TRANSFER_JUDICIAL").contains(req.decisionType());
+        out.check("decision_type", "法定决定类型", validType, 2040, "决定类型须为第43条规定的五种之一", "HANDLER");
+        BigDecimal fine = out.money("fine_amount", "罚款金额", req.fineAmount());
+        BigDecimal recoup = out.money("recoup_amount", "追回金额", req.recoupAmount());
+        BigDecimal conf = out.money("confiscate_amount", "没收金额", req.confiscateAmount());
+        boolean validAmounts = fine != null && recoup != null && conf != null;
+        if (fine != null && conf != null)
+            out.check("penalty_type", "决定类型与罚没金额一致", "PUNISH".equals(req.decisionType())
+                            || fine.signum() == 0 && conf.signum() == 0,
+                    2140, "非处罚决定不能确定罚款或没收违法所得", "HANDLER");
+        boolean summary = "SUMMARY".equals(c.getProcedureType());
+        if (req.penaltyBasis() != null || c.isReportingDetailsRequired()) {
+            out.check("penalty_basis", "处罚依据", !"PUNISH".equals(req.decisionType())
+                            || validReportText(req.penaltyBasis(), 4000),
+                    2040, "请填写处罚依据，最多4000字", "LEADER");
+        }
+        if (req.finding() != null || summary && c.isReportingDetailsRequired() && "PUNISH".equals(req.decisionType())) {
+            out.check("violation_finding", "确认违法事实", summary && "PUNISH".equals(req.decisionType())
+                            && req.finding() != null && validFinding(req.finding()),
+                    2040, "请在简易程序处罚决定中填写有效的违法发生起止日期、认定事实和金额", "LEADER");
+        }
+        if (summary) {
+            out.check("decision_status", "简易程序决定阶段", "INVESTIGATING".equals(c.getStatus()),
+                    2003, "简易程序应在调查中当场作出决定（第48条）", "HANDLER");
+            BigDecimal limit = config.byPartyType(c.getPartyType(), "summary_fine_limit_individual", "summary_fine_limit_org",
+                    "INDIVIDUAL".equals(c.getPartyType()) ? "200" : "3000");
+            if (fine != null)
+                out.check("summary_limit", "简易程序罚款限额", !"PUNISH".equals(req.decisionType()) || fine.compareTo(limit) <= 0,
+                        2003, "简易程序罚款超限（当事人类别限额 " + limit + " 元），请转普通程序（第48条）", "HANDLER");
+        } else {
+            out.check("decision_status", "已告知并听取陈述申辩", "NOTIFIED".equals(c.getStatus()),
+                    2006, "作出处罚决定前应当书面告知当事人并听取陈述申辩（第41条）", "HANDLER");
+            CaseNotice notice = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+            out.check("notice", "处罚告知记录", notice != null, 2006, "缺少处罚告知记录（第41条）", "HANDLER");
+            LocalDate heldHearing = procedureService.heldHearingDate(caseId);
+            if (notice != null) {
+                List<CaseNotice> notices = noticeRepository.findByCaseIdOrderByIdDesc(caseId);
+                BigDecimal minFine = notices.stream().map(CaseNotice::getProposedFine).filter(java.util.Objects::nonNull)
+                        .min(BigDecimal::compareTo).orElse(nz(notice.getProposedFine()));
+                BigDecimal minRecoup = notices.stream().map(CaseNotice::getProposedRecoup).filter(java.util.Objects::nonNull)
+                        .min(BigDecimal::compareTo).orElse(nz(notice.getProposedRecoup()));
+                BigDecimal minConf = notices.stream().map(n -> nz(n.getProposedConfiscate())).min(BigDecimal::compareTo).orElse(BigDecimal.ZERO);
+                if (validAmounts)
+                    out.check("no_aggravation", "不得高于历次最低告知金额", fine.compareTo(minFine) <= 0
+                                    && recoup.compareTo(minRecoup) <= 0 && conf.compareTo(minConf) <= 0,
+                            2007, "决定金额不得高于告知金额（已告知最低 罚款" + minFine + "元/追回"
+                                    + minRecoup + "元/没收" + minConf + "元）——不得因陈述申辩而加重处罚（第41条）", "HANDLER");
+                out.check("requested_hearing", "已申请听证的真实听证笔录", !Boolean.TRUE.equals(notice.getHearingRequested()) || heldHearing != null,
+                        2075, "当事人已申请听证，应当组织听证并制作笔录后方可作出决定（第41条）", "HANDLER");
+            }
+            Integer pending = jdbc.queryForObject("select count(*) from case_hearing where case_id = ? and status = 'SCHEDULED'", Integer.class, caseId);
+            out.check("pending_hearing", "无尚未举行的排期听证", pending == null || pending == 0,
+                    2075, "本案有已排期但尚未举行的听证，应当组织听证后方可作出决定（第41条）", "HANDLER");
+            if (notice != null) {
+                boolean waiting = "PUNISH".equals(req.decisionType()) && config.bool("statement_wait_required", true)
+                        && notice.getStatementDeadline() != null && !LocalDate.now().isAfter(notice.getStatementDeadline())
+                        && notice.getStatement() == null && !Boolean.TRUE.equals(notice.getStatementWaived()) && heldHearing == null;
+                out.check("statement_period", "陈述申辩期限或已行使/放弃权利", !waiting, 2076,
+                        "陈述申辩期至 " + notice.getStatementDeadline()
+                                + " 届满前不得作出处罚决定（第41条）；当事人已陈述申辩或明确放弃的，请先录入陈述申辩记录", "HANDLER");
+            }
+            if (validAmounts && documentService.legalReviewRequired(caseId, fine, recoup, conf)) {
+                CaseReview review = reviewRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+                out.check("legal_review", "法制审核通过", review != null && Boolean.TRUE.equals(review.getPassed()),
+                        2005, "本案属法制审核范围，未经审核通过不得作出决定（第37条/辽40条）", "LEGAL");
+                out.check("legal_review_materials", "法制审核覆盖当前材料", review != null && reviewMaterials.matches(review),
+                        2150, "当前材料与最新送审版本不一致，或历史审核未绑定材料；请重新送审并通过后再作决定", "LEGAL");
+            }
+            if (config.bool("cross_exam_required", false) && "PUNISH".equals(req.decisionType())) {
+                Integer unexamined = jdbc.queryForObject("select count(*) from case_evidence where case_id = ? and cross_exam_at is null", Integer.class, caseId);
+                out.check("cross_exam", "证据已经当事人质证", unexamined == null || unexamined == 0, 2045,
+                        "尚有 " + unexamined + " 份证据未经当事人质证，不能作为决定依据（辽24条）", "HANDLER");
+            }
+            if ("PUNISH".equals(req.decisionType())) {
+                BigDecimal threshold = config.byPartyType(c.getPartyType(), "meeting_required_fine_individual", "meeting_required_fine_org", "100000");
+                if (fine != null && conf != null)
+                    out.check("collective_meeting", "较大数额罚没集体讨论并签字", punitiveAmount(fine, conf).compareTo(threshold) < 0 || hasValidMeeting(caseId),
+                            2047, "较大数额罚款（≥" + threshold + "元）应当经负责人集体讨论决定，请先录入讨论记录（辽54条/局令44条）", "LEADER");
+                out.check("discretion_reason", "裁量理由与考虑因素", !config.bool("discretion_reason_required", true)
+                                || req.discretionReason() != null && !req.discretionReason().isBlank(),
+                        2062, "处罚决定须说明裁量理由/考虑因素（辽44条），可先查看裁量基准建议", "HANDLER");
+            }
+            LocalDate deadline = c.getDeadlineAt() == null ? null : c.getDeadlineAt().plusDays(totalExclusionDays(caseId));
+            out.check("decision_deadline", "尚在有效办案期限内", deadline != null && !LocalDate.now().isAfter(deadline),
+                    2008, "已超办案期限（" + deadline + "），请先办理延期审批（第45条）", "LEADER");
+        }
+        out.check("decision_content", "处理决定正文", req.content() != null && !req.content().isBlank(),
+                2144, "须填写处理决定正文", "HANDLER");
+        return new DecisionChecks(out, fine, recoup, conf);
+    }
+
+    private boolean courtAccepted(CaseFile c) {
+        return "ACCEPTED".equals(c.getCourtEnforceStatus()) && c.getCourtReceivedAt() != null
+                && c.getCourtReceiptNo() != null && !c.getCourtReceiptNo().isBlank();
+    }
+
+    private Checklist closeChecks(CaseFile c, CloseReq req) {
+        Checklist out = new Checklist();
+        boolean terminated = "TERMINATED".equals(c.getStatus());
+        boolean report = req != null && req.closeReport() != null && !req.closeReport().isBlank();
+        out.check("writable", "尚未立卷归档", c.getArchiveNo() == null && !"CLOSED".equals(c.getStatus()), 2011,
+                terminated ? "本案已立卷归档（案卷号 " + c.getArchiveNo() + "）" : "案件状态不满足结案条件", "LEADER");
+        out.check("exclusions_closed", "期限扣除事由已登记结束日期", exclusionsClosed(c.getId()),
+                2032, "仍有未结束的期限扣除事由或专家评审，请先登记结束日期再归档", "HANDLER");
+        if (!terminated) {
+            CaseDecision d = decisionRepository.findByCaseId(c.getId()).orElse(null);
+            out.check("decision", "已有处理决定", d != null, 2011, "无处理决定，不能结案", "LEADER");
+            out.check("close_status", "已决定或已送达阶段", List.of("DECIDED", "DELIVERED").contains(c.getStatus()),
+                    2011, "案件状态不满足结案条件", "HANDLER");
+            if (d != null && "PUNISH".equals(d.getDecisionType())) {
+                out.check("delivery", "处罚决定书已送达", "DELIVERED".equals(c.getStatus()),
+                        2011, "处罚决定书未送达，不能结案（第59条）", "HANDLER");
+                out.check("execution_or_court", "款项执行完毕或法院正式受理", courtAccepted(c) || fullyExecuted(c.getId(), d),
+                        2011, "罚没款项/退回基金未执行完毕，且未申请法院强制执行，不能结案（第56条）", "HANDLER");
+            }
+        }
+        out.check("close_report", terminated ? "终止调查/移送归档报告" : "行政处罚结案报告", report, 2011,
+                terminated ? "须填写终止调查/移送情况说明与归档报告（第56/57条）"
+                        : "须填写行政处罚结案报告并经负责人批准（第56条）", "LEADER");
+        if (config.bool("archive_completeness_required", false)) {
+            List<String> missing = documentService.missingRequiredDocs(c.getId()).stream()
+                    .filter(type -> !report || !"CLOSE_REPORT".equals(type)).toList();
+            String originalFailure = "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）";
+            for (String type : missing) {
+                String name = switch (type) {
+                    case "FILING_APPROVAL" -> "立案审批表";
+                    case "FINAL_REPORT" -> "调查终结报告";
+                    case "NOTICE" -> "行政处罚告知书";
+                    case "DECISION" -> "处理决定书";
+                    case "DELIVERY_RECEIPT" -> "送达回证";
+                    case "CLOSE_REPORT" -> "结案/归档报告";
+                    case "LEGAL_OPINION" -> "法制审核意见书";
+                    case "TERMINATE_DECISION" -> "终止调查决定书";
+                    case "TRANSFER_LETTER" -> "案件移送函";
+                    case "ACCEPT_RECEIPT" -> "受案回执";
+                    default -> type;
+                };
+                String role = "LEGAL_OPINION".equals(type) ? "LEGAL"
+                        : List.of("FILING_APPROVAL", "DECISION", "CLOSE_REPORT", "TERMINATE_DECISION").contains(type) ? "LEADER" : "HANDLER";
+                out.check("document_" + type, name, false, 2052, "缺少" + name + "（第57条文书齐全要求）", role, originalFailure);
+            }
+            if (missing.isEmpty()) out.check("documents_complete", "案卷必备文书齐全", true, 2052, "", "HANDLER");
+        }
+        return out;
+    }
 
     @Transactional
     public CaseDecision decide(Long caseId, DecisionReq req) {
+        CaseGuards.lock(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
         CaseFile c = get(caseId);
-        if (decisionRepository.findByCaseId(caseId).isPresent())
-            throw new BizException(2040, "该案已作出处理决定");
-        if (!List.of("PUNISH", "NO_PUNISH", "NOT_ESTABLISHED", "TRANSFER_ADMIN", "TRANSFER_JUDICIAL")
-                .contains(req.decisionType()))
-            throw new BizException(2040, "决定类型须为第43条规定的五种之一");
-
-        BigDecimal fine = nz(req.fineAmount());
-        BigDecimal recoup = nz(req.recoupAmount());
-        boolean summary = "SUMMARY".equals(c.getProcedureType());
-
-        if (summary) {
-            if (!"INVESTIGATING".equals(c.getStatus()))
-                throw new BizException(2003, "简易程序应在调查中当场作出决定（第48条）");
-            // 第48条：公民/单位限额（参数化：新处罚法200/3000，辽宁旧口径50/1000）
-            BigDecimal limit = config.byPartyType(c.getPartyType(),
-                    "summary_fine_limit_individual", "summary_fine_limit_org",
-                    "INDIVIDUAL".equals(c.getPartyType()) ? "200" : "3000");
-            if ("PUNISH".equals(req.decisionType()) && fine.compareTo(limit) > 0)
-                throw new BizException(2003, "简易程序罚款超限（当事人类别限额 " + limit + " 元），请转普通程序（第48条）");
-        } else {
-            if (!"NOTIFIED".equals(c.getStatus()))
-                throw new BizException(2006, "作出处罚决定前应当书面告知当事人并听取陈述申辩（第41条）");
-            CaseNotice notice = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
-                    .orElseThrow(() -> new BizException(2006, "缺少处罚告知记录（第41条）"));
-            // 第41条：不得因陈述、申辩或申请听证而加重处罚。
-            // 比对全部告知中的最低拟处罚额：仅比最新一条会被"再告知一个更高金额"绕过（辽52条的重新告知
-            // 只允许在事实/证据/依据改变时进行，notify 已要求载明变更理由并重新起算陈述申辩期）。
-            List<CaseNotice> allNotices = noticeRepository.findByCaseIdOrderByIdDesc(caseId);
-            BigDecimal minFine = allNotices.stream()
-                    .map(CaseNotice::getProposedFine).filter(java.util.Objects::nonNull)
-                    .min(BigDecimal::compareTo).orElse(notice.getProposedFine());
-            BigDecimal minRecoup = allNotices.stream()
-                    .map(CaseNotice::getProposedRecoup).filter(java.util.Objects::nonNull)
-                    .min(BigDecimal::compareTo).orElse(notice.getProposedRecoup());
-            BigDecimal minConfiscate = allNotices.stream()
-                    .map(x -> nz(x.getProposedConfiscate())).min(BigDecimal::compareTo).orElse(BigDecimal.ZERO);
-            BigDecimal confiscate = nz(req.confiscateAmount());
-            if (fine.compareTo(minFine) > 0 || recoup.compareTo(minRecoup) > 0
-                    || confiscate.compareTo(minConfiscate) > 0)
-                throw new BizException(2007, "决定金额不得高于告知金额（已告知最低 罚款" + minFine + "元/追回"
-                        + minRecoup + "元/没收" + minConfiscate + "元）——不得因陈述申辩而加重处罚（第41条）");
-            // 第41条：当事人申请听证的，应当组织听证后再决定
-            if (Boolean.TRUE.equals(notice.getHearingRequested()) && notice.getHearingHeldAt() == null)
-                throw new BizException(2075, "当事人已申请听证，应当组织听证并制作笔录后方可作出决定（第41条）");
-            // 已排期未举行的听证同样拦截：notice 上的标记可能因再次告知而遗漏
-            Integer pendingHearing = jdbc.queryForObject(
-                    "select count(*) from case_hearing where case_id = ? and status = 'SCHEDULED'",
-                    Integer.class, caseId);
-            if (pendingHearing != null && pendingHearing > 0)
-                throw new BizException(2075, "本案有已排期但尚未举行的听证，应当组织听证后方可作出决定（第41条）");
-            // 陈述申辩期届满前不得决定；当事人已陈述申辩或书面放弃的除外（参数开关）
-            // 已举行听证的，当事人已充分陈述申辩，不再受该期限约束
-            if ("PUNISH".equals(req.decisionType()) && config.bool("statement_wait_required", true)
-                    && notice.getStatementDeadline() != null
-                    // 含尾：届满日当天当事人仍可陈述申辩（recordStatement 用 isAfter 受理），
-                    // 这里若用 isBefore 就会出现"同一天既可申辩又可下决定"，先决定即剥夺申辩权
-                    && !LocalDate.now().isAfter(notice.getStatementDeadline())
-                    && notice.getStatement() == null && !Boolean.TRUE.equals(notice.getStatementWaived())
-                    && notice.getHearingHeldAt() == null)
-                throw new BizException(2076, "陈述申辩期至 " + notice.getStatementDeadline()
-                        + " 届满前不得作出处罚决定（第41条）；当事人已陈述申辩或明确放弃的，请先录入陈述申辩记录");
-            // 法制审核：THRESHOLD=数额较大或经听证必审（国家37条）；ALL=全案必审（辽40条）
-            boolean needReview = "ALL".equalsIgnoreCase(config.str("legal_review_mode", "THRESHOLD"))
-                    || punitiveAmount(fine, nz(req.confiscateAmount()))
-                            .compareTo(cfgDecimal("legal_review_fine_threshold")) >= 0
-                    || notice.getHearingHeldAt() != null;
-            if (needReview) {
-                CaseReview review = reviewRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
-                if (review == null || !Boolean.TRUE.equals(review.getPassed()))
-                    throw new BizException(2005, "本案属法制审核范围，未经审核通过不得作出决定（第37条/辽40条）");
-            }
-            // 辽24条：未经当事人质证（发表意见）的证据不能作为处罚决定依据（参数开关）
-            if (config.bool("cross_exam_required", false) && "PUNISH".equals(req.decisionType())) {
-                Integer unexamined = jdbc.queryForObject(
-                        "select count(*) from case_evidence where case_id = ? and cross_exam_at is null",
-                        Integer.class, caseId);
-                if (unexamined != null && unexamined > 0)
-                    throw new BizException(2045, "尚有 " + unexamined + " 份证据未经当事人质证，不能作为决定依据（辽24条）");
-            }
-            // 辽54条：较大数额罚款必须经负责人集体讨论决定（按当事人类型分档）
-            if ("PUNISH".equals(req.decisionType())) {
-                BigDecimal meetingThreshold = config.byPartyType(c.getPartyType(),
-                        "meeting_required_fine_individual", "meeting_required_fine_org", "100000");
-                // 空壳讨论记录不算数：须有实质内容且经签字确认（第44条集体讨论决定）
-                if (punitiveAmount(fine, nz(req.confiscateAmount())).compareTo(meetingThreshold) >= 0
-                        && !hasValidMeeting(caseId))
-                    throw new BizException(2047, "较大数额罚款（≥" + meetingThreshold + "元）应当经负责人集体讨论决定，请先录入讨论记录（辽54条/局令44条）");
-            }
-            // 辽44条：裁量性处罚决定应说明裁量考虑因素（参数开关）
-            if ("PUNISH".equals(req.decisionType()) && config.bool("discretion_reason_required", true)
-                    && (req.discretionReason() == null || req.discretionReason().isBlank()))
-                throw new BizException(2062, "处罚决定须说明裁量理由/考虑因素（辽44条），可先查看裁量基准建议");
-            // 第45条：办案期限（含批准延长），扣除期间不计入
-            LocalDate effectiveDeadline = c.getDeadlineAt().plusDays(totalExclusionDays(caseId));
-            if (LocalDate.now().isAfter(effectiveDeadline))
-                throw new BizException(2008, "已超办案期限（" + effectiveDeadline + "），请先办理延期审批（第45条）");
-        }
+        DecisionChecks checks = decisionChecks(c, req);
+        checks.checklist().requireReady();
+        BigDecimal fine = checks.fine();
+        BigDecimal recoup = checks.recoup();
+        BigDecimal confiscateAmount = checks.confiscate();
 
         CaseDecision d = new CaseDecision();
         d.setCaseId(caseId);
@@ -692,9 +1142,12 @@ public class CaseService {
         }
         d.setFineAmount(fine);
         d.setRecoupAmount(recoup);
-        d.setConfiscateAmount(nz(req.confiscateAmount()));
+        d.setConfiscateAmount(confiscateAmount);
         d.setOtherMeasures(req.otherMeasures());
         d.setContent(req.content());
+        if ("PUNISH".equals(req.decisionType()) && req.penaltyBasis() != null)
+            d.setPenaltyBasis(req.penaltyBasis().strip());
+        if (req.finding() != null) applyFinding(c, req.finding());
         d.setMitigation(req.mitigation());
         d.setDiscretionReason(req.discretionReason());
         d.setDecidedAt(LocalDate.now());
@@ -722,6 +1175,8 @@ public class CaseService {
 
     @Transactional
     public CaseFile deliver(Long caseId, DeliveryReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = get(caseId);
         if (!"DECIDED".equals(c.getStatus())) throw new BizException(2041, "仅已决定的案件可登记送达（第59条）");
         if (!List.of("DIRECT", "MAIL", "LEFT", "ELECTRONIC", "ANNOUNCE").contains(req.method()))
@@ -756,9 +1211,14 @@ public class CaseService {
     /** 处罚决定公开（局令46条；辽56条：作出决定7日内公开） */
     @Transactional
     public CaseDecision publish(Long caseId) {
+        CaseGuards.lock(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        entityManager.flush();
         CaseFile cf = get(caseId);
+        entityManager.refresh(cf);
         CaseDecision d = decisionRepository.findByCaseId(caseId)
                 .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
+        entityManager.refresh(d);
         // 辽56条：公开的是"行政处罚决定"，且应在决定书送达后（未送达即公开会侵害当事人陈述救济权）
         if (!"PUNISH".equals(d.getDecisionType()))
             throw new BizException(2042, "仅行政处罚决定需要依法公开（当前决定类型：" + d.getDecisionType() + "）");
@@ -771,20 +1231,31 @@ public class CaseService {
         // 幂等：重复调用会把公开日期刷成当天，把"7日内公开"的超期证据洗白（第56条监督链）
         if (Boolean.TRUE.equals(d.getPublished()) && d.getPublishedAt() != null)
             throw new BizException(2042, "该决定已于 " + d.getPublishedAt() + " 公开，不可重复登记");
-        d.setPublished(true);
-        d.setPublishedAt(LocalDate.now());
-        return decisionRepository.save(d);
+        int updated = jdbc.update("update case_decision set published = true, published_at = ? where case_id = ? and published = false",
+                LocalDate.now(), caseId);
+        if (updated == 0) throw new BizException(2042, "该决定已公开，不可重复登记");
+        entityManager.refresh(d);
+        return d;
     }
 
     /** 重大处罚决定政府备案登记（辽54条） */
     @Transactional
     public CaseDecision govRecord(Long caseId, String recordNo) {
+        CaseGuards.lock(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        entityManager.flush();
         CaseDecision d = decisionRepository.findByCaseId(caseId)
                 .orElseThrow(() -> new BizException(2042, "案件无处理决定"));
+        entityManager.refresh(d);
         if (recordNo == null || recordNo.isBlank()) throw new BizException(2042, "须填写备案文号");
-        d.setGovRecordNo(recordNo);
-        d.setGovRecordAt(LocalDate.now());
-        return decisionRepository.save(d);
+        if (recordNo.trim().length() > 64) throw new BizException(2042, "备案文号不得超过64字");
+        if (!"PUNISH".equals(d.getDecisionType())) throw new BizException(2042, "仅行政处罚决定可登记政府备案");
+        int updated = jdbc.update("""
+                update case_decision set gov_record_no = ?, gov_record_at = ?
+                where case_id = ? and gov_record_no is null and gov_record_at is null""", recordNo.trim(), LocalDate.now(), caseId);
+        if (updated == 0) throw new BizException(2042, "该决定已登记政府备案，不可覆盖原文号或日期");
+        entityManager.refresh(d);
+        return d;
     }
 
     // ---------- 结案（第56-57条） ----------
@@ -794,21 +1265,12 @@ public class CaseService {
      * private 自调用方法标 @Transactional 无效，事务由调用方 close() 承担。
      */
     private CaseFile archiveTerminated(CaseFile c, String closeReport, String maker) {
-        if (c.getArchiveNo() != null)
-            throw new BizException(2011, "本案已立卷归档（案卷号 " + c.getArchiveNo() + "）");
-        if (closeReport == null || closeReport.isBlank())
-            throw new BizException(2011, "须填写终止调查/移送情况说明与归档报告（第56/57条）");
         var d = decisionRepository.findByCaseId(c.getId()).orElse(null);
         String reason = d != null && String.valueOf(d.getDecisionType()).startsWith("TRANSFER")
                 ? "JUDICIAL" : "TERMINATED";
         addDocument(c.getId(), new DocumentReq(
                 "CLOSE_REPORT", c.getCaseNo() + " 归档报告", closeReport,
                 LocalDate.now(), maker, false, null, null));
-        if (config.bool("archive_completeness_required", false)) {
-            List<String> missing = documentService.missingRequiredDocs(c.getId());
-            if (!missing.isEmpty())
-                throw new BizException(2052, "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）");
-        }
         jdbc.update("update case_evidence set sealed = false, register_hold = false where case_id = ?", c.getId());
         c.setClosedAt(LocalDate.now());
         c.setCloseReason(reason);
@@ -818,44 +1280,17 @@ public class CaseService {
 
     @Transactional
     public CaseFile close(Long caseId, String closeReport, String maker) {
+        CaseGuards.lock(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
         CaseFile c = get(caseId);
-        // 终止调查（第47条五类情形）与移送司法的案件同样要立卷归档（第57条一案一卷），
-        // 但它们既没有处罚决定、也不在 DECIDED/DELIVERED 状态——此前被"无处理决定"与
-        // 状态白名单双重拦死，拿不到案卷号、产不出结案报告，只能线下手工立卷。
-        // 归档不改变 TERMINATED 状态（终止是案件的真实出口，不应被改写成"已结案"），
-        // 以 archive_no 是否已生成作为"是否已归档"的标志。
+        Checklist checks = closeChecks(c, new CloseReq(closeReport));
+        checks.requireReady();
         if ("TERMINATED".equals(c.getStatus())) return archiveTerminated(c, closeReport, maker);
-
-        CaseDecision d = decisionRepository.findByCaseId(caseId)
-                .orElseThrow(() -> new BizException(2011, "无处理决定，不能结案"));
-        if (!List.of("DECIDED", "DELIVERED").contains(c.getStatus()))
-            throw new BizException(2011, "案件状态不满足结案条件");
-
-        String closeReason;
-        if ("PUNISH".equals(d.getDecisionType())) {
-            if (!"DELIVERED".equals(c.getStatus()))
-                throw new BizException(2011, "处罚决定书未送达，不能结案（第59条）");
-            if (Boolean.TRUE.equals(c.getCourtEnforceApplied())) {
-                closeReason = "COURT";     // 第56条(二)：申请法院强制执行且受理
-            } else if (fullyExecuted(caseId, d)) {
-                closeReason = "EXECUTED";  // 第56条(一)：执行完毕
-            } else {
-                throw new BizException(2011, "罚没款项/退回基金未执行完毕，且未申请法院强制执行，不能结案（第56条）");
-            }
-        } else {
-            closeReason = "NO_NEED";       // 第56条(三)：不予处罚等无须执行
-        }
-
-        if (closeReport == null || closeReport.isBlank())
-            throw new BizException(2011, "须填写行政处罚结案报告并经负责人批准（第56条）");
+        CaseDecision d = decisionRepository.findByCaseId(caseId).orElseThrow();
+        String closeReason = !"PUNISH".equals(d.getDecisionType()) ? "NO_NEED"
+                : courtAccepted(c) ? "COURT" : "EXECUTED";
         addDocument(caseId, new DocumentReq("CLOSE_REPORT", c.getCaseNo() + " 结案报告",
                 closeReport, LocalDate.now(), maker, false, null, null));
-        // 第57条：一案一卷、文书齐全（参数开启时强制校验必备文书）
-        if (config.bool("archive_completeness_required", false)) {
-            List<String> missing = documentService.missingRequiredDocs(caseId);
-            if (!missing.isEmpty())
-                throw new BizException(2052, "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）");
-        }
 
         // 结案即解除仍在生效的强制措施（第31条封存、第26条先行登记保存）：
         // updateSeal 限案件在办状态，进入 DECIDED 后就再也解不掉，
@@ -909,29 +1344,52 @@ public class CaseService {
         sb.append("(select coalesce(json_agg(t order by t.id), '[]'::json) from ")
           .append("(select id, doc_type, title, made_at, maker, signed, note from case_document ")
           .append("where case_id = ?) t) as \"documents\", ");
-        sb.append("(select coalesce(sum(end_at - start_at), 0) from case_period_exclusion ")
-          .append("where case_id = ? and end_at is not null) as \"exclusionDays\"");
+        sb.append("(select coalesce(sum(greatest(0, coalesce(end_at, cast(? as date)) - start_at)), 0) from case_period_exclusion ")
+          .append("where case_id = ?) as \"exclusionDays\"");
         return sb.toString();
     }
 
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public Map<String, Object> detail(Long id) {
+        materialAccess.requireCurrentCaseReader(id);
         CaseFile c = get(id);
         CaseCause cause = causeRepository.findById(c.getCauseId()).orElse(null);
-        Object[] args = new Object[DETAIL_PARTS.size() + 2];
+        Object[] args = new Object[DETAIL_PARTS.size() + 3];
         java.util.Arrays.fill(args, id);
+        args[args.length - 2] = exclusionCutoff(c);
         Map<String, Object> agg = jdbc.queryForMap(DETAIL_SQL, args);
 
         Map<String, Object> m = new java.util.LinkedHashMap<>();
         m.put("caseFile", c);
+        m.put("jurisdiction", jurisdictionFacts(c));
+        m.put("jurisdictionHistory", jurisdictionHistory(id));
+        m.put("jurisdictionMaterials", jurisdictionMaterials(jurisdictionFacts(c)));
         m.put("cause", cause == null ? Map.of() : cause);
         for (String part : DETAIL_PARTS) m.put(part.split("\\|")[0], readJson(agg.get(part.split("\\|")[0])));
         m.put("documents", readJson(agg.get("documents")));
         m.put("reviews", reviewRepository.findByCaseIdOrderByIdDesc(id));
+        m.put("reviewMaterialStatus", reviewMaterialStatus(id));
         m.put("notices", noticeRepository.findByCaseIdOrderByIdDesc(id));
         m.put("decision", decisionRepository.findByCaseId(id).map(Object.class::cast).orElse(Map.of()));
         long exclusionDays = agg.get("exclusionDays") == null ? 0 : ((Number) agg.get("exclusionDays")).longValue();
         m.put("effectiveDeadline", c.getDeadlineAt().plusDays(exclusionDays));
+        m.put("executionDeadline", executionDeadlines.summary(c, LocalDate.now()));
         return m;
+    }
+
+    private Map<String, Object> reviewMaterialStatus(Long caseId) {
+        var review = reviewRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+        Map<String, Object> status = new java.util.LinkedHashMap<>();
+        boolean bound = review != null && review.getMaterialSnapshot() != null && review.getMaterialFingerprint() != null;
+        boolean current = bound && reviewMaterials.matches(review);
+        status.put("reviewId", review == null ? null : review.getId());
+        status.put("fingerprint", review == null ? null : review.getMaterialFingerprint());
+        status.put("bound", bound);
+        status.put("current", current);
+        status.put("reason", review == null ? "尚未提交法制审核" : !bound
+                ? "历史审核未绑定送审材料；在办必审案件须重新送审" : !current
+                ? "材料已变更，请重新送审；旧审核记录继续保留" : "当前材料与最新送审版本一致");
+        return status;
     }
 
     private List<Map<String, Object>> readJson(Object pgJson) {
@@ -945,9 +1403,8 @@ public class CaseService {
 
     // ---------- 数据级权限（v1.2）：case_view_scope=SELF 时办案员仅见本人承办/参办案件 ----------
 
-    /** 负责人/法制/管理员始终全局；办案员按参数收窄 */
-    public boolean scopedSelf(boolean privileged) {
-        return !privileged && "SELF".equalsIgnoreCase(config.str("case_view_scope", "ALL"));
+    public boolean hasCaseScope(String username, boolean privileged) {
+        return materialAccess.caseScope(username, privileged).restricted();
     }
 
     // 普通字符串拼接（文本块会剥前导空格导致 "?and" 语法错，医院项目同坑）
@@ -960,12 +1417,7 @@ public class CaseService {
 
     /** 越权访问单案（2080） */
     public void assertInScope(Long caseId, String username, boolean privileged) {
-        if (!scopedSelf(privileged)) return;
-        Integer hit = jdbc.queryForObject(
-                "select count(*) from case_file where id = ?" + SCOPE_SQL,
-                Integer.class, caseId, username, username);
-        if (hit == null || hit == 0)
-            throw new BizException(2080, "该案件不在您的数据查看范围内（承办/参办范围，case_view_scope=SELF）");
+        materialAccess.assertCaseScope(caseId, materialAccess.caseScope(username, privileged));
     }
 
     /** 分页+关键词检索（案号/案名/当事人），含范围过滤 */
@@ -992,10 +1444,9 @@ public class CaseService {
             String like = "%" + q.trim() + "%";
             args.add(like); args.add(like); args.add(like);
         }
-        if (scopedSelf(privileged)) {
-            where.append(SCOPE_SQL);
-            args.add(username); args.add(username);
-        }
+        var scope = materialAccess.caseScope(username, privileged);
+        where.append(scope.sql());
+        args.addAll(scope.args());
         Long total = jdbc.queryForObject("select count(*) from case_file" + where, Long.class, args.toArray());
         args.add(size);
         args.add((long) (Math.max(page, 1) - 1) * size);
@@ -1007,14 +1458,30 @@ public class CaseService {
     /** 案件移交（承办人变更，负责人操作，留消息） */
     @Transactional
     public CaseFile transferOwner(Long caseId, String newOwner, String operator) {
+        CaseGuards.lockWritable(jdbc, caseId);
         CaseFile c = get(caseId);
-        Integer exists = jdbc.queryForObject(
-                "select count(*) from sys_user where username = ? and enabled = true", Integer.class, newOwner);
-        if (exists == null || exists == 0) throw new BizException(2081, "接收人账号不存在或已停用");
+        // Lock operator and receiver together in ID order, including a distinct authenticated domain caller.
+        // Separate operator->receiver locks could deadlock reciprocal transfers in different cases.
+        var actors = workflowUsers.lockUsers(operator, newOwner, currentPrincipalName());
+        var current = materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
+        var receiver = newOwner == null ? null : actors.get(newOwner);
+        if (receiver == null || !receiver.enabled())
+            throw new BizException(2081, "接收人账号不存在、已停用或不具备接案角色");
+        workflowUsers.assertDepartmentEnabled(receiver);
+        if (receiver.roles().stream().noneMatch(cn.ybcase.bureau.spi.CaseOwnerRoles.RECEIVER_CODES::contains))
+            throw new BizException(2081, "接收人账号不存在、已停用或不具备接案角色");
+        var sender = current != null || operator == null ? current : actors.get(operator);
+        if ((receiver.district() && receiver.deptId() == null)
+                || (sender != null && sender.district()
+                    && (sender.deptId() == null || !sender.deptId().equals(receiver.deptId()))))
+            throw new BizException(2080, "区市县机构只能在本机构内移交案件");
+        if (!java.util.Objects.equals(c.getOwnerDeptId(), receiver.deptId())
+                && Boolean.TRUE.equals(jdbc.queryForObject(
+                        "select exists(select 1 from sys_dept where id in (?,?) and org_kind in ('BUREAU','DISTRICT'))",
+                        Boolean.class, c.getOwnerDeptId(), receiver.deptId())))
+            throw new BizException(2080, "跨机构案件请通过机构交接办理");
         c.setOwnerUser(newOwner);
-        var deptRows = jdbc.queryForList("select dept_id from sys_user where username = ?", newOwner);
-        if (!deptRows.isEmpty() && deptRows.get(0).get("dept_id") != null)
-            c.setOwnerDeptId(((Number) deptRows.get(0).get("dept_id")).longValue());
+        c.setOwnerDeptId(receiver.deptId());
         CaseFile saved = caseRepository.save(c);
         messageService.send(newOwner, "SYSTEM",
                 "案件移交：" + c.getCaseNo() + " 已移交给您承办",
@@ -1026,14 +1493,15 @@ public class CaseService {
     public List<Map<String, Object>> searchCases(String like, String username, boolean privileged) {
         String base = "select id, case_no, name, party_name, status, filed_at from case_file"
                 + " where (case_no ilike ? or name ilike ? or party_name ilike ?)";
-        if (scopedSelf(privileged)) {
-            return jdbc.queryForList(base + SCOPE_SQL + " order by id desc limit 20",
-                    like, like, like, username, username);
-        }
-        return jdbc.queryForList(base + " order by id desc limit 20", like, like, like);
+        var scope = materialAccess.caseScope(username, privileged);
+        var args = new java.util.ArrayList<Object>(List.of(like, like, like));
+        args.addAll(scope.args());
+        return jdbc.queryForList(base + scope.sql() + " order by id desc limit 20", args.toArray());
     }
 
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public Map<String, Object> documentDetail(Long caseId, Long docId) {
+        materialAccess.requireCurrentCaseReader(caseId);
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "select * from case_document where id = ? and case_id = ?", docId, caseId);
         if (rows.isEmpty()) throw new BizException(2045, "文书不存在");
@@ -1041,6 +1509,11 @@ public class CaseService {
     }
 
     // ---------- 私有 ----------
+
+    private String currentPrincipalName() {
+        var auth = org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication();
+        return auth != null && auth.isAuthenticated() && !"anonymousUser".equals(auth.getPrincipal()) ? auth.getName() : null;
+    }
 
     private void requireActive(CaseFile c) {
         if (!"INVESTIGATING".equals(c.getStatus()) && !"REPORTED".equals(c.getStatus())
@@ -1056,11 +1529,48 @@ public class CaseService {
         List<Map<String, Object>> rows = jdbc.queryForList(
                 // 进行中的事由（end_at 为空）按截至今天计入：扣除的本就是"已经发生"的期间，
                 // 与 addExclusion 的重叠判定（coalesce(end_at, current_date)）同口径
-                "select start_at, coalesce(end_at, current_date) as end_at from case_period_exclusion where case_id = ?",
-                caseId);
+                "select start_at, coalesce(end_at, cast(? as date)) as end_at from case_period_exclusion where case_id = ?",
+                exclusionCutoff(get(caseId)), caseId);
         return rows.stream().mapToLong(r -> ChronoUnit.DAYS.between(
                 ((java.sql.Date) r.get("start_at")).toLocalDate(),
-                ((java.sql.Date) r.get("end_at")).toLocalDate())).sum();
+                ((java.sql.Date) r.get("end_at")).toLocalDate())).map(days -> Math.max(0, days)).sum();
+    }
+
+    /** Historic open rows stay intact; an investigation's clock stops at its first terminal action. */
+    static LocalDate exclusionCutoff(CaseFile c) {
+        return java.util.stream.Stream.of(LocalDate.now(), c.getDecidedAt(), c.getTerminatedAt(), c.getClosedAt())
+                .filter(java.util.Objects::nonNull).min(LocalDate::compareTo).orElseThrow();
+    }
+
+    private boolean exclusionsClosed(Long caseId) {
+        return jdbc.queryForObject("""
+                select (select count(*) from case_period_exclusion where case_id = ? and end_at is null)
+                     + (select count(*) from expert_review where case_id = ? and ended_at is null)""",
+                Integer.class, caseId, caseId) == 0;
+    }
+
+    private void requireExclusionsClosed(Long caseId) {
+        if (!exclusionsClosed(caseId))
+            throw new BizException(2032, "仍有未结束的期限扣除事由或专家评审，请先登记结束日期");
+    }
+
+    /** Legacy suspended cases may already have exclusions; extend only days not counted there. */
+    private long suspensionAdditionalDays(Long caseId, LocalDate start, LocalDate end) {
+        long covered = 0;
+        LocalDate cursor = start;
+        for (var row : jdbc.queryForList("""
+                select start_at, coalesce(end_at, cast(? as date)) as end_at
+                from case_period_exclusion where case_id = ? order by start_at""", end, caseId)) {
+            LocalDate left = ((java.sql.Date) row.get("start_at")).toLocalDate();
+            LocalDate right = ((java.sql.Date) row.get("end_at")).toLocalDate();
+            if (left.isBefore(cursor)) left = cursor;
+            if (right.isAfter(end)) right = end;
+            if (right.isAfter(left)) {
+                covered += ChronoUnit.DAYS.between(left, right);
+                cursor = right;
+            }
+        }
+        return Math.max(0, ChronoUnit.DAYS.between(start, end) - covered);
     }
 
     /** 法定"负责人集体讨论"记录是否成立：须签字确认且参会人/结论有实质内容（第44/45条共用口径） */

@@ -13,6 +13,8 @@ import java.time.LocalDate;
 @Entity
 @Table(name = "case_clue")
 public class CaseClue {
+    private String extendApprovedBy;
+    private java.time.Instant extendApprovedAt;
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -63,6 +65,8 @@ public class CaseClue {
 
     @Column(length = 64)
     private String createdBy;
+
+    private Long ownerDeptId;
 
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();

@@ -1,48 +1,100 @@
 package cn.ybcase.bureau.web;
 
+import cn.ybcase.bureau.common.BizException;
+import cn.ybcase.bureau.service.ReportExport;
 import cn.ybcase.core.common.R;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
+import java.util.function.Supplier;
 
 /** 统计分析与督办看板（执法公示与全过程监督支撑） */
 @RestController
 @RequestMapping("/api/bureau/stats")
 @RequiredArgsConstructor
 public class BureauStatsController {
+    private final Semaphore reportSlots = new Semaphore(2);
 
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.bureau.service.BusinessStatisticsService statistics;
     private final cn.ybcase.bureau.service.BureauConfig cfg;
+    private final cn.ybcase.bureau.service.ExecutionAlerts executionAlerts;
+    private final cn.ybcase.bureau.service.MaterialAccess materialAccess;
+
+    private final cn.ybcase.bureau.service.PenaltyReportService penaltyReport;
+    private final cn.ybcase.bureau.service.EnforcementWorkReportService enforcementWorkReport;
+    private final cn.ybcase.bureau.service.DepartmentInterviewService departmentInterviews;
+
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','LEGAL','ADMIN')")
+    @GetMapping("/interviews/download")
+    public org.springframework.http.ResponseEntity<byte[]> downloadInterviews(
+            @RequestParam int year,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate start,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate cutoff,
+            @RequestParam(defaultValue = "false") boolean reconcile,
+            org.springframework.security.core.Authentication auth, HttpServletRequest request) {
+        return downloadWorkbook(request, year + "年医保部门约谈定点医药机构台账.xlsx",
+                () -> departmentInterviews.export(year, start, cutoff, reconcile, auth.getName()));
+    }
+
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','LEGAL','ADMIN')")
+    @GetMapping("/enforcement-work/download")
+    public org.springframework.http.ResponseEntity<byte[]> downloadEnforcementWork(
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate start,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate end,
+            @RequestParam(defaultValue = "false") boolean reconcile, HttpServletRequest request) {
+        return downloadWorkbook(request, "基金监管部门执法人员办理案件情况统计表.xlsx",
+                () -> enforcementWorkReport.export(start, end, reconcile));
+    }
+
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','LEGAL','ADMIN')")
+    @GetMapping("/penalties/download")
+    public org.springframework.http.ResponseEntity<byte[]> downloadPenalties(
+            @RequestParam(required = false) Integer year,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate start,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate cutoff,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate end,
+            HttpServletRequest request) {
+        String filename = year == null ? "2024-2026年行政处罚情况统计表.xlsx"
+                : year + "年行政处罚情况统计表（内部核对）.xlsx";
+        return downloadWorkbook(request, filename, () -> penaltyReport.export(year, start, end, cutoff));
+    }
+
+    private org.springframework.http.ResponseEntity<byte[]> downloadWorkbook(
+            HttpServletRequest request, String name, Supplier<ReportExport> generate) {
+        if (!reportSlots.tryAcquire()) throw new BizException(2100, "报表导出繁忙，请稍后重试");
+        ReportExport report;
+        try {
+            report = generate.get();
+        } finally {
+            reportSlots.release();
+        }
+        request.setAttribute(ReportExport.AUDIT_ATTRIBUTE, report.audit());
+        var disposition = org.springframework.http.ContentDisposition.attachment()
+                .filename(name, java.nio.charset.StandardCharsets.UTF_8)
+                .build();
+        return org.springframework.http.ResponseEntity.ok()
+                .contentType(org.springframework.http.MediaType.parseMediaType(
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .cacheControl(org.springframework.http.CacheControl.noStore())
+                .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, disposition.toString())
+                .body(report.workbook());
+    }
 
     /** 总览：案件分状态计数、罚没/追回金额合计、线索转化 */
     @GetMapping("/overview")
-    public R<Map<String, Object>> overview() {
-        Map<String, Object> m = new java.util.LinkedHashMap<>();
-        m.put("clueTotal", one("select count(*) from case_clue"));
-        m.put("cluePending", one("select count(*) from case_clue where status = 'PENDING'"));
-        m.put("clueFiled", one("select count(*) from case_clue where status = 'FILED'"));
-        m.put("caseTotal", one("select count(*) from case_file"));
-        m.put("caseByStatus", jdbc.queryForList(
-                "select status, count(*) as cnt from case_file group by status order by status"));
-        m.put("fineDecided", one("select coalesce(sum(fine_amount),0) from case_decision"));
-        m.put("recoupDecided", one("select coalesce(sum(recoup_amount),0) from case_decision"));
-        m.put("confiscateDecided", one("select coalesce(sum(confiscate_amount),0) from case_decision"));
-        m.put("fineCollected", one("select coalesce(sum(amount),0) from case_execution where kind in ('FINE','LATE_FEE','CONFISCATE')"));
-        m.put("recoupCollected", one("select coalesce(sum(amount),0) from case_execution where kind = 'RECOUP'"));
-        m.put("byPartyType", jdbc.queryForList(
-                "select party_type, count(*) as cnt from case_file group by party_type order by cnt desc"));
-        m.put("byCause", jdbc.queryForList("""
-                select cc.category, count(*) as cnt from case_file cf
-                join case_cause cc on cc.id = cf.cause_id group by cc.category order by cnt desc limit 10"""));
-        m.put("monthlyFiled", jdbc.queryForList("""
-                select to_char(filed_at, 'YYYY-MM') as ym, count(*) as cnt from case_file
-                where filed_at >= current_date - interval '12 months' group by 1 order by 1"""));
-        return R.ok(m);
+    public R<Map<String, Object>> overview(org.springframework.security.core.Authentication auth) {
+        return R.ok(statistics.overview(auth.getName()));
     }
 
     /**
@@ -52,7 +104,13 @@ public class BureauStatsController {
      */
     @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','LEGAL','ADMIN')")
     @GetMapping("/supervision")
+    @org.springframework.transaction.annotation.Transactional(readOnly = true,
+            isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public R<Map<String, Object>> supervision() {
+        var actor = materialAccess.requireCurrentReadRoles("LEADER", "LEGAL", "ADMIN");
+        if (actor != null && Boolean.TRUE.equals(jdbc.queryForObject(
+                "select account_category = 'DISTRICT' from sys_user where id = ?", Boolean.class, actor.id())))
+            throw new cn.ybcase.bureau.common.BizException(403, "全市督办看板由局机关授权岗位查看");
         Map<String, Object> m = new java.util.LinkedHashMap<>();
         // 每类只返回最紧急的前 N 条：各查询本就按紧急度 ORDER BY，截断保留的正是最该看的。
         // 此前 16 类全部无上界，实测 3102 案件时响应 933KB、合计 6434 行，
@@ -145,60 +203,16 @@ public class BureauStatsController {
         // ---- 执行阶段（第52-55条 / 行政强制法53-54条）----
         // 此前督办看板止于"送达"：决定书送达那天起系统就不再计时，缴款逾期、该催告、
         // 强执申请期将满全靠办案人自己记台账。三个参数与 ExecutionService 同源，不另起口径。
-        int payDays = cfg.intVal("payment_days", 15);
-        int urgeDays = cfg.intVal("court_urge_days", 10);
-        // 未缴清判定与 close() 的 fullyExecuted 一致：三类款项各自累计均达决定额才算缴清
-        String unpaid = """
-                and (coalesce((select sum(e.amount) from case_execution e
-                               where e.case_id = cf.id and e.kind = 'FINE'), 0) < d.fine_amount
-                  or coalesce((select sum(e.amount) from case_execution e
-                               where e.case_id = cf.id and e.kind = 'RECOUP'), 0) < d.recoup_amount
-                  or coalesce((select sum(e.amount) from case_execution e
-                               where e.case_id = cf.id and e.kind = 'CONFISCATE'), 0) < d.confiscate_amount)""";
-        // 已批准暂缓/分期缴纳的案件不在此列：其按 case_installment 的 due_at 履行，
-        // 由 installmentOverdue 面板监控；否则依约分期的案件会被一路误报到"已失权"
-        // 缴款期届满仍未缴清（第53条）
-        put.accept("paymentOverdue", jdbc.queryForList("""
-                select cf.id, cf.case_no, cf.name, cf.delivered_at,
-                       cf.delivered_at + ?::int as pay_deadline,
-                       d.fine_amount, d.recoup_amount, d.confiscate_amount,
-                       coalesce((select sum(e.amount) from case_execution e
-                                 where e.case_id = cf.id and e.kind in ('FINE','RECOUP','CONFISCATE')), 0) as paid
-                from case_file cf join case_decision d on d.case_id = cf.id
-                where cf.status = 'DELIVERED' and cf.delivered_at is not null
-                  and cf.delivered_at + ?::int < current_date
-                  and cf.court_enforce_applied = false and cf.defer_approved = false
-                """ + unpaid + """
-                order by cf.delivered_at""", payDays, payDays));
-        // 缴款期已届满未缴清但尚未催告——催告是申请强执的法定前置（行政强制法54条）
-        put.accept("urgeLetterMissing", jdbc.queryForList("""
-                select cf.id, cf.case_no, cf.name, cf.delivered_at + ?::int as pay_deadline
-                from case_file cf join case_decision d on d.case_id = cf.id
-                where cf.status = 'DELIVERED' and cf.delivered_at is not null
-                  and cf.delivered_at + ?::int < current_date
-                  and cf.court_enforce_applied = false and cf.defer_approved = false
-                  and not exists (select 1 from case_document doc
-                                  where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER')
-                """ + unpaid + """
-                order by cf.delivered_at""", payDays, payDays));
-        // 强执申请期将满/已过（行政强制法53条：缴款期满起3个月内申请，逾期即失权）
-        // 这是全流程唯一"错过即作废且标的最大"的期限，故不止报超期，提前 30 日即入清单
-        put.accept("courtEnforceExpiring", jdbc.queryForList("""
-                select cf.id, cf.case_no, cf.name,
-                       cf.delivered_at + ?::int as pay_deadline,
-                       -- 必须 ::date：date + interval 会提升为 timestamp，前端切前 10 位恒早一天，
-                       -- 与紧邻的 days_left 自相矛盾（这是本看板唯一"错过即失权"的日期）
-                       ((cf.delivered_at + ?::int) + interval '3 month')::date as apply_deadline,
-                       ((cf.delivered_at + ?::int) + interval '3 month')::date - current_date as days_left,
-                       (select max(doc.made_at) from case_document doc
-                        where doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER') as urged_at
-                from case_file cf join case_decision d on d.case_id = cf.id
-                where cf.status = 'DELIVERED' and cf.delivered_at is not null
-                  and cf.court_enforce_applied = false and cf.defer_approved = false
-                  -- <= 而非 <：与提醒的 daysLeft <= 30 同口径，否则恰剩 30 天时看板不报而提醒报
-                  and ((cf.delivered_at + ?::int) + interval '3 month')::date <= current_date + 30
-                """ + unpaid + """
-                order by apply_deadline""", payDays, payDays, payDays, payDays));
+        java.time.LocalDate today = java.time.LocalDate.now();
+        var executionRows = executionAlerts.rows(today);
+        var overdue = executionRows.stream().filter(r -> r.get("pay_deadline") != null
+                && cn.ybcase.bureau.service.ExecutionAlerts.date(r.get("pay_deadline")).isBefore(today)).toList();
+        put.accept("paymentOverdue", overdue);
+        put.accept("urgeLetterMissing", overdue.stream().filter(r -> r.get("urged_at") == null).toList());
+        put.accept("courtEnforceExpiring", executionRows.stream().filter(r -> r.get("apply_deadline") != null
+                && !cn.ybcase.bureau.service.ExecutionAlerts.date(r.get("apply_deadline")).isAfter(today.plusDays(30))).toList());
+        put.accept("executionReliefUnconfirmed", executionRows.stream()
+                .filter(r -> "UNCONFIRMED".equals(r.get("application_state"))).toList());
         // 封存到期（第31条）
         put.accept("sealExpiring", jdbc.queryForList("""
                 select ev.id, ev.case_id, cf.case_no, ev.name, ev.seal_expire_at, ev.seal_extended

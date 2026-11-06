@@ -21,104 +21,243 @@ public class ApprovalService {
 
     private final CaseService caseService;
     private final ExecutionService executionService;
+    private final ClueService clueService;
     private final MessageService messageService;
     private final JdbcTemplate jdbc;
+    private final SourceAttachmentAccess sourceAttachmentAccess;
+    private final WorkflowUserAccess workflowUsers;
+    private final EnforcerRegistryAccess enforcerRegistry;
+    private final MaterialAccess materialAccess;
     // 用 Spring 全局 ObjectMapper（含 JavaTime 模块，LocalDate 反序列化正确）
     private final ObjectMapper objectMapper;
 
     private static final Map<String, String> KIND_NAMES = Map.of(
-            "FILE_CASE", "立案", "EXTEND", "延期", "SUSPEND", "中止", "TERMINATE", "终止", "DEFER", "暂缓分期");
+            "FILE_CASE", "立案", "EXTEND", "延期", "SUSPEND", "中止", "TERMINATE", "终止", "DEFER", "暂缓分期", "CLUE_EXTEND", "线索延期");
 
-    private static final List<String> KINDS = List.of("FILE_CASE", "EXTEND", "SUSPEND", "TERMINATE", "DEFER");
+    private static final List<String> KINDS = List.of("FILE_CASE", "EXTEND", "SUSPEND", "TERMINATE", "DEFER", "CLUE_EXTEND");
 
     public record ApplyReq(String kind, Long clueId, Long caseId, Map<String, Object> payload, String reason) {}
 
     @Transactional
     public long apply(ApplyReq req, String applicant, boolean privileged) {
-        if (!KINDS.contains(req.kind())) throw new BizException(2071, "审批类型须为 立案/延期/中止/终止/暂缓 之一");
+        if (req.kind() == null || !KINDS.contains(req.kind())) throw new BizException(2071, "审批类型须为 立案/延期/中止/终止/暂缓 之一");
+        requireBinding(req.kind(), req.caseId(), req.clueId());
         if (req.reason() == null || req.reason().isBlank()) throw new BizException(2071, "须填写申请理由");
+        Map<String, Object> submittedPayload = req.payload() == null ? null : new java.util.LinkedHashMap<>(req.payload());
+        Long filingClueId = req.clueId();
         if ("FILE_CASE".equals(req.kind())) {
             if (req.payload() == null || req.payload().get("partyName") == null)
                 throw new BizException(2071, "立案申请须附立案审批表内容（当事人/案由/办案人员）");
-        } else if (req.caseId() == null) {
-            throw new BizException(2071, "须关联案件");
+            CaseService.JurisdictionReq jurisdiction;
+            try {
+                jurisdiction = objectMapper.convertValue(req.payload().get("jurisdiction"), CaseService.JurisdictionReq.class);
+            } catch (IllegalArgumentException e) {
+                throw new BizException(2145, "管辖事实格式无效");
+            }
+            submittedPayload.put("jurisdiction", CaseService.normalizeJurisdiction(jurisdiction));
+            CaseService.InstitutionReq institution;
+            try {
+                institution = objectMapper.convertValue(req.payload().get("institution"), CaseService.InstitutionReq.class);
+            } catch (IllegalArgumentException e) {
+                throw new BizException(2026, "机构信息格式无效");
+            }
+            String partyType = java.util.Objects.toString(req.payload().get("partyType"), "");
+            if ("PROVIDER".equals(partyType) && institution == null
+                    && Boolean.TRUE.equals(req.payload().get("reportingDetailsRequired")))
+                throw new BizException(2026, "请填写机构编码、性质和等级");
+            submittedPayload.put("institution", CaseService.normalizeInstitution(partyType, institution));
+            Object rawClueId = req.payload().get("clueId");
+            Long payloadClueId;
+            try { payloadClueId = rawClueId == null ? null : objectMapper.convertValue(rawClueId, Long.class); }
+            catch (IllegalArgumentException e) { throw new BizException(2146, "立案申请的线索编号无效"); }
+            if (filingClueId != null && payloadClueId != null && !filingClueId.equals(payloadClueId))
+                throw new BizException(2146, "立案申请关联线索与审批材料中的线索不一致");
+            filingClueId = filingClueId == null ? payloadClueId : filingClueId;
+            if (filingClueId != null) {
+                jdbc.queryForList("select id from case_clue where id=? for update", filingClueId);
+                submittedPayload.put("clueId", filingClueId);
+            }
+        } else if ("CLUE_EXTEND".equals(req.kind())) {
+            jdbc.queryForList("select id from case_clue where id=? for update", req.clueId());
+        } else {
+            CaseGuards.lock(jdbc, req.caseId());
         }
-        // caseId 来自请求体，CaseScopeInterceptor 只按路径变量拦截，这里必须自行补范围校验，
-        // 否则办案员可对本人无权查看的案件提交延期/中止/终止/暂缓申请
-        if (req.caseId() != null) caseService.assertInScope(req.caseId(), applicant, privileged);
-        String payload = toJson(req.payload());
+        // Never trust a caller-provided privileged flag after waiting on a business source.
+        WorkflowUserAccess.User actor = workflowUsers.requireFiling(applicant);
+        if (actor.district() && actor.deptId() == null)
+            throw new BizException(2080, "区市县账号尚未关联机构");
+        if ("FILE_CASE".equals(req.kind()) && filingClueId != null)
+            sourceAttachmentAccess.clueForFiling(filingClueId, applicant, false);
+        else if ("CLUE_EXTEND".equals(req.kind())) {
+            sourceAttachmentAccess.lockClueForHandling(req.clueId(), applicant);
+            if (!"PENDING".equals(clueService.get(req.clueId()).getStatus())) throw new BizException(2021, "线索已办结");
+        }
+        if (req.caseId() != null) {
+            materialAccess.assertCaseScope(req.caseId(), actor);
+            CaseGuards.lockWritable(jdbc, req.caseId());
+        }
+        String payload = toJson(submittedPayload);
         Long id = jdbc.queryForObject("""
-                insert into biz_approval (kind, clue_id, case_id, payload, reason, applicant)
-                values (?,?,?,?,?,?) returning id""", Long.class,
-                req.kind(), req.clueId(), req.caseId(), payload, req.reason(), applicant);
-        // 即时通知负责人
-        messageService.sendToRole("LEADER", "APPROVAL",
+                insert into biz_approval (kind, clue_id, case_id, payload, reason, applicant, applicant_dept_id)
+                values (?,?,?,?,?,?,?) returning id""", Long.class,
+                req.kind(), filingClueId, req.caseId(), payload, req.reason(), applicant, actor.deptId());
+        messageService.sendApprovalRequest(id,
                 "新审批单：" + KIND_NAMES.getOrDefault(req.kind(), req.kind()) + "（" + applicant + "）",
-                req.reason(), "/case/approvals");
+                req.reason());
         return id;
     }
 
     /** 负责人裁决：批准即执行对应动作（同事务，失败则整单回滚） */
     @Transactional
     public Map<String, Object> decide(long approvalId, boolean approve, String opinion, String approver) {
-        // 先抢占单据（带状态条件的原子 update）：先查后改会被双击/并发裁决执行两次，
-        // EXTEND 会把期限顺延两倍、FILE_CASE 会建出两个案件
+        if (opinion == null || opinion.isBlank()) throw new BizException(2071, "须填写审批意见或驳回理由");
+        // Conditional claim is retained: only one concurrent decision may execute this application.
         int claimed = jdbc.update("""
                 update biz_approval set status = ?, approver = ?, decided_at = now(), opinion = ?
                 where id = ? and status = 'PENDING'""",
                 approve ? "APPROVED" : "REJECTED", approver, opinion, approvalId);
         if (claimed == 0) throw new BizException(2072, "审批单不存在或已办结");
-        var rows = jdbc.queryForList("select * from biz_approval where id = ?", approvalId);
-        var a = rows.get(0);
+        var a = jdbc.queryForList("select * from biz_approval where id = ?", approvalId).get(0);
         Object executed = null;
+        Long linkedCaseId = a.get("case_id") == null ? null : ((Number) a.get("case_id")).longValue();
         if (approve) {
-            executed = execute((String) a.get("kind"), a, approver);
-            // FILE_CASE 是唯一"批准时才产生案件"的类型，申请时 case_id 必然为 null；
-            // 不回填的话这张立案审批表挂不到案件上（byCase 查不到、案卷里看不见第17条批准留痕）
-            if (executed instanceof cn.ybcase.bureau.entity.CaseFile created && a.get("case_id") == null)
-                jdbc.update("update biz_approval set case_id = ? where id = ?", created.getId(), approvalId);
+            String kind = (String) a.get("kind");
+            Long clueId = a.get("clue_id") == null ? null : ((Number) a.get("clue_id")).longValue();
+            requireBinding(kind, linkedCaseId, clueId);
+            if ("FILE_CASE".equals(kind)) {
+                clueId = filingClueId(clueId, fromJson((String) a.get("payload")));
+                if (clueId != null) {
+                    jdbc.queryForList("select id from case_clue where id=? for update", clueId);
+                    sourceAttachmentAccess.lockInspectionsForAdoption(clueId);
+                }
+                enforcerRegistry.lockRegistry();
+            } else if ("CLUE_EXTEND".equals(kind)) {
+                jdbc.queryForList("select id from case_clue where id=? for update", clueId);
+            } else {
+                CaseGuards.lock(jdbc, linkedCaseId);
+            }
+            String applicant = (String) a.get("applicant");
+            // Business source -> all users in ID order. Never user -> existing case (transfer takes case -> user).
+            var actors = workflowUsers.lockUsers(applicant, approver);
+            var actor = workflowUsers.requireFiling(actors.get(applicant));
+            var decider = workflowUsers.requireApprover(actors.get(approver));
+            assertApprovalDepartment(approvalId, decider);
+            if ("FILE_CASE".equals(kind) && a.get("applicant_dept_id") instanceof Number originalDept
+                    && !java.util.Objects.equals(originalDept.longValue(), actor.deptId()))
+                throw new BizException(2080, "申请人所属机构已变化，请驳回并由当前机构重新提交");
+            if (linkedCaseId != null) {
+                materialAccess.assertCaseScope(linkedCaseId, actor);
+                CaseGuards.lockWritable(jdbc, linkedCaseId);
+            }
+            if ("FILE_CASE".equals(kind) && clueId != null)
+                sourceAttachmentAccess.clueForFiling(clueId, applicant, false);
+            else if ("CLUE_EXTEND".equals(kind))
+                sourceAttachmentAccess.lockClueForHandling(clueId, applicant);
+            executed = execute(kind, a, approver);
+            if (executed instanceof cn.ybcase.bureau.entity.CaseFile created && linkedCaseId == null) {
+                linkedCaseId = created.getId();
+                jdbc.update("update biz_approval set case_id = ? where id = ?", linkedCaseId, approvalId);
+            }
+        } else {
+            // A stale/disabled applicant or malformed historical payload must remain rejectable.
+            if (linkedCaseId != null)
+                jdbc.queryForList("select id from case_file where id=? for update", linkedCaseId);
+            var actors = workflowUsers.lockUsers(approver, (String) a.get("applicant"));
+            assertApprovalDepartment(approvalId, workflowUsers.requireApprover(actors.get(approver)));
         }
-        // 即时通知申请人
         messageService.send((String) a.get("applicant"), "APPROVAL",
                 "审批单 #" + approvalId + "（" + KIND_NAMES.getOrDefault((String) a.get("kind"), "") + "）"
                         + (approve ? "已批准" : "已驳回"),
-                opinion, a.get("case_id") == null ? "/case/approvals" : "/case/detail/" + a.get("case_id"), null);
+                opinion, linkedCaseId == null ? "/case/approvals" : "/case/detail/" + linkedCaseId, null);
         return Map.of("approved", approve, "result", executed == null ? Map.of() : executed);
+    }
+
+    private void assertApprovalDepartment(long approvalId, WorkflowUserAccess.User approver) {
+        if (!approver.district()) return;
+        var scope = sourceAttachmentAccess.approvalDepartmentPredicate("a", approver.username());
+        var args = new java.util.ArrayList<Object>();
+        args.add(approvalId);
+        args.addAll(scope.args());
+        if (!Boolean.TRUE.equals(jdbc.queryForObject(
+                "select exists(select 1 from biz_approval a where a.id=? and " + scope.sql() + ")",
+                Boolean.class, args.toArray())))
+            throw new BizException(2080, "审批单不在当前区市县机构范围内");
     }
 
     /** 负责人直接操作原接口时补记单据（申请即批准） */
     @Transactional
     public void recordDirect(String kind, Long caseId, String reason, String operator) {
+        Map<String, Object> snapshot = "FILE_CASE".equals(kind)
+                ? Map.of("jurisdiction", caseService.jurisdictionSnapshot(caseId)) : null;
         jdbc.update("""
-                insert into biz_approval (kind, case_id, reason, applicant, status, approver, decided_at, opinion)
-                values (?,?,?,?, 'APPROVED', ?, now(), '负责人直接批准')""",
-                kind, caseId, reason == null ? "（直接操作）" : reason, operator, operator);
+                insert into biz_approval (kind, case_id, reason, applicant, status, approver, decided_at, opinion, payload, applicant_dept_id)
+                values (?,?,?,?, 'APPROVED', ?, now(), '负责人直接批准',?,
+                        (select dept_id from sys_user where username=?))""",
+                kind, caseId, reason == null ? "（直接操作）" : reason, operator, operator, toJson(snapshot), operator);
+    }
+
+    @Transactional
+    public void recordClueDirect(Long clueId, String reason, String operator) {
+        jdbc.update("""
+                insert into biz_approval(kind, clue_id, reason, applicant, status, approver, decided_at, opinion, applicant_dept_id)
+                values ('CLUE_EXTEND',?,?,?,'APPROVED',?,now(),'主要负责人对应岗位直接批准',
+                        (select dept_id from sys_user where username=?))""",
+                clueId, reason, operator, operator, operator);
     }
 
     /** applicant 非空时只看本人提交的（非负责人/管理员视角） */
     public List<Map<String, Object>> pending(String applicant) {
+        return pending(applicant, applicant == null);
+    }
+
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public List<Map<String, Object>> pendingFor(String username) {
+        return pending(username, materialAccess.readActor(username).privileged());
+    }
+
+    private List<Map<String, Object>> pending(String applicant, boolean canDecide) {
         String base = """
                 select a.*, cf.case_no, cf.name as case_name, c.clue_no
                 from biz_approval a
                 left join case_file cf on cf.id = a.case_id
                 left join case_clue c on c.id = a.clue_id
                 where a.status = 'PENDING'""";
-        return applicant == null
-                ? jdbc.queryForList(base + " order by a.id")
-                : jdbc.queryForList(base + " and a.applicant = ? order by a.id", applicant);
+        if (applicant == null) return jdbc.queryForList(base + " order by a.id");
+        if (canDecide) {
+            var scope = sourceAttachmentAccess.approvalDepartmentPredicate("a", applicant);
+            return jdbc.queryForList(base + " and " + scope.sql() + " order by a.id", scope.args().toArray());
+        }
+        var caseScope = sourceAttachmentAccess.caseReadPredicate("a.case_id", applicant);
+        var clueScope = sourceAttachmentAccess.clueReadPredicate("a.clue_id", applicant);
+        var args = new java.util.ArrayList<Object>(); args.add(applicant);
+        var departmentScope = sourceAttachmentAccess.approvalDepartmentPredicate("a", applicant);
+        args.addAll(caseScope.args()); args.addAll(clueScope.args()); args.addAll(departmentScope.args());
+        return jdbc.queryForList(base + " and a.applicant=? and (a.case_id is null or " + caseScope.sql()
+                + ") and (a.clue_id is null or " + clueScope.sql() + ") and "
+                + departmentScope.sql() + " order by a.id", args.toArray());
     }
 
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public List<Map<String, Object>> byCase(Long caseId) {
+        materialAccess.requireCurrentCaseReader(caseId);
         return jdbc.queryForList("select * from biz_approval where case_id = ? order by id desc", caseId);
     }
 
     private Object execute(String kind, Map<String, Object> a, String approver) {
         Long caseId = a.get("case_id") == null ? null : ((Number) a.get("case_id")).longValue();
+        Long clueId = a.get("clue_id") == null ? null : ((Number) a.get("clue_id")).longValue();
+        requireBinding(kind, caseId, clueId);
         Map<String, Object> p = fromJson((String) a.get("payload"));
         String reason = (String) a.get("reason");
         return switch (kind) {
+            case "CLUE_EXTEND" -> clueService.extend(((Number) a.get("clue_id")).longValue(), reason, approver);
             case "FILE_CASE" -> {
-                CaseService.CaseCreateReq req = objectMapper.convertValue(p, CaseService.CaseCreateReq.class);
+                Map<String, Object> filingPayload = new java.util.LinkedHashMap<>(p);
+                Long resolvedClueId = filingClueId(clueId, p);
+                if (resolvedClueId != null) filingPayload.put("clueId", resolvedClueId);
+                CaseService.CaseCreateReq req;
+                try { req = objectMapper.convertValue(filingPayload, CaseService.CaseCreateReq.class); }
+                catch (IllegalArgumentException e) { throw new BizException(2071, "立案审批材料格式无效，请驳回后重新提交"); }
                 yield caseService.create(req, (String) a.get("applicant"));
             }
             // getOrDefault 对"键存在但值为 null"返回 null（不是默认值）→ NPE → 500，
@@ -127,13 +266,40 @@ public class ApprovalService {
                 Object days = p.get("days");
                 if (!(days instanceof Number n))
                     throw new BizException(2071, "延期申请未填写延长天数，无法执行；请驳回后重新提交");
-                yield caseService.extend(caseId, n.intValue(), reason);
+                int exactDays;
+                try { exactDays = new java.math.BigDecimal(n.toString()).intValueExact(); }
+                catch (ArithmeticException | NumberFormatException e) {
+                    throw new BizException(2071, "延期天数须为有效整数，请驳回后重新提交");
+                }
+                yield caseService.extend(caseId, exactDays, reason);
             }
             case "SUSPEND" -> caseService.suspend(caseId, reason);
             case "TERMINATE" -> caseService.terminate(caseId, reason);
             case "DEFER" -> executionService.approveDefer(caseId);
             default -> throw new BizException(2071, "未知审批类型");
         };
+    }
+
+    private Long filingClueId(Long clueId, Map<String, Object> payload) {
+        Long payloadClueId;
+        try { payloadClueId = payload.get("clueId") == null ? null : objectMapper.convertValue(payload.get("clueId"), Long.class); }
+        catch (IllegalArgumentException e) { throw new BizException(2146, "立案申请的线索编号无效"); }
+        if (clueId != null && payloadClueId != null && !clueId.equals(payloadClueId))
+            throw new BizException(2146, "立案申请关联线索与审批材料中的线索不一致");
+        return clueId == null ? payloadClueId : clueId;
+    }
+
+    /** Pending application bindings describe their source, never an already-created filing result. */
+    private static void requireBinding(String kind, Long caseId, Long clueId) {
+        if ("FILE_CASE".equals(kind)) {
+            if (caseId != null) throw new BizException(2071, "立案申请不得关联已有案件；请驳回后重新提交");
+        } else if ("CLUE_EXTEND".equals(kind)) {
+            if (clueId == null || caseId != null) throw new BizException(2071, "线索延期须仅关联线索");
+        } else if (kind != null && KINDS.contains(kind)) {
+            if (caseId == null || clueId != null) throw new BizException(2071, "案件审批须仅关联案件");
+        } else {
+            throw new BizException(2071, "未知审批类型");
+        }
     }
 
     private String toJson(Map<String, Object> m) {
@@ -146,10 +312,11 @@ public class ApprovalService {
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> fromJson(String s) {
-        try {
-            return s == null ? Map.of() : objectMapper.readValue(s, Map.class);
-        } catch (Exception e) {
-            throw new BizException(2072, "审批单参数解析失败");
-        }
+        if (s == null) return Map.of();
+        Object value;
+        try { value = objectMapper.readValue(s, Object.class); }
+        catch (Exception e) { throw new BizException(2072, "审批单参数解析失败"); }
+        if (!(value instanceof Map<?, ?>)) throw new BizException(2071, "审批单参数须为对象，请驳回后重新提交");
+        return (Map<String, Object>) value;
     }
 }

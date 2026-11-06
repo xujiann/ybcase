@@ -16,6 +16,12 @@ public class CaseOwnerDeactivationGuard implements UserDeactivationGuard {
     private final JdbcTemplate jdbc;
 
     @Override
+    public List<String> roleChangeBlockers(String username, List<String> newRoleCodes) {
+        if (newRoleCodes.stream().anyMatch(CaseOwnerRoles.CODES::contains)) return List.of();
+        return blockers(username);
+    }
+
+    @Override
     public List<String> blockers(String username) {
         List<Map<String, Object>> rows = jdbc.queryForList("""
                 select case_no from case_file

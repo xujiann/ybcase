@@ -18,6 +18,7 @@ import java.util.Map;
 public class AuditQueryController {
 
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.core.security.AdminReadAccess adminReads;
 
     private static final int MAX_SIZE = 500;
 
@@ -28,6 +29,8 @@ public class AuditQueryController {
      */
     @GetMapping("/api/audit/logs")
     @PreAuthorize("hasRole('ADMIN')")
+    @org.springframework.transaction.annotation.Transactional(readOnly = true,
+            isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public R<Object> auditLogs(@RequestParam(required = false) String username,
                                @RequestParam(defaultValue = "false") boolean sensitive,
                                @RequestParam(required = false) String from,
@@ -36,6 +39,7 @@ public class AuditQueryController {
                                @RequestParam(required = false) String requestId,
                                @RequestParam(required = false) Integer page,
                                @RequestParam(required = false) Integer size) {
+        adminReads.requireCurrentAdmin();
         // 医保执法本域的敏感操作（原为医院项目遗留路径 refund/abx-privileges/insurance-catalog，
         // 本系统无对应接口，敏感筛选实际近乎失效）
         String sensitiveWhere = """
@@ -95,8 +99,10 @@ public class AuditQueryController {
     }
 
     private static LocalDate parseDay(String v) {
+        if(v==null || !v.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}")) return null;
         try {
-            return LocalDate.parse(v);
+            LocalDate date=LocalDate.parse(v);
+            return date.getYear()>0?date:null;
         } catch (java.time.format.DateTimeParseException e) {
             return null;
         }

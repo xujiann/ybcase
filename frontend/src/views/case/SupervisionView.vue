@@ -1,7 +1,7 @@
 <template>
   <div v-loading="loading">
     <el-alert type="info" :closable="false" class="mb"
-              title="督办看板：按法定时限自动预警——线索核查15个工作日、法制审核10个工作日、办案期限90日（含延长与扣除）、送达7个工作日、先行登记保存7个工作日、封存30日；决定作出后继续跟到执行终了——缴款期、催告、法院强制执行申请期（缴款期满起3个月，逾期即失权）" />
+              title="督办看板：按法定时限自动预警——线索核查15个工作日、法制审核10个工作日、办案期限90日（含延长与扣除）、送达7个工作日、先行登记保存7个工作日、封存30日；决定作出后继续跟到执行终了——缴款期、催告、法院强制执行申请期（按登记的法定救济、暂缓期限计算）" />
     <el-alert v-if="d.holidayMissing?.length" type="error" :closable="false" class="mb"
               :title="`${d.holidayMissing.join('、')} 年法定节假日表尚未录入：在录入之前，该年度所有按工作日计算的期限只跳周末、不跳节假日，下方工作日口径的预警可能失真。请管理员在「系统管理 → 节假日表」按国办通知批量录入。`" />
     <el-alert v-if="anyTruncated" type="warning" :closable="false" class="mb"
@@ -156,7 +156,15 @@
             <el-table-column prop="name" label="案件" show-overflow-tooltip />
             <el-table-column prop="pay_deadline" label="缴款期限" width="110" />
           </el-table>
-          <div class="hint">催告是申请法院强制执行的法定前置：须先制作催告书（文书类型 URGE_LETTER），满 10 日仍不履行方可申请。</div>
+          <div class="hint">催告是申请法院强制执行的法定前置：须先制作催告书（文书类型 URGE_LETTER）并登记送达，送达满 10 日仍不履行方可申请。</div>
+        </el-card>
+        <el-card class="mb">
+          <h4>执行救济期限待确认 <el-tag type="warning" size="small">{{ d.executionReliefUnconfirmed?.length || 0 }}</el-tag></h4>
+          <el-table :data="d.executionReliefUnconfirmed" size="small" border @row-click="(r: any) => $router.push(`/case/detail/${r.id}`)">
+            <el-table-column prop="case_no" label="案号" width="160" />
+            <el-table-column prop="name" label="案件" show-overflow-tooltip />
+          </el-table>
+          <div class="hint">打开案件详情，登记法定救济期限、程序是否进行中及暂缓期限后，系统计算申请期限。</div>
         </el-card>
         <el-card class="mb">
           <h4>强制执行申请期将满/已过（行政强制法53条）
@@ -173,7 +181,7 @@
               </template>
             </el-table-column>
           </el-table>
-          <div class="hint">缴款期满起 3 个月内不申请即丧失强制执行权，罚没款将无法再追缴——本看板唯一"错过即作废"的期限。</div>
+          <div class="hint">申请期限按已登记的法定救济期限与暂缓期限计算；救济程序进行中不得申请，事实未确认的案件请先补录。</div>
         </el-card>
       </el-col>
     </el-row>

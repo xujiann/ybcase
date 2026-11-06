@@ -32,6 +32,13 @@ import static org.junit.jupiter.api.Assertions.*;
 @ActiveProfiles("test")
 class OpsIntegrationTest {
 
+    @org.junit.jupiter.api.BeforeEach
+    void ensureRealCreator() {
+        FixtureUsers.ensure(jdbc, "it", "HANDLER");
+        FixtureUsers.ensure(jdbc, "someone", "HANDLER");
+    }
+
+
     @Autowired CaseService caseService;
     @Autowired OversightService oversightService;
     @Autowired DocumentService documentService;
@@ -64,9 +71,16 @@ class OpsIntegrationTest {
 
     private CaseFile newCase(String tag) {
         var cause = causeRepository.findAll().stream().filter(c -> c.getItemNo() == 13).findFirst().orElseThrow();
-        return caseService.create(new CaseService.CaseCreateReq(null, cause.getId(), "NORMAL",
+        // Only fixture creation needs responsible-role authority; restore the uploader for attachment checks.
+        Authentication previous = SecurityContextHolder.getContext().getAuthentication();
+        login("admin", "ADMIN");
+        try {return caseService.create(new CaseService.CaseCreateReq(null, cause.getId(), "NORMAL",
                 "IT-" + tag + System.nanoTime(), "PROVIDER", null, null, null, null, "集成测试", BigDecimal.TEN,
-                TWO, null, null, null, null), "it");
+                TWO, null, null, null, null), "it");}
+        finally {
+            if (previous == null) SecurityContextHolder.clearContext();
+            else SecurityContextHolder.getContext().setAuthentication(previous);
+        }
     }
 
     private long insertAttachment(long caseId, String uploader) {
@@ -80,6 +94,7 @@ class OpsIntegrationTest {
 
     @Test
     void 参数改值写历史_同值不写() {
+        FixtureUsers.ensure(jdbc, "it-admin", "ADMIN");
         Authentication admin = login("it-admin", "ADMIN");
         String key = "org_short";
         String original = jdbc.queryForObject("select cfg_value from sys_config where cfg_key = ?", String.class, key);
@@ -117,7 +132,7 @@ class OpsIntegrationTest {
     void 附件作废_上传人可作废_列表过滤_下载受限() {
         CaseFile c = newCase("附件作废");
         long attId = insertAttachment(c.getId(), "banban");
-        Authentication uploader = auth("banban", "HANDLER");
+        Authentication uploader = login("banban", "HANDLER");
         Authentication other = auth("someone", "HANDLER");
         Authentication leader = auth("juzhang", "LEADER");
 
@@ -158,16 +173,16 @@ class OpsIntegrationTest {
     }
 
     @Test
-    void 附件作废_负责人可代作废_已归档拒2131() {
+    void 附件作废_负责人可代作废_已归档拒2031() {
         CaseFile c = newCase("附件负责人");
         long attId = insertAttachment(c.getId(), "banban");
-        attachmentController.voidAttachment(c.getId(), attId, Map.of("reason", "负责人复核作废"), auth("juzhang", "LEADER"));
+        attachmentController.voidAttachment(c.getId(), attId, Map.of("reason", "负责人复核作废"), login("juzhang", "LEADER"));
         assertEquals(Boolean.TRUE, jdbc.queryForObject("select voided from case_attachment where id = ?", Boolean.class, attId));
 
         CaseFile closed = newCase("附件归档");
         long att2 = insertAttachment(closed.getId(), "banban");
         jdbc.update("update case_file set status = 'CLOSED' where id = ?", closed.getId());
-        assertEquals(2131, assertThrows(BizException.class, () ->
+        assertEquals(2031, assertThrows(BizException.class, () ->
                 attachmentController.voidAttachment(closed.getId(), att2, Map.of("reason", "x"), auth("juzhang", "LEADER"))).code);
     }
 

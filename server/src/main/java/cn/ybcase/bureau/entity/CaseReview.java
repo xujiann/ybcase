@@ -31,6 +31,8 @@ public class CaseReview {
 
     @Column(length = 64)
     private String reviewer;
+    private Long reviewerUserId;
+    private String operator;
 
     /** AGREE 同意 / CONTINUE 继续调查 / CHANGE 变更 / CORRECT 纠正 / OTHER */
     @Column(length = 24)
@@ -42,4 +44,11 @@ public class CaseReview {
     private LocalDate reviewedAt;
 
     private Boolean passed;
+
+    /** Bound once when submitted; review approval must never silently replace the submitted version. */
+    @Column(length = 64, updatable = false)
+    private String materialFingerprint;
+
+    @Column(columnDefinition = "text", updatable = false)
+    private String materialSnapshot;
 }

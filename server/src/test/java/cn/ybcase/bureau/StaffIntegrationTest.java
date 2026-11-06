@@ -44,8 +44,9 @@ class StaffIntegrationTest {
     /** 直接调用带 @PreAuthorize 的控制器方法须有认证上下文：以 ADMIN 身份模拟（不引入 spring-security-test） */
     @org.junit.jupiter.api.BeforeEach
     void asAdmin() {
+        FixtureUsers.ensure(jdbc, "it", "HANDLER");
         org.springframework.security.core.context.SecurityContextHolder.getContext().setAuthentication(
-                new org.springframework.security.authentication.UsernamePasswordAuthenticationToken("it", "n/a",
+                new org.springframework.security.authentication.UsernamePasswordAuthenticationToken("admin", "n/a",
                         List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority("ROLE_ADMIN"))));
     }
 

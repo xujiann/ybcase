@@ -22,6 +22,10 @@ import static org.junit.jupiter.api.Assertions.*;
 @ActiveProfiles("test")
 class GuardIntegrationTest {
 
+    @org.junit.jupiter.api.BeforeEach
+    void ensureRealCreator() { FixtureUsers.ensure(jdbc, "it", "HANDLER"); }
+
+
     @Autowired CaseService caseService;
     @Autowired ApprovalService approvalService;
     @Autowired CaseCauseRepository causeRepository;
@@ -47,6 +51,40 @@ class GuardIntegrationTest {
     private static final List<CaseService.OfficerReq> TWO = List.of(
             new CaseService.OfficerReq("王办案", "YB001", "LEAD"),
             new CaseService.OfficerReq("张协办", "YB002", "MEMBER"));
+
+    @Test
+    void reportFieldsFollowFilingInvestigationAndDecision() {
+        var filing = Map.<String, Object>of("causeId", providerCause().getId(), "procedureType", "NORMAL",
+                "partyName", "报表字段测试机构", "partyType", "PROVIDER", "summary", "初查摘要",
+                "amountInvolved", BigDecimal.TEN, "officers", TWO, "reportingDetailsRequired", true,
+                "institution", Map.of("code", "001234", "ownership", "PUBLIC", "grade", "SECONDARY"));
+        long application = approvalService.apply(new ApprovalService.ApplyReq("FILE_CASE", null, null, filing, "立案申请"), "it", false);
+        var c = (CaseFile) approvalService.decide(application, true, "同意立案", "juzhang").get("result");
+        assertEquals("001234", c.getInstitutionCode());
+        assertEquals("PUBLIC", c.getInstitutionOwnership());
+        assertEquals("SECONDARY", c.getInstitutionGrade());
+        assertThrows(BizException.class, () -> caseService.report(c.getId(), "报告正文", "it"));
+        var end = java.time.LocalDate.now();
+        var invalid = new CaseService.ViolationFinding(end, end.minusDays(1), "认定事实", BigDecimal.ONE);
+        assertThrows(BizException.class, () -> caseService.report(c.getId(), new CaseService.ReportReq("报告正文", invalid), "it"));
+        assertEquals("INVESTIGATING", caseService.get(c.getId()).getStatus());
+
+        var finding = new CaseService.ViolationFinding(end.minusDays(2), end, "已核实的事实", new BigDecimal("7.50"));
+        var reported = caseService.report(c.getId(), new CaseService.ReportReq("报告正文", finding), "it");
+        assertEquals(finding.start(), reported.getConfirmedViolationStart());
+        assertEquals(finding.facts(), reported.getConfirmedViolationFacts());
+        assertEquals(finding.amount(), reported.getConfirmedViolationAmount());
+        caseService.notify(c.getId(), new CaseService.NoticeReq("拟罚", BigDecimal.ONE, BigDecimal.ZERO, BigDecimal.ZERO, null));
+        caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
+        assertThrows(BizException.class, () -> caseService.decide(c.getId(),
+                new CaseService.DecisionReq("PUNISH", BigDecimal.ONE, null, null, null, "决定内容", null, "一般情形")));
+        var decision = caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", BigDecimal.ONE, null,
+                null, null, "决定内容", null, "一般情形", "测试依据第一条", null));
+        assertEquals("测试依据第一条", decision.getPenaltyBasis());
+        String draft = documentService.render(c.getId(), "DECISION").get("content");
+        assertTrue(draft.contains("已核实的事实"));
+        assertTrue(draft.contains("测试依据第一条"));
+    }
 
     @Test
     void 执法人员不足两人拒2002() {
@@ -346,7 +384,7 @@ class GuardIntegrationTest {
                 BigDecimal.ZERO, BigDecimal.ZERO, "复核后调整认定金额"));
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         var rv = caseService.submitReview(c.getId(), "重大案件");
-        caseService.doReview(rv.getId(), "李法制", "AGREE", "程序合法");
+        caseService.doReview(rv.getId(), "fazhi", "AGREE", "程序合法");
         caseService.addMeeting(c.getId(), new CaseService.MeetingReq(java.time.LocalDate.now(),
                 "局领导班子", "讨论一致", "同意处罚"));
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("1500"),

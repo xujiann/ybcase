@@ -27,8 +27,15 @@ spring:
 
 server:
   port: 8090
+  tomcat:
+    # 255 个字符的合法文件名可含 1020B UTF-8；为 filename 与固定 part 头保留有界空间。
+    # Tomcat 默认 512B 会在到达附件校验前误拒这类小文件；part 数量及文件/请求限额保持不变。
+    max-part-header-size: 2KB
 
 ybcase:
+  audit:
+    # Only explicit proxy IPs/CIDRs may supply forwarding headers; direct connections ignore them.
+    trusted-proxies: ${YBCASE_AUDIT_TRUSTED_PROXIES:}
   security:
     # 生产/联网环境必须用环境变量 YBCASE_SECURITY_JWT_SECRET 覆盖（32 位以上随机串）；
     # 该默认值公开在代码仓库中，pilot profile 下使用它会拒绝启动

@@ -7,7 +7,6 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
-      - 'deploy/**'
       - '.devcontainer/**'
   pull_request:
     branches: [main]
@@ -18,6 +17,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  backup:
+    name: 备份脚本反例验证
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 验证 DB、FILE、轮转及失败场景
+        env:
+          YBCASE_TEST_TMP_ROOT: ${{ runner.temp }}
+        run: bash deploy/tests/backup-test.sh
+      - name: 验证升级拒绝缺少备份、无效回滚点和容器重建失败
+        env:
+          YBCASE_TEST_TMP_ROOT: ${{ runner.temp }}
+        run: bash deploy/tests/upgrade-test.sh
+      - name: 验证发布配置同步、完整回滚产物和失败中止
+        env:
+          YBCASE_TEST_TMP_ROOT: ${{ runner.temp }}
+        run: bash deploy/tests/push-update-test.sh
+
   backend:
     name: 后端构建与测试（单测+集成测试）
     runs-on: ubuntu-latest
@@ -25,13 +42,13 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_DB: ybcase_test
+          POSTGRES_DB: ybcase_authowner_test_20261028_00000000
           POSTGRES_USER: hip
           POSTGRES_PASSWORD: hip123456
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U hip -d ybcase_test"
+          --health-cmd "pg_isready -U hip -d ybcase_authowner_test_20261028_00000000"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
@@ -45,10 +62,13 @@ jobs:
           cache: maven
 
       - name: 构建与测试
+        env:
+          # 并发回归要求明确命名的隔离库，避免在开发或业务库运行。
+          SPRING_DATASOURCE_URL: jdbc:postgresql://127.0.0.1:5432/ybcase_authowner_test_20261028_00000000
         run: mvn -B --no-transfer-progress test
 
   frontend:
-    name: 前端构建（vue-tsc + vite）
+    name: 前端测试与构建
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,10 +83,11 @@ jobs:
         working-directory: frontend
         run: |
           npm ci
+          npm test
           npm run build
 
   e2e:
-    name: 端到端回归（26 步全流程）
+    name: 端到端回归（136 步全流程）
     runs-on: ubuntu-latest
     services:
       postgres:

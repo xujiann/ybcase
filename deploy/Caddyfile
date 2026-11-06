@@ -1,8 +1,50 @@
+{
+    # Unknown-host HTTP redirects use the default logger, outside the site logger.
+    # Apply the same privacy boundary there; otherwise raw queries and custom
+    # headers from those requests still reach Docker stderr.
+    log default {
+        output stderr
+        format filter {
+            wrap json
+            fields {
+                request delete
+                resp_headers delete
+                user_id delete
+            }
+        }
+    }
+}
+
 # 有域名：自动签发 HTTPS（Let's Encrypt）。DEMO_DOMAIN 在 .env 里配，如 demo.example.com
 # 无域名裸 IP 演示：把第一行改成 :80 （无 HTTPS，仅限临时）
 {$DEMO_DOMAIN}
 
 encode gzip
+
+# Only the three fixed historical reads are logged. Drop the entire request and
+# response headers: query terms, tokens, cookies, IPs and business rows stay out.
+log history_reads {
+    output file /data/history-reads.jsonl {
+        roll_size 10MiB
+        roll_keep 3
+        roll_keep_for 168h
+    }
+    format filter {
+        wrap json
+        fields {
+            request delete
+            resp_headers delete
+            user_id delete
+        }
+    }
+}
+@notHistory not path /api/bureau/rewards /api/bureau/inspections /api/bureau/transfers
+log_skip @notHistory
+log_append <module {http.request.uri.path}
+log_append trace_id {http.request.uuid}
+log_append request_id {http.response.header.X-Request-Id}
+log_append upstream_ms {rp.upstream.duration_ms}
+log_append upstream_header_ms {rp.upstream.latency_ms}
 
 # 安全响应头：令牌存 localStorage 且会话 12 小时，须防点击劫持与 MIME 嗅探
 header {
@@ -18,6 +60,8 @@ header {
 # API 反代到后端（actuator 不对公网暴露）
 @api path /api/*
 handle @api {
+    # Also returned on gateway errors, when no application request ID exists.
+    header X-Trace-Id {http.request.uuid}
     reverse_proxy app:8090 {
         # 审计留痕需要真实操作终端 IP（等保要求可溯源）；Caddy 默认会追加 X-Forwarded-For，
         # 这里显式写明，避免将来调整反代配置时丢失

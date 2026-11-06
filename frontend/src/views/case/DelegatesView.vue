@@ -2,7 +2,7 @@
   <el-card>
     <div class="toolbar">
       <h3>委托执法档案<span class="hint">（局令第8条：委托书载明事项/权限/期限并向社会公布，不得转委托）</span></h3>
-      <el-button type="primary" @click="dlg = true">登记委托</el-button>
+      <el-button v-if="isLeader" type="primary" @click="dlg = true">登记委托</el-button>
     </div>
     <el-table :data="rows" border stripe size="small" v-loading="loading">
       <el-table-column prop="name" label="受托组织" width="200" show-overflow-tooltip />
@@ -33,16 +33,21 @@
       </el-form>
       <template #footer>
         <el-button @click="dlg = false">取消</el-button>
-        <el-button type="primary" @click="onCreate">登记</el-button>
+        <el-button v-if="isLeader" type="primary" @click="onCreate">登记</el-button>
       </template>
     </el-dialog>
   </el-card>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import client from '../../api/client'
+import { useAuthStore } from '../../stores/auth'
+import { leaderOperationAccess } from '../../api/caseWriteAccess'
+
+const auth = useAuthStore()
+const isLeader = computed(() => leaderOperationAccess(auth.user?.roles))
 
 const rows = ref<any[]>([])
 const loading = ref(false)
@@ -59,6 +64,7 @@ async function load() {
 }
 
 async function onCreate() {
+  if (!isLeader.value) return
   if (!form.name || !form.agreementNo || !form.startAt || !form.endAt) {
     ElMessage.warning('受托组织/文号/期限必填')
     return

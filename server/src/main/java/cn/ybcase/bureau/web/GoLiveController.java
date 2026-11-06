@@ -22,47 +22,21 @@ public class GoLiveController {
 
     private final ClueService clueService;
     private final JdbcTemplate jdbc;
+    private final cn.ybcase.bureau.service.BusinessStatisticsService statistics;
+    private final cn.ybcase.bureau.service.MaterialAccess materialAccess;
 
     /** 智能监控疑点批量导入为线索（source=MONITOR） */
     @PostMapping("/clues/import")
+    @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     public R<Map<String, Object>> importClues(@RequestBody List<Map<String, String>> rows,
                                               Authentication auth) {
-        if (rows == null || rows.isEmpty()) throw new BizException(2067, "导入清单为空");
-        if (rows.size() > 500) throw new BizException(2067, "单批最多导入500条");
-        List<String> nos = new ArrayList<>();
-        for (var r : rows) {
-            var clue = clueService.create(new ClueService.ClueCreateReq(
-                    "MONITOR", r.get("content"), r.get("suspectName"),
-                    r.getOrDefault("suspectType", "PROVIDER"), LocalDate.now(),
-                    r.get("handler")), auth.getName());
-            nos.add(clue.getClueNo());
-        }
-        return R.ok(Map.of("imported", nos.size(), "clueNos", nos));
+        return R.ok(clueService.importMonitorForCurrentActor(rows, auth.getName()));
     }
 
     /** 统计上报（月报/年报口径）：按月立案/结案/罚没/追回/听证/移送 */
     @GetMapping("/stats/report")
-    public R<Map<String, Object>> report(@RequestParam int year) {
-        List<Map<String, Object>> monthly = jdbc.queryForList("""
-                with months as (select generate_series(1,12) as m)
-                select months.m as month,
-                       (select count(*) from case_file cf where extract(year from cf.filed_at)=? and extract(month from cf.filed_at)=months.m) as filed,
-                       (select count(*) from case_file cf where extract(year from cf.closed_at)=? and extract(month from cf.closed_at)=months.m) as closed,
-                       (select coalesce(sum(d.fine_amount),0) from case_decision d where extract(year from d.decided_at)=? and extract(month from d.decided_at)=months.m) as fine_decided,
-                       (select coalesce(sum(d.recoup_amount),0) from case_decision d where extract(year from d.decided_at)=? and extract(month from d.decided_at)=months.m) as recoup_decided,
-                       (select coalesce(sum(e.amount),0) from case_execution e where extract(year from e.paid_at)=? and extract(month from e.paid_at)=months.m) as collected
-                from months order by months.m""", year, year, year, year, year);
-        Map<String, Object> totals = jdbc.queryForMap("""
-                select
-                  (select count(*) from case_clue where extract(year from received_at)=?) as clue_total,
-                  (select count(*) from case_file where extract(year from filed_at)=?) as filed_total,
-                  (select count(*) from case_file where extract(year from closed_at)=?) as closed_total,
-                  (select count(*) from case_hearing where extract(year from held_at)=?) as hearing_total,
-                  (select count(*) from case_transfer where extract(year from sent_at)=?) as transfer_total,
-                  (select count(*) from inspection where extract(year from done_at)=?) as inspection_total,
-                  (select coalesce(sum(amount),0) from reward where extract(year from paid_at)=?) as reward_paid""",
-                year, year, year, year, year, year, year);
-        return R.ok(Map.of("year", year, "monthly", monthly, "totals", totals));
+    public R<Map<String, Object>> report(@RequestParam int year, Authentication auth) {
+        return R.ok(statistics.report(year, auth.getName()));
     }
 
     // 委托执法档案（第8条）
@@ -73,27 +47,68 @@ public class GoLiveController {
 
     @PostMapping("/delegates")
     @PreAuthorize("hasRole('ADMIN') or hasRole('LEADER')")
-    public R<Void> addDelegate(@RequestBody Map<String, String> b) {
-        if (b.get("name") == null || b.get("agreementNo") == null || b.get("scope") == null)
-            throw new BizException(2068, "受托组织/委托书文号/委托事项必填（第8条：委托书应载明事项权限期限）");
+    @org.springframework.transaction.annotation.Transactional
+    public R<Void> addDelegate(@RequestBody Map<String, Object> b, Authentication auth) {
+        // The request's captured authorities can precede a concurrent role/enable/password change.
+        // Delegations have no case/source row, so lock the actor before validating and inserting.
+        var actor = materialAccess.lockActor(auth.getName(), false);
+        if (!actor.privileged()) throw new BizException(403, "当前岗位无权登记委托执法档案");
+        String name = delegateText(b, "name", "受托组织", 128, true);
+        String agreement = delegateText(b, "agreementNo", "委托书文号", 64, true);
+        String scope = delegateText(b, "scope", "委托事项与权限", 512, true);
+        String note = delegateText(b, "note", "备注", 255, false);
+        LocalDate start = delegateDate(b, "startAt", "委托开始日期", true);
+        LocalDate end = delegateDate(b, "endAt", "委托结束日期", true);
+        LocalDate published = delegateDate(b, "publishedAt", "公布日期", false);
+        if (end.isBefore(start)) throw new BizException(2068, "委托结束日期不能早于开始日期");
         jdbc.update("""
                 insert into delegate_org (name, agreement_no, scope, start_at, end_at, published_at, note)
-                values (?,?,?,?::date,?::date,?::date,?)""",
-                b.get("name"), b.get("agreementNo"), b.get("scope"),
-                b.get("startAt"), b.get("endAt"), b.get("publishedAt"), b.get("note"));
+                values (?,?,?,?,?,?,?)""", name, agreement, scope, start, end, published, note);
         return R.ok();
+    }
+
+    private static String delegateText(Map<String, Object> body, String key, String label, int max, boolean required) {
+        Object value = body == null ? null : body.get(key);
+        if (value == null && !required) return null;
+        if (!(value instanceof String text) || (required && text.isBlank()))
+            throw new BizException(2068, label + "须为" + (required ? "非空" : "") + "文本");
+        if (text.indexOf('\0') >= 0 || text.codePointCount(0, text.length()) > max)
+            throw new BizException(2068, label + "含无效字符或超过" + max + "字限制");
+        return text;
+    }
+
+    private static LocalDate delegateDate(Map<String, Object> body, String key, String label, boolean required) {
+        Object value = body == null ? null : body.get(key);
+        if (value == null || "".equals(value)) {
+            if (required) throw new BizException(2068, label + "必填");
+            return null;
+        }
+        if (value instanceof String text && text.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}")) {
+            try {
+                LocalDate date = LocalDate.parse(text);
+                if (date.getYear() > 0) return date;
+            } catch (java.time.format.DateTimeParseException ignored) { }
+        }
+        throw new BizException(2068, label + "须为有效日期（yyyy-MM-dd）");
     }
 
     /** 集体讨论记录签字确认（局令44条） */
     @PostMapping("/cases/{caseId}/meetings/{meetingId}/sign")
+    @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
+    @org.springframework.transaction.annotation.Transactional
     public R<Void> signMeeting(@PathVariable Long caseId, @PathVariable Long meetingId,
-                               @RequestBody Map<String, String> body) {
-        String names = body.get("signNames");
-        if (names == null || names.isBlank()) throw new BizException(2069, "须记录参加讨论人员签字确认名单");
+                               @RequestBody Map<String, Object> body) {
+        cn.ybcase.bureau.service.CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        Object value = body == null ? null : body.get("signNames");
+        if (!(value instanceof String names) || names.isBlank())
+            throw new BizException(2069, "须记录参加讨论人员签字确认名单");
+        if (names.indexOf('\0') >= 0 || names.codePointCount(0, names.length()) > 255)
+            throw new BizException(2069, "签字确认名单含无效字符或超过255字限制");
         int n = jdbc.update("""
                 update case_meeting set sign_confirmed = true, sign_names = ?
-                where id = ? and case_id = ?""", names, meetingId, caseId);
-        if (n == 0) throw new BizException(2069, "讨论记录不存在");
+                where id = ? and case_id = ? and sign_confirmed = false""", names, meetingId, caseId);
+        if (n == 0) throw new BizException(2069, "讨论记录不存在或已完成签字确认");
         return R.ok();
     }
 }

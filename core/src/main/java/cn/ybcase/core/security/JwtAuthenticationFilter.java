@@ -21,6 +21,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     private final JwtService jwtService;
     private final DbUserDetailsService userDetailsService;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
@@ -42,6 +43,16 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             } catch (Exception ignored) {
                 // token 无效则按匿名处理，由授权规则拦截
             }
+        }
+        var current = SecurityContextHolder.getContext().getAuthentication();
+        if (current != null && current.getPrincipal() instanceof AuthUser user && user.isMustChangePassword()
+                && !java.util.Set.of("/api/auth/me", "/api/auth/change-password", "/api/auth/login",
+                        "/api/config/public", "/actuator/health").contains(request.getServletPath())) {
+            request.setAttribute("ybcaseBizCode", 1006);
+            response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            response.setContentType("application/json;charset=UTF-8");
+            objectMapper.writeValue(response.getWriter(), cn.ybcase.core.common.R.fail(1006, "请先修改初始口令，再办理业务"));
+            return;
         }
         chain.doFilter(request, response);
     }

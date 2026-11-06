@@ -19,6 +19,7 @@ public class EvidenceService {
     private final CaseFileRepository caseRepository;
     private final BureauConfig config;
     private final JdbcTemplate jdbc;
+    private final MaterialAccess materialAccess;
 
     /** 证据种类：国家局令 8 类 + 辽23条第九类"其他材料" */
     private static final List<String> EVIDENCE_TYPES = List.of(
@@ -29,9 +30,15 @@ public class EvidenceService {
 
     @Transactional
     public void addEvidence(Long caseId, EvidenceReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseGuards.requireActive(CaseGuards.get(caseRepository, caseId));
-        if (!EVIDENCE_TYPES.contains(req.type()))
+        if (req == null || req.type() == null || !EVIDENCE_TYPES.contains(req.type()))
             throw new BizException(2027, "证据种类须为法定类型之一（第19条/辽23条）");
+        text(req.name(), "证据名称", 255, true);
+        text(req.source(), "证据来源", 255, false);
+        text(req.keeper(), "保管人", 64, false);
+        text(req.note(), "证据备注", 512, false);
         LocalDate obtained = req.obtainedAt() != null ? req.obtainedAt() : LocalDate.now();
         boolean hold = Boolean.TRUE.equals(req.registerHold());
         boolean sealed = Boolean.TRUE.equals(req.sealed());
@@ -48,8 +55,10 @@ public class EvidenceService {
     /** 先行登记保存处理决定（第28条）：PRESERVE 保全 / SEAL 转封存 / RELEASE 解除 */
     @Transactional
     public void disposeHold(Long caseId, Long evidenceId, String disposal) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseGuards.requireActive(CaseGuards.get(caseRepository, caseId));
-        if (!List.of("PRESERVE", "SEAL", "RELEASE").contains(disposal))
+        if (disposal == null || !List.of("PRESERVE", "SEAL", "RELEASE").contains(disposal))
             throw new BizException(2028, "处理措施须为 保全/封存/解除 之一（第28条）");
         int n;
         if ("SEAL".equals(disposal)) {
@@ -68,6 +77,8 @@ public class EvidenceService {
     /** 延长封存（第31条：可延长一次，不超过30日）或解除封存（第33条） */
     @Transactional
     public void updateSeal(Long caseId, Long evidenceId, boolean extend) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseGuards.requireActive(CaseGuards.get(caseRepository, caseId));
         if (extend) {
             int n = jdbc.update("""
@@ -84,11 +95,20 @@ public class EvidenceService {
     /** 证据质证（辽24条：未经当事人发表意见的证据不能作为处罚决定依据） */
     @Transactional
     public void crossExam(Long caseId, Long evidenceId, String opinion) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = CaseGuards.get(caseRepository, caseId);
         CaseGuards.requireNotArchived(c);
         if (opinion == null || opinion.isBlank()) throw new BizException(2045, "须记录当事人对证据的意见（无异议也须注明）");
         int n = jdbc.update("update case_evidence set cross_exam_opinion = ?, cross_exam_at = ? where id = ? and case_id = ?",
                 opinion, LocalDate.now(), evidenceId, caseId);
         if (n == 0) throw new BizException(2029, "证据不存在");
+    }
+
+    private static void text(String value, String label, int max, boolean required) {
+        if (required && (value == null || value.isBlank())) throw new BizException(2100, "请填写" + label);
+        if (value != null && value.indexOf('\0') >= 0) throw new BizException(2100, label + "含无效字符");
+        if (value != null && value.codePointCount(0, value.length()) > max)
+            throw new BizException(2100, label + "不能超过" + max + "个字符");
     }
 }

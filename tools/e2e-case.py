@@ -13,7 +13,11 @@ import os
 
 import requests
 
-BASE = "http://127.0.0.1:8090/api"
+# Ad-hoc probes also reuse connections; no automatic retries of writes.
+HTTP = requests.Session()
+
+BASE = os.environ.get("YBCASE_API_BASE", "http://127.0.0.1:8090/api")
+PASSWORDS = {}
 step_no = 0
 
 
@@ -31,25 +35,40 @@ def ok(cond, msg):
 
 
 class Api:
-    def __init__(self, username, password="admin123"):
+    def __init__(self, username, password=None, auto_change=True):
+        # Reuse keep-alive connections during long regressions instead of opening
+        # hundreds of short-lived sockets. Never enable automatic mutation retries.
+        self.session = requests.Session()
+        password = password if password is not None else PASSWORDS.get(username, "admin123")
+        self.username = username
         # 健康检查通过 ≠ 初始化器已建好默认账号（ApplicationRunner 晚于 Web 就绪）——登录重试消除时序 flake
         import time
         last = None
         for _ in range(30):
-            r = requests.post(f"{BASE}/auth/login",
+            r = self.session.post(f"{BASE}/auth/login",
                               json={"username": username, "password": password}, timeout=10)
             last = r.json()
             if last.get("code") == 0:
                 self.token = last["data"]["token"]
+                PASSWORDS[username] = password
+                if auto_change and last["data"].get("mustChangePassword"):
+                    updated = "Regression2026!"
+                    self.post("/auth/change-password", json={"oldPassword": password, "newPassword": updated})
+                    PASSWORDS[username] = updated
+                    renewed = self.session.post(f"{BASE}/auth/login", json={"username": username, "password": updated}, timeout=10).json()
+                    assert renewed["code"] == 0, renewed
+                    self.token = renewed["data"]["token"]
                 return
             time.sleep(1)
         raise AssertionError(f"登录失败（{username}）: {last}")
 
     def call(self, method, path, expect_code=0, **kwargs):
-        r = requests.request(method, f"{BASE}{path}", timeout=15,
+        r = self.session.request(method, f"{BASE}{path}", timeout=15,
                              headers={"Authorization": f"Bearer {self.token}"}, **kwargs)
         body = r.json()
         assert body["code"] == expect_code, f"{path} 期望 code={expect_code} 实得 {body['code']}: {body.get('message')}"
+        if path == "/auth/change-password" and body["code"] == 0:
+            PASSWORDS[self.username] = kwargs["json"]["newPassword"]
         return body.get("data")
 
     def get(self, path, **kw):
@@ -84,6 +103,7 @@ def workdays_plus(d, n):
 
 def main():
     admin = Api("admin")
+    fazhi = Api("fazhi")
     load_holidays(admin)   # 工作日推算与服务端同口径（见 workdays_plus）
 
     step("案由字典：35 项种子")
@@ -176,6 +196,10 @@ def main():
     detail = admin.get(f"/bureau/cases/{cid}")
     ok(detail["effectiveDeadline"] == str(today + datetime.timedelta(days=90)),
        "进行中的扣除尚未产生顺延（期限仍为 90 日）")
+    admin.post(f"/bureau/cases/{cid}/decide",
+               json={"decisionType": "PUNISH", "fineAmount": 1, "content": "x"}, expect_code=2032)
+    _period = next(x for x in detail["exclusions"] if x.get("end_at") is None)
+    admin.post(f"/bureau/cases/{cid}/exclusions/{_period['id']}/end", json={"endAt": str(today)})
 
     step("程序顺序守卫：终结前告知拒（2004）；告知前决定拒（2006）")
     admin.post(f"/bureau/cases/{cid}/notice",
@@ -201,12 +225,12 @@ def main():
         "decisionType": "PUNISH", "fineAmount": 150000, "recoupAmount": 80000,
         "content": "x"}, expect_code=2005)
 
-    step("法制审核：办案人员不得审核（2038）；法制员审核通过")
+    step("法制审核：冒用办案人姓名无资格拒（2070）；法制员审核通过")
     review = admin.post(f"/bureau/cases/{cid}/reviews", json={"requiredReason": "罚款数额较大（≥10万元）"})
     ok(review["deadlineAt"] == str(workdays_plus(today, 10)), "审核期限 10 个工作日")
     admin.post(f"/bureau/cases/reviews/{review['id']}",
-               json={"reviewer": "王办案", "opinionType": "AGREE", "opinion": "x"}, expect_code=2038)
-    admin.post(f"/bureau/cases/reviews/{review['id']}",
+               json={"reviewer": "王办案", "opinionType": "AGREE", "opinion": "x"}, expect_code=2070)
+    fazhi.post(f"/bureau/cases/reviews/{review['id']}",
                json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "事实清楚、证据充分、程序合法"})
 
     step("不得因陈述申辩加重处罚：决定 20 万 > 告知 15 万拒（2007）")
@@ -440,12 +464,12 @@ def main():
 
     step("附件上传/下载回路")
     files = {"file": ("询问笔录扫描件.txt", "笔录内容示例".encode("utf-8"), "text/plain")}
-    r = requests.post(f"{BASE}/bureau/cases/{tcase['id']}/attachments", files=files, timeout=15,
+    r = HTTP.post(f"{BASE}/bureau/cases/{tcase['id']}/attachments", files=files, timeout=15,
                       headers={"Authorization": f"Bearer {admin.token}"})
     assert r.json()["code"] == 0, r.text
     atts = admin.get(f"/bureau/cases/{tcase['id']}/attachments")
     ok(len(atts) == 1 and atts[0]["filename"] == "询问笔录扫描件.txt", "附件已登记")
-    dl = requests.get(f"{BASE}/bureau/cases/attachments/{atts[0]['id']}/download", timeout=15,
+    dl = HTTP.get(f"{BASE}/bureau/cases/attachments/{atts[0]['id']}/download", timeout=15,
                       headers={"Authorization": f"Bearer {admin.token}"})
     ok(dl.content.decode("utf-8") == "笔录内容示例", "下载内容一致")
 
@@ -464,7 +488,7 @@ def main():
         # 该案走到决定送达后尝试结案（缺 DELIVERY 无碍——必备清单为终结报告/告知/决定/结案报告）
         admin.post(f"/bureau/cases/{tcase['id']}/statement", json={"statement": "无异议"})
         rev = admin.post(f"/bureau/cases/{tcase['id']}/reviews", json={"requiredReason": "数额较大"})
-        admin.post(f"/bureau/cases/reviews/{rev['id']}",
+        fazhi.post(f"/bureau/cases/reviews/{rev['id']}",
                    json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "同意"})
         admin.post(f"/bureau/cases/{tcase['id']}/decide", json={
             "decisionType": "NO_PUNISH", "content": "违法行为轻微并及时纠正，不予处罚"})
@@ -545,6 +569,8 @@ def main():
     # 送达日回拨 95 天：缴款期(15日)早已届满，且强执申请期(缴款期满+3个月)进入 30 日临期窗口
     admin.post(f"/bureau/cases/{_ex['id']}/deliver", json={
         "method": "DIRECT", "deliveredAt": str(today - datetime.timedelta(days=95)), "receiver": "法人"})
+    admin.post(f"/bureau/cases/{_ex['id']}/relief-deadline", json={
+        "deadline": str(today - datetime.timedelta(days=70)), "pending": False, "basis": "回归夹具：救济期限已核实"})
 
     def _exec_warn():
         s2 = admin.get("/bureau/stats/supervision")
@@ -557,6 +583,9 @@ def main():
     admin.post(f"/bureau/cases/{_ex['id']}/documents", json={
         "docType": "URGE_LETTER", "title": "催告书", "content": "限十日内履行",
         "madeAt": str(today - datetime.timedelta(days=30))})
+    _urge = next(x for x in admin.get(f"/bureau/cases/{_ex['id']}")["documents"] if x["doc_type"] == "URGE_LETTER")
+    admin.post(f"/bureau/cases/{_ex['id']}/doc-deliveries", json={
+        "documentId": _urge["id"], "method": "DIRECT", "deliveredAt": str(today - datetime.timedelta(days=30)), "receiver": "法人"})
     w2 = _exec_warn()
     ok(w2["urgeLetterMissing"] == 0 and w2["courtEnforceExpiring"] == 1,
        f"下达催告书后仅『未催告』消退，申请期仍预警 {w2}")
@@ -564,7 +593,7 @@ def main():
     admin.post("/bureau/messages/generate-reminders")
     _msgs = admin.get("/bureau/messages")
     ok(any(m["kind"] == "DEADLINE" and str(_ex["id"]) in str(m.get("link", ""))
-           and "强制执行申请期" in m["title"] for m in _msgs),
+           and "法院申请期限" in m["title"] for m in _msgs),
        "强执申请期临期已推送站内提醒")
     admin.post(f"/bureau/cases/{_ex['id']}/executions", json={
         "kind": "FINE", "amount": 5000, "paidAt": str(today), "method": "BANK"})
@@ -585,6 +614,8 @@ def main():
         "content": "罚款5000", "discretionReason": "一般情形"})
     admin.post(f"/bureau/cases/{_df['id']}/deliver", json={
         "method": "DIRECT", "deliveredAt": str(today - datetime.timedelta(days=95)), "receiver": "法人"})
+    admin.post(f"/bureau/cases/{_df['id']}/relief-deadline", json={
+        "deadline": str(today - datetime.timedelta(days=70)), "pending": False, "basis": "回归夹具：救济期限已核实"})
     _s_before = admin.get("/bureau/stats/supervision")
     ok(any(x["id"] == _df["id"] for x in _s_before["paymentOverdue"]), "未批准分期时正常报催缴")
     admin.post(f"/bureau/cases/{_df['id']}/approve-defer")
@@ -639,26 +670,29 @@ def main():
     ok(not _mismatch, f"每笔分期入账的款项类型与计划一致（不符 {_mismatch}）")
 
     step("专家评审：结束自动登记期限扣除（第25/45条）；起始日不得由结束请求倒填")
+    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews", json={"experts": "已决定案件不得新开评审"}, expect_code=2044)
+    _expert_case = admin.post("/bureau/cases", json={"causeId": cause13["id"], "partyName": "评审在办测试医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"}, {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]})["id"]
     # 起始日只在启动时登记且受校验（不得早于立案日、不得晚于今天）
-    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews",
+    admin.post(f"/bureau/cases/{_expert_case}/expert-reviews",
                json={"experts": "临床专家A、医保专家B", "startedAt": str(today - datetime.timedelta(days=4))},
                expect_code=2066)  # 案件今日立案，评审不可能 4 日前开始
-    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews",
+    admin.post(f"/bureau/cases/{_expert_case}/expert-reviews",
                json={"experts": "临床专家A、医保专家B", "startedAt": str(today + datetime.timedelta(days=1))},
                expect_code=2066)  # 未来日期
-    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews", json={"experts": "临床专家A、医保专家B"})
+    admin.post(f"/bureau/cases/{_expert_case}/expert-reviews", json={"experts": "临床专家A、医保专家B"})
     # 同案不允许并行第二条评审（并行区间重合会重复扣除期限，第五轮新守卫）
-    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews",
+    admin.post(f"/bureau/cases/{_expert_case}/expert-reviews",
                json={"experts": "专家C"}, expect_code=2066)
-    er_id = admin.get(f"/bureau/cases/{d_case['id']}")["expertReviews"][-1]["id"]  # 用本次创建的真实 id，非全新库也可跑
-    e_case_before = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
+    er_id = admin.get(f"/bureau/cases/{_expert_case}")["expertReviews"][-1]["id"]
+    e_case_before = admin.get(f"/bureau/cases/{_expert_case}")["effectiveDeadline"]
     # 结束时倒填一个很早的开始日：应被忽略，扣除仍按库内登记的今天计
-    admin.post(f"/bureau/cases/{d_case['id']}/expert-reviews/{er_id}/end", json={
+    admin.post(f"/bureau/cases/{_expert_case}/expert-reviews/{er_id}/end", json={
         "opinion": "病历评审意见：过度诊疗成立",
         "startedAt": str(today - datetime.timedelta(days=300)), "endedAt": str(today)})
-    e_case_after = admin.get(f"/bureau/cases/{d_case['id']}")["effectiveDeadline"]
+    e_case_after = admin.get(f"/bureau/cases/{_expert_case}")["effectiveDeadline"]
     ok(e_case_after == e_case_before, "结束请求中的倒填起始日被忽略，期限未被凭空延长")
-    er_done = admin.get(f"/bureau/cases/{d_case['id']}")["expertReviews"][-1]
+    er_done = admin.get(f"/bureau/cases/{_expert_case}")["expertReviews"][-1]
     ok(er_done["ended_at"] == str(today) and er_done["started_at"] == str(today), "评审起止以库内登记为准")
 
     step("公示导出：自然人姓名脱敏")
@@ -734,7 +768,7 @@ def main():
 
     step("听证案件决定（经审核+集体讨论）→ 电子送达须确认书（2054）")
     rev = admin.post(f"/bureau/cases/{hid}/reviews", json={"requiredReason": "经过听证程序"})
-    admin.post(f"/bureau/cases/reviews/{rev['id']}",
+    fazhi.post(f"/bureau/cases/reviews/{rev['id']}",
                json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "程序合法"})
     admin.post(f"/bureau/cases/{hid}/meetings", json={
         "heldAt": str(today), "attendees": "局领导班子", "record": "讨论一致", "conclusion": "同意处罚"})
@@ -818,11 +852,11 @@ def main():
     _users = _users["records"] if isinstance(_users, dict) else _users
     _uid = next(u["id"] for u in _users if u["username"] == "banban")
     for _ in range(5):
-        requests.post(f"{BASE}/auth/login", json={"username": "banban", "password": "wrong-pass"}, timeout=10)
-    _locked = requests.post(f"{BASE}/auth/login", json={"username": "banban", "password": "admin123"}, timeout=10).json()
+        HTTP.post(f"{BASE}/auth/login", json={"username": "banban", "password": "wrong-pass"}, timeout=10)
+    _locked = HTTP.post(f"{BASE}/auth/login", json={"username": "banban", "password": PASSWORDS.get("banban", "admin123")}, timeout=10).json()
     ok(_locked["code"] == 1002, "5 次错密后账号锁定（1002）")
     admin.call("PUT", f"/system/users/{_uid}/unlock")
-    _ok = requests.post(f"{BASE}/auth/login", json={"username": "banban", "password": "admin123"}, timeout=10).json()
+    _ok = HTTP.post(f"{BASE}/auth/login", json={"username": "banban", "password": PASSWORDS.get("banban", "admin123")}, timeout=10).json()
     ok(_ok["code"] == 0, "管理员解锁后可登录")
     _bb = Api("banban")
     _all = admin.get("/bureau/transfers")
@@ -891,18 +925,18 @@ def main():
     q_rev = admin.post(f"/bureau/cases/{q_case['id']}/reviews", json={"requiredReason": "测试"})
     admin.post(f"/bureau/cases/reviews/{q_rev['id']}",
                json={"reviewer": "赵局长", "opinionType": "AGREE", "opinion": "x"}, expect_code=2070)
-    admin.post(f"/bureau/cases/reviews/{q_rev['id']}",
+    fazhi.post(f"/bureau/cases/reviews/{q_rev['id']}",
                json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "具备资格"})
     print("    PASS: 非法律职业资格人员不得审核")
 
     step("配置白名单：匿名 /api/config/public 不再泄露口径参数")
-    pub_cfg = requests.get(f"{BASE}/config/public", timeout=10).json()["data"]
+    pub_cfg = HTTP.get(f"{BASE}/config/public", timeout=10).json()["data"]
     ok("org_name" in pub_cfg and "hearing_threshold_individual" not in pub_cfg
        and "legal_review_mode" not in pub_cfg, f"仅暴露 {len(pub_cfg)} 个机构信息键")
 
     step("执法证守卫（2055）：立案人员不在台账/证名不符已拒（含上批用例）——附件>1MB 上传成功（multipart 修复）")
     big = ("大附件.bin", b"x" * (2 * 1024 * 1024), "application/octet-stream")
-    r_big = requests.post(f"{BASE}/bureau/cases/{q_case['id']}/attachments", files={"file": big},
+    r_big = HTTP.post(f"{BASE}/bureau/cases/{q_case['id']}/attachments", files={"file": big},
                           timeout=30, headers={"Authorization": f"Bearer {admin.token}"})
     ok(r_big.json()["code"] == 0, "2MB 附件上传成功（原默认1MB限制已修复）")
 
@@ -922,7 +956,7 @@ def main():
     admin.post(f"/bureau/cases/{j_case['id']}/report", json={"content": "涉嫌犯罪"})
     admin.post(f"/bureau/cases/{j_case['id']}/notice", json={"content": "移送告知", "proposedFine": 0})
     j_rev = admin.post(f"/bureau/cases/{j_case['id']}/reviews", json={"requiredReason": "涉刑移送"})
-    admin.post(f"/bureau/cases/reviews/{j_rev['id']}",
+    fazhi.post(f"/bureau/cases/reviews/{j_rev['id']}",
                json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "同意移送"})
     admin.post(f"/bureau/cases/{j_case['id']}/decide", json={
         "decisionType": "TRANSFER_JUDICIAL", "content": "移送公安机关追究刑事责任"})
@@ -954,22 +988,23 @@ def main():
         admin.call("PUT", "/config/late_fee_base?value=FULL")
 
     step("自助修改密码：改密→新密登录→改回")
-    banban.post("/auth/change-password", json={"oldPassword": "admin123", "newPassword": "Fix2026pwd"})
-    r_new = requests.post(f"{BASE}/auth/login",
+    banban.post("/auth/change-password", json={"oldPassword": PASSWORDS["banban"], "newPassword": "Fix2026pwd"})
+    r_new = HTTP.post(f"{BASE}/auth/login",
                           json={"username": "banban", "password": "Fix2026pwd"}, timeout=10).json()
     ok(r_new["code"] == 0, "新密码登录成功")
     # 弱密码拒（1004）后改回演示口令
     tok = r_new["data"]["token"]
-    weak = requests.post(f"{BASE}/auth/change-password",
+    weak = HTTP.post(f"{BASE}/auth/change-password",
                          json={"oldPassword": "Fix2026pwd", "newPassword": "abc"},
                          timeout=10, headers={"Authorization": f"Bearer {tok}"}).json()
     ok(weak["code"] == 1004, "弱密码被策略拒绝")
-    back = requests.post(f"{BASE}/auth/change-password",
+    back = HTTP.post(f"{BASE}/auth/change-password",
                          json={"oldPassword": "Fix2026pwd", "newPassword": "admin123"},
                          timeout=10, headers={"Authorization": f"Bearer {tok}"}).json()
     ok(back["code"] == 0, "改密闭环并复位")
+    PASSWORDS["banban"] = "admin123"
     # 改密即吊销旧令牌：banban 手里改密前的令牌此刻已失效，须重新登录
-    r_stale = requests.get(f"{BASE}/bureau/my/workbench", timeout=10,
+    r_stale = HTTP.get(f"{BASE}/bureau/my/workbench", timeout=10,
                            headers={"Authorization": f"Bearer {banban.token}"})
     ok(r_stale.status_code in (401, 403), f"改密前的旧令牌已失效（HTTP {r_stale.status_code}）")
     banban = Api("banban")
@@ -1049,14 +1084,14 @@ def main():
     admin.call("PUT", "/config/attachment_storage?value=FILE")
     try:
         files = {"file": ("现场执法记录.mp4", b"FAKE_VIDEO" * 1000, "video/mp4")}
-        r_av = requests.post(f"{BASE}/bureau/cases/{d_case['id']}/attachments",
+        r_av = HTTP.post(f"{BASE}/bureau/cases/{d_case['id']}/attachments",
                              files=files, data={"category": "AV_RECORD"}, timeout=30,
                              headers={"Authorization": f"Bearer {admin.token}"})
         assert r_av.json()["code"] == 0, r_av.text
         atts2 = admin.get(f"/bureau/cases/{d_case['id']}/attachments")
         av = next(a for a in atts2 if a["category"] == "AV_RECORD")
         ok(av["external"] is True, "音像件外置存储")
-        dl2 = requests.get(f"{BASE}/bureau/cases/attachments/{av['id']}/download", timeout=15,
+        dl2 = HTTP.get(f"{BASE}/bureau/cases/attachments/{av['id']}/download", timeout=15,
                            headers={"Authorization": f"Bearer {admin.token}"})
         ok(dl2.content.startswith(b"FAKE_VIDEO"), "外置文件下载一致")
     finally:
@@ -1070,7 +1105,7 @@ def main():
 
     step("审计导出（等保归档）")
     month = str(today)[:7]
-    r_csv = requests.get(f"{BASE}/bureau/audit/export", params={"month": month}, timeout=15,
+    r_csv = HTTP.get(f"{BASE}/bureau/audit/export", params={"month": month}, timeout=15,
                          headers={"Authorization": f"Bearer {admin.token}"})
     ok(r_csv.status_code == 200 and len(r_csv.content) > 200, f"审计 CSV {len(r_csv.content)} 字节")
 
@@ -1311,10 +1346,10 @@ def main():
     admin.post("/system/users", json={
         "username": "tokentest", "password": "Init12345", "realName": "令牌测试",
         "roleCodes": ["HANDLER"]})
-    tt = Api("tokentest", password="Init12345")
+    tt = Api("tokentest", password="Init12345", auto_change=False)
     tt.get("/auth/me")
     tt.post("/auth/change-password", json={"oldPassword": "Init12345", "newPassword": "Next12345"})
-    r_old = requests.get(f"{BASE}/auth/me", timeout=10,
+    r_old = HTTP.get(f"{BASE}/auth/me", timeout=10,
                          headers={"Authorization": f"Bearer {tt.token}"})
     ok(r_old.status_code in (401, 403), f"旧令牌已失效（HTTP {r_old.status_code}）")
     tt2 = Api("tokentest", password="Next12345")
@@ -1326,14 +1361,14 @@ def main():
     admin.call("PUT", f"/system/users/{uid}",
                json={"username": "tokentest", "realName": "令牌测试", "password": "Reset12345",
                      "roleCodes": ["HANDLER"]})
-    r_reset = requests.get(f"{BASE}/auth/me", timeout=10,
+    r_reset = HTTP.get(f"{BASE}/auth/me", timeout=10,
                            headers={"Authorization": f"Bearer {tt2.token}"})
     ok(r_reset.status_code in (401, 403), f"管理员改密后旧令牌失效（HTTP {r_reset.status_code}）")
-    tt3 = Api("tokentest", password="Reset12345")
+    tt3 = Api("tokentest", password="Reset12345", auto_change=False)
 
     step("停用账号即断开在线会话")
     admin.call("PUT", f"/system/users/{uid}/enabled?enabled=false")
-    r_dis = requests.get(f"{BASE}/auth/me", timeout=10,
+    r_dis = HTTP.get(f"{BASE}/auth/me", timeout=10,
                          headers={"Authorization": f"Bearer {tt3.token}"})
     ok(r_dis.status_code in (401, 403), f"停用后令牌立即失效（HTTP {r_dis.status_code}）")
 
@@ -1342,7 +1377,7 @@ def main():
     ok(len(admin.get("/system/roles")) >= 4, "管理员可读角色矩阵")
 
     step("OpenAPI 文档可用（对接厂商契约）")
-    docs_r = requests.get(f"{BASE.replace('/api','')}/v3/api-docs", timeout=15,
+    docs_r = HTTP.get(f"{BASE.replace('/api','')}/v3/api-docs", timeout=15,
                           headers={"Authorization": f"Bearer {admin.token}"})
     spec = docs_r.json()
     ok(docs_r.status_code == 200 and len(spec.get("paths", {})) > 60,
@@ -1350,7 +1385,7 @@ def main():
 
     # ============ 用户反馈直报（bug/需求）+ request-id 定位闭环 ============
     step("request-id：响应头返回并落审计日志")
-    r_rid = requests.get(f"{BASE}/bureau/stats/overview", timeout=10,
+    r_rid = HTTP.get(f"{BASE}/bureau/stats/overview", timeout=10,
                          headers={"Authorization": f"Bearer {admin.token}"})
     rid = r_rid.headers.get("X-Request-Id")
     ok(rid and len(rid) >= 12, f"X-Request-Id={rid}")
@@ -1377,13 +1412,13 @@ def main():
     row = next(r for r in fl["rows"] if r["id"] == fb["id"])
     ok(row["has_screenshot"] is True and row["request_id"] == rid, "上下文完整")
     ok(any(s["status"] == "NEW" for s in fl["byStatus"]), "状态统计")
-    shot = requests.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
+    shot = HTTP.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
                         headers={"Authorization": f"Bearer {admin.token}"})
     ok(shot.status_code == 200 and shot.content[1:4] == b"PNG", "截图可取")
-    shot_ju = requests.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
+    shot_ju = HTTP.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
                            headers={"Authorization": f"Bearer {juzhang.token}"})
     ok(shot_ju.status_code == 403, "非本人非管理员取截图 403")
-    shot_bb = requests.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
+    shot_bb = HTTP.get(f"{BASE}/bureau/feedback/{fb['id']}/screenshot", timeout=10,
                            headers={"Authorization": f"Bearer {banban.token}"})
     ok(shot_bb.status_code == 200, "提交人本人可取")
     admin.post(f"/bureau/feedback/{fb['id']}/handle",
@@ -1413,7 +1448,7 @@ def main():
         admin.call("PUT", "/config/feedback_autoclose_days?value=7")
 
     step("反馈导出 CSV")
-    r_fcsv = requests.get(f"{BASE}/bureau/feedback/export", timeout=10,
+    r_fcsv = HTTP.get(f"{BASE}/bureau/feedback/export", timeout=10,
                           headers={"Authorization": f"Bearer {admin.token}"})
     ok(r_fcsv.status_code == 200 and "决定页偶发报错".encode("utf-8") in r_fcsv.content, "CSV 含反馈内容")
 
@@ -1444,10 +1479,15 @@ def main():
 
     step("集体讨论签字确认（局令44条）：名单必填（2069）+确认")
     mt = admin.get(f"/bureau/cases/{cid}")["meetings"][0]
-    admin.post(f"/bureau/cases/{cid}/meetings/{mt['id']}/sign", json={}, expect_code=2069)
-    admin.post(f"/bureau/cases/{cid}/meetings/{mt['id']}/sign",
+    admin.post(f"/bureau/cases/{cid}/meetings/{mt['id']}/sign", json={"signNames": "归档后不可补签"}, expect_code=2031)
+    _sign_case = admin.post("/bureau/cases", json={"causeId": cause13["id"], "partyName": "签名测试医院", "partyType": "PROVIDER",
+        "officers": [{"name": "王办案", "certNo": "YB001", "duty": "LEAD"}, {"name": "张协办", "certNo": "YB002", "duty": "MEMBER"}]})["id"]
+    admin.post(f"/bureau/cases/{_sign_case}/meetings", json={"heldAt": str(today), "attendees": "局长及成员", "record": "集体讨论", "conclusion": "同意"})
+    mt = admin.get(f"/bureau/cases/{_sign_case}")["meetings"][0]
+    admin.post(f"/bureau/cases/{_sign_case}/meetings/{mt['id']}/sign", json={}, expect_code=2069)
+    admin.post(f"/bureau/cases/{_sign_case}/meetings/{mt['id']}/sign",
                json={"signNames": "局长、分管副局长、基金监督处长、法规处长"})
-    ok(admin.get(f"/bureau/cases/{cid}")["meetings"][0]["sign_confirmed"] is True, "签字确认入卷")
+    ok(admin.get(f"/bureau/cases/{_sign_case}")["meetings"][0]["sign_confirmed"] is True, "签字确认入卷")
 
     step("重大处罚政府备案督办：未备案案件出现在预警列表")
     sup5 = admin.get("/bureau/stats/supervision")
@@ -1528,7 +1568,7 @@ def main():
             "content": "x"}, expect_code=2005)
         ln_rev = admin.post(f"/bureau/cases/{lnid}/reviews", json={"requiredReason": "辽宁全案审核"})
         ok(ln_rev["deadlineAt"] == str(today + datetime.timedelta(days=7)), "审核期限7自然日（辽41条）")
-        admin.post(f"/bureau/cases/reviews/{ln_rev['id']}",
+        fazhi.post(f"/bureau/cases/reviews/{ln_rev['id']}",
                    json={"reviewer": "李法制", "opinionType": "AGREE", "opinion": "同意"})
 
         step("辽·质证守卫：证据未质证不得决定（2045，辽24条）；质证后可决定")
@@ -1538,6 +1578,12 @@ def main():
         ev = admin.get(f"/bureau/cases/{lnid}")["evidences"][0]
         admin.post(f"/bureau/cases/{lnid}/evidences/{ev['id']}/cross-exam",
                    json={"opinion": "当事人无异议"})
+        admin.post(f"/bureau/cases/{lnid}/decide", json={
+            "decisionType": "PUNISH", "fineAmount": 1500, "recoupAmount": 3000,
+            "discretionReason": "初犯且金额较小，按下限处罚", "content": "补质证后需审核新材料"}, expect_code=2150)
+        ln_current_review = admin.post(f"/bureau/cases/{lnid}/reviews", json={"requiredReason": "补充质证后重新审核当前材料"})
+        fazhi.post(f"/bureau/cases/reviews/{ln_current_review['id']}",
+                   json={"opinionType": "AGREE", "opinion": "补充质证后的材料经复审同意"})
         ln_dec = admin.post(f"/bureau/cases/{lnid}/decide", json={
             "decisionType": "PUNISH", "fineAmount": 1500, "recoupAmount": 3000,
             "discretionReason": "初犯且金额较小，按下限处罚",
@@ -1680,7 +1726,7 @@ def main():
     ok(admin.get(f"/bureau/cases/{_sc['id']}")["caseFile"]["ownerUser"] == _hd, "案件已在离职人员名下")
 
     step("停用前置校验：名下有在办案件拒 1105 并回带案号，账号不被改动")
-    _resp = requests.put(f"{BASE}/system/users/{_hd_id}/enabled", params={"enabled": "false"},
+    _resp = HTTP.put(f"{BASE}/system/users/{_hd_id}/enabled", params={"enabled": "false"},
                          headers={"Authorization": f"Bearer {admin.token}"}, timeout=15).json()
     ok(_resp["code"] == 1105 and _sc["caseNo"] in _resp["message"], f"停用被拦：{_resp['message']}")
     ok(next(u for u in admin.get("/system/users", params={"size": 200})["records"]
@@ -1772,7 +1818,7 @@ def main():
     _ops_ac = admin.post("/bureau/cases", json={
         "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "附件作废测试医院",
         "partyType": "PROVIDER", "summary": "附件作废回路", "amountInvolved": 1000, "officers": ops_officers})
-    _ops_r = requests.post(f"{BASE}/bureau/cases/{_ops_ac['id']}/attachments", timeout=15,
+    _ops_r = HTTP.post(f"{BASE}/bureau/cases/{_ops_ac['id']}/attachments", timeout=15,
                            files={"file": ("误传病历.txt", "他案病历".encode("utf-8"), "text/plain")},
                            headers={"Authorization": f"Bearer {ops_banban.token}"})
     assert _ops_r.json()["code"] == 0, _ops_r.text
@@ -1781,7 +1827,7 @@ def main():
     ops_banban.post(f"/bureau/cases/{_ops_ac['id']}/attachments/{_ops_att['id']}/void",
                     json={"reason": " "}, expect_code=2130)
     ops_fazhi.post(f"/bureau/cases/{_ops_ac['id']}/attachments/{_ops_att['id']}/void",
-                   json={"reason": "误传"}, expect_code=2133)   # 法制可看案件但不是上传人/负责人
+                   json={"reason": "误传"}, expect_code=403)   # 法制可读，附件写入仅承办/负责人/管理员
     _ops_ac2 = admin.post("/bureau/cases", json={
         "causeId": cause13["id"], "procedureType": "NORMAL", "partyName": "附件作废他案医院",
         "partyType": "PROVIDER", "summary": "他案", "amountInvolved": 1000, "officers": ops_officers})
@@ -1795,10 +1841,10 @@ def main():
     _ops_v = ops_juzhang.get(f"/bureau/cases/{_ops_ac['id']}/attachments", params={"includeVoided": "true"})
     ok(len(_ops_v) == 1 and _ops_v[0]["voided"] is True and _ops_v[0]["void_reason"] == "误传他案参保人病历"
        and _ops_v[0]["voided_by"] == "banban" and _ops_v[0]["voided_at"], "负责人 includeVoided 可见作废记录")
-    _ops_dl = requests.get(f"{BASE}/bureau/cases/attachments/{_ops_att['id']}/download", timeout=15,
+    _ops_dl = HTTP.get(f"{BASE}/bureau/cases/attachments/{_ops_att['id']}/download", timeout=15,
                            headers={"Authorization": f"Bearer {ops_banban.token}"})
     ok(_ops_dl.json()["code"] == 2135, "办案员下载作废件拒 2135")
-    _ops_dl2 = requests.get(f"{BASE}/bureau/cases/attachments/{_ops_att['id']}/download", timeout=15,
+    _ops_dl2 = HTTP.get(f"{BASE}/bureau/cases/attachments/{_ops_att['id']}/download", timeout=15,
                             headers={"Authorization": f"Bearer {ops_juzhang.token}"})
     ok(_ops_dl2.status_code == 200 and _ops_dl2.content.decode("utf-8") == "他案病历", "负责人仍可下载复核（文件未删）")
     ops_juzhang.post(f"/bureau/cases/{_ops_ac['id']}/attachments/{_ops_att['id']}/void",
@@ -1821,7 +1867,7 @@ def main():
        "明日起无记录")
     admin.get("/audit/logs", params={"from": "2026/01/01", "page": 1}, expect_code=2139)
     ok(admin.get("/audit/logs", params={"page": 1, "size": 9999})["size"] == 500, "size 上限 500")
-    _ops_csv = requests.get(f"{BASE}/bureau/audit/export", params={"month": str(today)[:7]}, timeout=15,
+    _ops_csv = HTTP.get(f"{BASE}/bureau/audit/export", params={"month": str(today)[:7]}, timeout=15,
                             headers={"Authorization": f"Bearer {admin.token}"})
     _ops_head = _ops_csv.content.decode("utf-8").splitlines()[0]
     ok(_ops_csv.status_code == 200 and _ops_head.endswith("时间,请求号"), f"月导出表头：{_ops_head}")

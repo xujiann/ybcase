@@ -5,7 +5,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
 @Slf4j
 @RestControllerAdvice(basePackages = "cn.ybcase")
@@ -27,11 +26,6 @@ public class BureauExceptionAdvice {
     public R<Void> handleDenied(AccessDeniedException e, jakarta.servlet.http.HttpServletRequest req) {
         req.setAttribute(BureauAuditFilter.BIZ_CODE_ATTR, 403);
         return R.fail(403, "当前角色无权执行该操作（批准/审核/决定类操作须相应岗位）");
-    }
-
-    @ExceptionHandler(MaxUploadSizeExceededException.class)
-    public R<Void> handleUpload(MaxUploadSizeExceededException e) {
-        return R.fail(2054, "附件超过服务端接收上限，请压缩后重传或改用外置存储模式");
     }
 
     /** 请求本身不合法（少传必填参数、类型不符、JSON 畸形）：给可读的业务提示而非 500 */

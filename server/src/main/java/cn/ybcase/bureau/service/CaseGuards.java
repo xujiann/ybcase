@@ -7,9 +7,24 @@ import cn.ybcase.bureau.repository.CaseFileRepository;
 import java.util.List;
 
 /** 案件状态守卫（拆分服务共用） */
-final class CaseGuards {
+public final class CaseGuards {
 
     private CaseGuards() {}
+
+    /** Acquire the case lock before reading state and keep it until the write transaction commits. */
+    public static void lock(org.springframework.jdbc.core.JdbcTemplate jdbc, Long id) {
+        if (!org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive())
+            throw new IllegalStateException("Case mutation must be transactional");
+        if (jdbc.queryForList("select id from case_file where id = ? for update", id).isEmpty())
+            throw new BizException(2043, "案件不存在");
+    }
+
+    public static void lockWritable(org.springframework.jdbc.core.JdbcTemplate jdbc, Long id) {
+        lock(jdbc, id);
+        var row = jdbc.queryForMap("select status, archive_no from case_file where id = ?", id);
+        if ("CLOSED".equals(row.get("status")) || row.get("archive_no") != null)
+            throw new BizException(2031, "案件已立卷归档，不可再增删卷内材料");
+    }
 
     static CaseFile get(CaseFileRepository repo, Long id) {
         return repo.findById(id).orElseThrow(() -> new BizException(2043, "案件不存在"));

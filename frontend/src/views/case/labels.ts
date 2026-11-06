@@ -1,7 +1,7 @@
 // 字典标签（与后端枚举一致）
 export const SOURCE: Record<string, string> = {
   INSPECTION: '监督检查', COMPLAINT: '投诉举报', TRANSFER: '部门移送',
-  ASSIGNED: '上级交办', MONITOR: '智能监控',
+  ASSIGNED: '上级交办', MONITOR: '智能监控', TRACE_CODE: '药品追溯码线索',
 }
 export const PARTY_TYPE: Record<string, string> = {
   AGENCY: '经办机构', PROVIDER: '定点医药机构', INDIVIDUAL: '自然人', OTHER: '其他主体',
@@ -53,19 +53,10 @@ export const REVIEW_OPINION: Record<string, string> = {
   AGREE: '同意', CONTINUE: '继续调查', CHANGE: '变更', CORRECT: '纠正', OTHER: '其他',
 }
 
-/** 时间戳展示：后端返回 ISO（带毫秒与时区偏移），直接塞进表格既难读又容易被误读为别的时刻 */
-/** JPA 实体里的 Instant 经 Jackson 恒输出 UTC（尾缀 Z），直接 slice(0,10) 在北京 0-8 点会得到前一天；按浏览器本地时区取日历日 */
-export function fmtDate(v?: string | null): string {
-  if (!v) return '—'
-  const d = new Date(String(v))
-  if (isNaN(d.getTime())) return String(v).slice(0, 10)
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
-}
+/** 日期保持日历日，带时区时间戳按浏览器本地时区展示。 */
+export { formatLocalDate as fmtDate, formatLocalDateTime as fmtTime } from '../../api/dates'
 
-export function fmtTime(v?: string | null): string {
-  if (!v) return '—'
-  const s = String(v)
-  // 只截到分钟：yyyy-MM-dd HH:mm（偏移已由服务端按业务时区给出，不再做二次换算）
-  return s.length >= 16 ? s.slice(0, 16).replace('T', ' ') : s
+export const EXECUTION_DEADLINE_STATE: Record<string, string> = {
+  UNCONFIRMED: '救济期限待确认', RELIEF_PENDING: '救济程序进行中', WAITING: '尚未进入申请期',
+  OPEN: '可申请法院强执', EXPIRED: '申请期限已过', APPLIED: '已申请，待法院结果', ACCEPTED: '法院已受理',
 }

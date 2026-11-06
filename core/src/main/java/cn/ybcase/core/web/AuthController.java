@@ -26,6 +26,8 @@ public class AuthController {
     private final JwtService jwtService;
     private final SysUserRepository userRepository;
     private final org.springframework.security.crypto.password.PasswordEncoder passwordEncoder;
+    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
+    private final jakarta.persistence.EntityManager entityManager;
 
     public record LoginRequest(@NotBlank String username, @NotBlank String password) {}
 
@@ -33,11 +35,27 @@ public class AuthController {
     private static final java.time.Duration LOCK_DURATION = java.time.Duration.ofMinutes(15);
 
     @PostMapping("/login")
+    @org.springframework.transaction.annotation.Transactional
     public R<Map<String, Object>> login(@RequestBody LoginRequest req, jakarta.servlet.http.HttpServletRequest http) {
         // 登录时 SecurityContext 里没有用户，审计过滤器拿不到用户名；把尝试登录的用户名与结果码
         // 放到请求属性里，让审计能区分"谁在爆破谁"。属性名与 server 侧 BureauAuditFilter 约定一致。
         http.setAttribute("ybcaseAuditUser", req.username());
-        var userOpt = userRepository.findByUsername(req.username());
+        // Authentication and its counters share the same row lock as administrator account updates.
+        // A failed attempt is counted from the latest committed row, rather than a stale detached entity.
+        var userOpt = lockUser(req.username());
+        if (userOpt.isEmpty()) {
+            // The absent-row lookup is this request's authentication boundary. A later account
+            // creation cannot turn it into an unlocked login, but still use the normal provider
+            // so unknown usernames retain its password-check timing.
+            try {
+                authenticationManager.authenticate(
+                        new UsernamePasswordAuthenticationToken(req.username(), req.password()));
+            } catch (BadCredentialsException | org.springframework.security.authentication.DisabledException expected) {
+                // An account created after the lookup does not belong to this login attempt.
+            }
+            http.setAttribute("ybcaseBizCode", 1001);
+            return R.fail(1001, "用户名或密码错误");
+        }
         if (userOpt.isPresent()) {
             var u = userOpt.get();
             if (u.getLockedUntil() != null && u.getLockedUntil().isAfter(java.time.Instant.now())) {
@@ -88,17 +106,30 @@ public class AuthController {
     public record ChangePasswordRequest(@NotBlank String oldPassword, @NotBlank String newPassword) {}
 
     @PostMapping("/change-password")
+    @org.springframework.transaction.annotation.Transactional
     public R<Void> changePassword(@RequestBody ChangePasswordRequest req, Authentication authentication) {
-        SysUser user = userRepository.findByUsername(authentication.getName()).orElseThrow();
+        if (req.oldPassword() == null || req.oldPassword().isBlank()) return R.fail(1003, "原密码不能为空");
+        if (req.newPassword() == null || req.newPassword().isBlank()) return R.fail(1004, "新密码不能为空");
+        if (authentication == null || !authentication.isAuthenticated())
+            throw new org.springframework.security.access.AccessDeniedException("需要登录后修改密码");
+        SysUser user = lockUser(authentication.getName()).orElseThrow(() ->
+                new org.springframework.security.access.AccessDeniedException("账号不存在或已停用"));
+        if (!Boolean.TRUE.equals(user.getEnabled())
+                || (authentication.getPrincipal() instanceof cn.ybcase.core.security.AuthUser principal
+                    && principal.getTokenVersion() != user.getTokenVersion()))
+            throw new org.springframework.security.access.AccessDeniedException("登录状态已变更，请重新登录");
         try {
             authenticationManager.authenticate(
                     new UsernamePasswordAuthenticationToken(user.getUsername(), req.oldPassword()));
+        } catch (org.springframework.security.authentication.DisabledException e) {
+            throw new org.springframework.security.access.AccessDeniedException("账号或所属机构已停用");
         } catch (BadCredentialsException e) {
             return R.fail(1003, "原密码错误");
         }
         if (req.newPassword().length() < 8
-                || !req.newPassword().matches(".*[a-zA-Z].*") || !req.newPassword().matches(".*\\d.*")) {
-            return R.fail(1004, "新密码须至少8位且包含字母和数字");
+                || !req.newPassword().matches(".*[a-zA-Z].*") || !req.newPassword().matches(".*\\d.*")
+                || req.newPassword().getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 72) {
+            return R.fail(1004, "新密码须至少8位、包含字母和数字，且UTF-8编码不超过72字节");
         }
         user.setPassword(passwordEncoder.encode(req.newPassword()));
         user.setPasswordUpdatedAt(java.time.Instant.now());
@@ -107,6 +138,15 @@ public class AuthController {
         user.setTokenVersion(user.getTokenVersion() + 1);
         userRepository.save(user);
         return R.ok();
+    }
+
+    private java.util.Optional<SysUser> lockUser(String username) {
+        // Lock only sys_user, without eager role/menu joins. No other account row is acquired here.
+        var rows = jdbc.queryForList("select id from sys_user where username=? for update", username);
+        if (rows.isEmpty()) return java.util.Optional.empty();
+        var user = userRepository.findById(((Number) rows.get(0).get("id")).longValue());
+        user.ifPresent(entityManager::refresh);
+        return user;
     }
 
     @GetMapping("/me")
@@ -130,6 +170,7 @@ public class AuthController {
                 "id", user.getId(),
                 "username", user.getUsername(),
                 "realName", user.getRealName(),
+                "accountCategory", java.util.Objects.toString(user.getAccountCategory(), ""),
                 "roles", user.getRoles().stream().map(r -> r.getCode()).toList(),
                 "mustChangePassword", Boolean.TRUE.equals(user.getMustChangePassword()),
                 "menus", menus));

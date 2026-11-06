@@ -39,7 +39,13 @@ docker run --rm -v "$SRC":/app -v ybcase_npm:/app/frontend/node_modules -w /app/
 # 备份提前到落盘之前：upgrade.sh 里的 pg_dump + pg_restore --list 校验随库增长可达数分钟，
 # 夹在"新产物已就位、容器还没重建"之间会把上面那段不一致窗口整体拉长。
 echo "[4/5] 升级前备份（回滚依据）"
-if [ -x "$DEPLOY/backup.sh" ]; then (cd "$DEPLOY" && ./backup.sh); fi
+if [ ! -x "$DEPLOY/backup.sh" ]; then echo '!! 缺少备份脚本，中止升级'; exit 1; fi
+(cd "$DEPLOY" && ./backup.sh)
+[ -s "$DEPLOY/ybcase-server.jar" ] || { echo '!! 缺少上一版本，中止升级'; exit 1; }
+ROLLBACK="$DEPLOY/rollback/$(date +%F-%H%M%S)"
+mkdir -p "$ROLLBACK"
+cp -p "$DEPLOY/ybcase-server.jar" "$DEPLOY/docker-compose.yml" "$DEPLOY/Caddyfile" "$ROLLBACK/"
+tar -C "$DEPLOY" -czf "$ROLLBACK/dist.tar.gz" dist
 
 echo "[4/5] 部署构建产物到 $DEPLOY"
 # 回滚点必须在覆盖之前留存：upgrade.sh 里再存就已经是新 jar 了（回滚等于没回滚）
@@ -53,15 +59,17 @@ cp "$SRC"/server/target/ybcase-server-*.jar "$DEPLOY/ybcase-server.jar.new"
 mv -f "$DEPLOY/ybcase-server.jar.new" "$DEPLOY/ybcase-server.jar"
 # 前端原地更新目录内容,不整体替换目录——否则换掉 inode 会让 Caddy 的 bind mount 失效(404)
 mkdir -p "$DEPLOY/dist"
-rm -rf "$DEPLOY/dist"/* "$DEPLOY/dist"/.[!.]* 2>/dev/null || true
-cp -r "$SRC/frontend/dist/." "$DEPLOY/dist/"
+find "$SRC/frontend/dist" -mindepth 1 -maxdepth 1 ! -name index.html -exec cp -r -t "$DEPLOY/dist/" {} +
+cp "$SRC/frontend/dist/index.html" "$DEPLOY/dist/index.html.new"
+mv -f "$DEPLOY/dist/index.html.new" "$DEPLOY/dist/index.html"
 # 同步最新的运维脚本与编排配置。
 # 此前只同步了两个脚本，compose/Caddyfile 的改动（时区、working_dir、日志轮转、安全头）
 # 永远到不了线上——源码改了、线上还是旧配置，且从部署日志完全看不出来。
 cp "$SRC"/deploy/upgrade.sh "$SRC"/deploy/backup.sh "$SRC"/deploy/healthcheck.sh "$DEPLOY/" && chmod +x "$DEPLOY"/upgrade.sh "$DEPLOY"/backup.sh "$DEPLOY"/healthcheck.sh
 CADDY_CHANGED=0
 if ! cmp -s "$SRC/deploy/Caddyfile" "$DEPLOY/Caddyfile"; then CADDY_CHANGED=1; fi
-cp "$SRC"/deploy/docker-compose.yml "$SRC"/deploy/Caddyfile "$DEPLOY/"
+cp "$SRC/deploy/docker-compose.yml" "$DEPLOY/"
+cat "$SRC/deploy/Caddyfile" > "$DEPLOY/Caddyfile"
 
 echo "[5/5] 重启 + 健康检查"
 cd "$DEPLOY" && ./upgrade.sh --skip-backup

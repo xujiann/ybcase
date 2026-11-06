@@ -31,6 +31,13 @@ public class SysDept {
     @Column(nullable = false, length = 16)
     private String type;
 
+    /** Administrative organization classification; null preserves legacy department entries. */
+    @Column(length = 16)
+    private String orgKind;
+
+    @Column(length = 1000)
+    private String responsibility;
+
     private Integer sortNo = 0;
 
     @Column(nullable = false)

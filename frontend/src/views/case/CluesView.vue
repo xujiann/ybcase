@@ -11,13 +11,18 @@
         <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 130px; margin-right: 8px" @change="reload">
           <el-option v-for="(v, k) in CLUE_STATUS" :key="k" :label="v" :value="k" />
         </el-select>
-        <el-button @click="onImport">监控疑点导入</el-button>
-        <el-button type="primary" @click="createVisible = true">登记线索</el-button>
+        <el-select v-model="sourceFilter" clearable placeholder="全部来源" style="width: 150px; margin-right: 8px" @change="reload">
+          <el-option v-for="(v, k) in SOURCE" :key="k" :label="v" :value="k" />
+        </el-select>
+        <el-button v-if="canPullMonitor" :loading="pullingMonitor" @click="onPullMonitor">拉取监控疑点</el-button>
+        <el-button v-if="canOperate" @click="onImport">监控疑点导入</el-button>
+        <el-button v-if="canOperate" type="primary" @click="createVisible = true">登记线索</el-button>
       </div>
     </div>
-    <el-table :data="records" v-loading="loading" border stripe>
+    <el-alert v-if="failed" type="error" :closable="false" title="线索列表加载失败，请重新搜索或筛选重试。" />
+    <el-table :data="records" v-loading="loading" border stripe :empty-text="failed ? '加载失败' : '暂无数据'">
       <el-table-column prop="clueNo" label="线索编号" width="120" />
-      <el-table-column label="来源" width="100">
+      <el-table-column label="来源" width="125">
         <template #default="{ row }">{{ SOURCE[row.source] || row.source }}</template>
       </el-table-column>
       <el-table-column prop="suspectName" label="违法嫌疑人" width="160" />
@@ -40,13 +45,14 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="290">
+      <el-table-column label="操作" width="360">
         <template #default="{ row }">
+          <el-button size="small" @click="openMaterials(row)">材料</el-button>
           <template v-if="row.status === 'PENDING'">
-            <el-button size="small" type="primary" @click="toFile(row)">立案</el-button>
-            <el-button size="small" :disabled="row.extended" @click="onExtend(row)">延期</el-button>
-            <el-button size="small" @click="onExclusion(row)">期限扣除</el-button>
-            <el-button size="small" type="warning" @click="onReject(row)">不予立案</el-button>
+            <el-button v-if="canManageClue(row)" size="small" type="primary" @click="toFile(row)">立案</el-button>
+            <el-button v-if="canManageClue(row)" size="small" :disabled="row.extended" @click="onExtend(row)">申请延期</el-button>
+            <el-button v-if="canManageClue(row)" size="small" @click="onExclusion(row)">期限扣除</el-button>
+            <el-button v-if="canManageClue(row)" size="small" type="warning" @click="onReject(row)">不予立案</el-button>
           </template>
           <span v-else class="hint">{{ row.verifyResult || '-' }}</span>
         </template>
@@ -54,8 +60,9 @@
     </el-table>
     <el-pagination style="margin-top: 12px; justify-content: flex-end"
                    layout="total, prev, pager, next" :total="total" :page-size="pageSize"
-                   :current-page="page" @current-change="(p: number) => { page = p; load() }" />
+                   :current-page="page" @current-change="changePage" />
 
+    <PrecaseAttachments v-model:visible="materialsVisible" :source="materialsSource" />
     <el-dialog v-model="createVisible" title="登记线索" width="560px">
       <el-form :model="form" label-width="90px">
         <el-form-item label="线索来源">
@@ -83,23 +90,48 @@
       </el-form>
       <template #footer>
         <el-button @click="createVisible = false">取消</el-button>
-        <el-button type="primary" @click="onCreate" :loading="submitting">保存</el-button>
+        <el-button v-if="canOperate" type="primary" @click="onCreate" :loading="submitting">保存</el-button>
       </template>
     </el-dialog>
   </el-card>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import client from '../../api/client'
+import { useAuthStore } from '../../stores/auth'
+import { caseOperationAccess } from '../../api/caseWriteAccess'
+import PrecaseAttachments from '../../components/PrecaseAttachments.vue'
+import { canWritePrecase, type PrecaseSource } from '../../api/precaseAttachments'
 import { CLUE_STATUS, PARTY_TYPE, SOURCE } from './labels'
 
+const auth = useAuthStore()
+const canOperate = computed(() => caseOperationAccess(auth.user?.roles))
+const canPullMonitor = computed(() => auth.user?.accountCategory === 'BUREAU'
+  && auth.user.roles.some(role => ['LEADER', 'ADMIN'].includes(role)))
+const pullingMonitor = ref(false)
+function canManageClue(row: any) {
+  return canWritePrecase(auth.user?.roles, auth.user?.username, { type: 'clues', id: row.id, status: row.status, owner: row.createdBy, handler: row.handler }, false)
+}
+
+
+const materialsVisible = ref(false)
+const materialsSource = ref<PrecaseSource>({ id: 0, type: 'clues' })
+function openMaterials(row: any) {
+  materialsSource.value = { id: row.id, type: 'clues', status: row.status, owner: row.createdBy, handler: row.handler }
+  materialsVisible.value = true
+}
 const router = useRouter()
 const records = ref<any[]>([])
 const loading = ref(false)
+const failed = ref(false)
+let loadGeneration = 0
+let disposed = false
+onUnmounted(() => { disposed = true; loadGeneration++; loading.value = false })
 const statusFilter = ref('')
+const sourceFilter = ref('')
 const createVisible = ref(false)
 const submitting = ref(false)
 function todayLocal() {
@@ -121,27 +153,42 @@ function reload() {
 }
 
 async function load() {
+  if (disposed) return
+  const run = ++loadGeneration
   loading.value = true
+  failed.value = false
+  records.value = []
   try {
     const params: any = { page: page.value, size: pageSize }
     if (statusFilter.value) params.status = statusFilter.value
+    if (sourceFilter.value) params.source = sourceFilter.value
     if (q.value.trim()) params.q = q.value.trim()
     if (range.value?.[0]) params.from = range.value[0]
     if (range.value?.[1]) params.to = range.value[1]
     const resp = await client.get('/bureau/clues', { params })
+    if (run !== loadGeneration) return
     // 分页接口返回 snake_case 行（JdbcTemplate），统一映射为模板与操作按钮读取的驼峰字段
     records.value = resp.data.data.rows.map((r: any) => ({
       id: r.id, clueNo: r.clue_no, source: r.source, suspectName: r.suspect_name, suspectType: r.suspect_type,
       content: r.content, receivedAt: r.received_at, deadlineAt: r.deadline_at, extended: r.extended,
-      status: r.status, verifyResult: r.verify_result,
+      createdBy: r.created_by, handler: r.handler, status: r.status, verifyResult: r.verify_result,
     }))
     total.value = resp.data.data.total
+  } catch {
+    if (run === loadGeneration) { records.value = []; total.value = 0; page.value = 1; failed.value = true }
   } finally {
-    loading.value = false
+    if (run === loadGeneration) loading.value = false
   }
 }
 
+function changePage(value: number) {
+  if (value === page.value) return
+  page.value = value
+  return load()
+}
+
 async function onCreate() {
+  if (!canOperate.value) return
   // 防重：连点或 15s 超时后的重试会生成两条连号且无法删除的记录
   if (submitting.value) return
   submitting.value = true
@@ -162,32 +209,59 @@ async function onCreate() {
 }
 
 async function onExclusion(row: any) {
+  if (!canManageClue(row)) return
   // 鉴定/检验期间不计入核查期限（辽15条）——此前只有后端接口，UI 无入口
   const { value: days } = await ElMessageBox.prompt(
     '不计入核查期限的天数（鉴定、检验等，辽15条）', '期限扣除',
     { inputPattern: /^[1-9]\d*$/, inputErrorMessage: '请填写正整数天数' })
   const { value: reason } = await ElMessageBox.prompt('扣除事由', '期限扣除',
     { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  if (!canManageClue(row)) return
   await client.post(`/bureau/clues/${row.id}/exclusions`, { days: Number(days), reason })
   ElMessage.success('已登记扣除，核查期限相应顺延')
   load()
 }
 
 async function onExtend(row: any) {
+  if (!canManageClue(row)) return
   const { value } = await ElMessageBox.prompt('特殊情况说明（经主要负责人批准，延长 15 个工作日）', '核查延期', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  await client.post(`/bureau/clues/${row.id}/extend`, { reason: value })
-  ElMessage.success('已延期')
+  if (!canManageClue(row)) return
+  await client.post('/bureau/approvals', { kind: 'CLUE_EXTEND', clueId: row.id, reason: value, payload: {} })
+  ElMessage.success('已提交延期审批')
   load()
 }
 
 async function onReject(row: any) {
+  if (!canManageClue(row)) return
   const { value } = await ElMessageBox.prompt('核查结果（不予立案理由）', '不予立案', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+  if (!canManageClue(row)) return
   await client.post(`/bureau/clues/${row.id}/reject`, { verifyResult: value })
   ElMessage.success('已办结')
   load()
 }
 
+async function onPullMonitor() {
+  if (!canPullMonitor.value || pullingMonitor.value) return
+  const token = auth.token, userId = auth.user?.id
+  pullingMonitor.value = true
+  try {
+    const { data } = await client.post('/bureau/clues/fetch-monitor')
+    if (auth.token !== token || auth.user?.id !== userId || !canPullMonitor.value) return
+    if (data.data.adapter === 'MockMonitorFeedAdapter') {
+      ElMessage.warning('监控疑点网关尚未启用')
+      return
+    }
+    ElMessage.success(`已导入 ${data.data.fetched} 条，跳过重复 ${data.data.skipped ?? 0} 条`)
+    reload()
+  } catch {
+    // The shared client reports the request failure.
+  } finally {
+    pullingMonitor.value = false
+  }
+}
+
 async function onImport() {
+  if (!canOperate.value) return
   const { value } = await ElMessageBox.prompt(
     '粘贴智能监控疑点 JSON 数组：[{"suspectName":"…","suspectType":"PROVIDER","content":"…"}]',
     '批量导入线索', { inputType: 'textarea', inputPattern: /^\s*\[/, inputErrorMessage: '须为 JSON 数组' })
@@ -208,6 +282,7 @@ async function onImport() {
 }
 
 function toFile(row: any) {
+  if (!canManageClue(row)) return
   router.push({ path: '/case/list', query: { clueId: row.id, suspectName: row.suspectName, suspectType: row.suspectType } })
 }
 

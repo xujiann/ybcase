@@ -11,4 +11,9 @@ public interface UserDeactivationGuard {
 
     /** 返回阻止停用的理由清单（面向管理员的完整提示语）；空/null 表示放行 */
     List<String> blockers(String username);
+
+    /** Business modules can reject removal of roles needed to finish existing work. */
+    default List<String> roleChangeBlockers(String username, List<String> newRoleCodes) {
+        return List.of();
+    }
 }

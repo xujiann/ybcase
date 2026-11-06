@@ -25,6 +25,10 @@ import static org.junit.jupiter.api.Assertions.*;
 @ActiveProfiles("test")
 class CorrectionIntegrationTest {
 
+    @org.junit.jupiter.api.BeforeEach
+    void ensureRealCreator() { FixtureUsers.ensure(jdbc, "it", "HANDLER"); }
+
+
     @Autowired CaseService caseService;
     @Autowired ClueService clueService;
     @Autowired DocumentService documentService;

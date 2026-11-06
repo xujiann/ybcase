@@ -35,6 +35,9 @@ public class SysUser {
 
     private Long deptId;
 
+    @Column(length = 16)
+    private String accountCategory;
+
     @Column(length = 32)
     private String phone;
 

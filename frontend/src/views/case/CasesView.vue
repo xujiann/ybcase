@@ -15,10 +15,11 @@
                      :label="`${ownerLabel(o.username)} ${o.active_cases} 件在办`" />
         </el-select>
         <el-button v-if="isLeader" style="margin-right: 8px" @click="openTransfer">批量移交</el-button>
-        <el-button type="primary" @click="openCreate()">{{ isLeader ? '立案' : '申请立案' }}</el-button>
+        <el-button v-if="canOperate" type="primary" @click="openCreate()">{{ isLeader ? '立案' : '申请立案' }}</el-button>
       </div>
     </div>
-    <el-table :data="records" v-loading="loading" border stripe @row-click="(r: any) => $router.push(`/case/detail/${r.id}`)">
+    <el-alert v-if="failed" type="error" :closable="false" title="案件列表加载失败，请重新搜索或筛选重试。" />
+    <el-table :data="records" v-loading="loading" border stripe :empty-text="failed ? '加载失败' : '暂无数据'" @row-click="(r: any) => $router.push(`/case/detail/${r.id}`)">
       <el-table-column prop="caseNo" label="案号" width="170" />
       <el-table-column prop="name" label="案件名称" show-overflow-tooltip />
       <el-table-column label="承办人" width="120" show-overflow-tooltip>
@@ -41,9 +42,9 @@
     </el-table>
     <el-pagination style="margin-top: 12px; justify-content: flex-end"
                    layout="total, prev, pager, next" :total="total" :page-size="pageSize"
-                   :current-page="page" @current-change="(p: number) => { page = p; load() }" />
+                   :current-page="page" @current-change="changePage" />
 
-    <el-dialog v-model="createVisible" :title="isLeader ? '立案（执法人员不得少于两人）' : '立案申请（提交负责人批准后建案，第17条）'" width="640px">
+    <el-dialog v-model="createVisible" @closed="form.institution = { code: '', ownership: '', grade: '', kind: null }" :title="isLeader ? '立案（执法人员不得少于两人）' : '立案申请（提交负责人批准后建案，第17条）'" width="760px" style="max-width: 95vw">
       <el-form :model="form" label-width="110px">
         <el-form-item label="当事人名称">
           <el-input v-model="form.partyName" />
@@ -53,6 +54,32 @@
             <el-option v-for="(v, k) in PARTY_TYPE" :key="k" :label="v" :value="k" />
           </el-select>
         </el-form-item>
+        <template v-if="form.partyType === 'PROVIDER'">
+          <el-form-item label="机构编码" required>
+            <el-input v-model="form.institution.code" maxlength="64" />
+          </el-form-item>
+          <el-form-item label="机构类型">
+            <el-select v-model="form.institution.kind" clearable placeholder="请选择">
+              <el-option label="医疗机构" value="MEDICAL" />
+              <el-option label="单体药店" value="SINGLE_PHARMACY" />
+              <el-option label="连锁药店" value="CHAIN_PHARMACY" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="机构性质" required>
+            <el-select v-model="form.institution.ownership">
+              <el-option label="公立" value="PUBLIC" />
+              <el-option label="社会办" value="SOCIAL" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="机构等级" required>
+            <el-select v-model="form.institution.grade">
+              <el-option label="三级" value="TERTIARY" />
+              <el-option label="二级" value="SECONDARY" />
+              <el-option label="一级" value="PRIMARY" />
+              <el-option label="未定级" value="UNGRADED" />
+            </el-select>
+          </el-form-item>
+        </template>
         <el-form-item label="案由">
           <el-select v-model="form.causeId" style="width: 100%" filterable placeholder="按当事人类别筛选">
             <el-option v-for="c in causes.filter((x) => x.subjectType === form.partyType)" :key="c.id"
@@ -94,6 +121,7 @@
         <el-form-item label="案情摘要">
           <el-input v-model="form.summary" type="textarea" :rows="3" />
         </el-form-item>
+        <JurisdictionForm v-model="form.jurisdiction" />
         <el-form-item label="办案人员">
           <div style="width: 100%">
             <div v-for="(o, i) in form.officers" :key="i" class="officer-row">
@@ -111,7 +139,7 @@
       </el-form>
       <template #footer>
         <el-button @click="createVisible = false">取消</el-button>
-        <el-button type="primary" @click="onCreate" :loading="submitting">{{ isLeader ? '立案' : '提交申请' }}</el-button>
+        <el-button v-if="canOperate" type="primary" @click="onCreate" :loading="submitting">{{ isLeader ? '立案' : '提交申请' }}</el-button>
       </template>
     </el-dialog>
 
@@ -141,16 +169,20 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import client from '../../api/client'
+import { caseOperationAccess } from '../../api/caseWriteAccess'
+import JurisdictionForm from '../../components/JurisdictionForm.vue'
+import { emptyJurisdiction, jurisdictionError, serializeJurisdiction } from '../../api/jurisdiction'
 import { CASE_STATUS, CASE_STATUS_TAG, PARTY_TYPE } from './labels'
 import { useAuthStore } from '../../stores/auth'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+const canOperate = computed(() => caseOperationAccess(auth.user?.roles))
 // 第17条：立案须负责人批准。负责人可直接立案（后端补记"负责人直接批准"审批单），
 // 办案人员则提交立案申请，由负责人在审批中心批准后建案——否则补记的就是一张 approver 为自己的假批准单
 const isLeader = computed(() => auth.user?.roles?.some((r: string) => ['LEADER', 'ADMIN'].includes(r)))
@@ -180,6 +212,7 @@ async function loadOwners() {
 watch(isPrivileged, (v) => { if (v && !owners.value.length) loadOwners() })
 
 async function openTransfer() {
+  if (!isLeader.value) return
   transfer.fromOwner = ownerFilter.value
   transfer.toOwner = ''
   const [o, c] = await Promise.all([client.get('/bureau/owners'), client.get('/bureau/owners/candidates')])
@@ -189,6 +222,7 @@ async function openTransfer() {
 }
 
 async function onTransfer() {
+  if (!isLeader.value) return
   if (!transfer.fromOwner || !transfer.toOwner) {
     ElMessage.warning('请选择移出承办人与接收人')
     return
@@ -207,6 +241,10 @@ async function onTransfer() {
 }
 const causes = ref<any[]>([])
 const loading = ref(false)
+const failed = ref(false)
+let loadGeneration = 0
+let disposed = false
+onUnmounted(() => { disposed = true; loadGeneration++; loading.value = false })
 const statusFilter = ref('')
 const createVisible = ref(false)
 const submitting = ref(false)
@@ -224,18 +262,25 @@ const form = reactive<any>({
   partyName: '', partyType: 'PROVIDER', partyCreditNo: '', partyAddress: '',
   partyLegalRep: '', partyContact: '', summary: '', amountInvolved: 0,
   enforceItemId: null, violationEndDate: null, healthHarm: false,
+  jurisdiction: emptyJurisdiction(),
   officers: emptyOfficers(),
+  institution: { code: '', ownership: '', grade: '', kind: null },
 })
 const enforceItems = ref<any[]>([])
 
 async function load() {
+  if (disposed) return
+  const run = ++loadGeneration
   loading.value = true
+  failed.value = false
+  records.value = []
   try {
     const params: any = { page: page.value, size: pageSize }
     if (statusFilter.value) params.status = statusFilter.value
     if (q.value.trim()) params.q = q.value.trim()
     if (ownerFilter.value) params.owner = ownerFilter.value
     const resp = await client.get('/bureau/cases', { params })
+    if (run !== loadGeneration) return
     // 分页接口返回 snake_case 行（JdbcTemplate），统一映射展示字段
     records.value = resp.data.data.rows.map((r: any) => ({
       id: r.id, caseNo: r.case_no, name: r.name, partyType: r.party_type,
@@ -243,12 +288,22 @@ async function load() {
       status: r.status, amountInvolved: r.amount_involved, ownerUser: r.owner_user,
     }))
     total.value = resp.data.data.total
+  } catch {
+    if (run === loadGeneration) { records.value = []; total.value = 0; page.value = 1; failed.value = true }
   } finally {
-    loading.value = false
+    if (run === loadGeneration) loading.value = false
   }
 }
 
+function changePage(value: number) {
+  if (value === page.value) return
+  page.value = value
+  return load()
+}
+
 function openCreate(fromClue = false) {
+  if (!canOperate.value) return
+  form.jurisdiction = emptyJurisdiction()
   form.officers = emptyOfficers()
   // 从线索跳转以外的入口必须清掉线索关联，否则新案会把上次那条线索标记为已立案
   if (!fromClue) {
@@ -259,6 +314,7 @@ function openCreate(fromClue = false) {
 }
 
 async function onCreate() {
+  if (!canOperate.value) return
   // 防重：连点或 15s 超时后的重试会生成两条连号且无法删除的记录
   if (submitting.value) return
   submitting.value = true
@@ -271,18 +327,26 @@ async function onCreate() {
       ElMessage.warning('办案人员须填写姓名与执法证号')
       return
     }
+    const error = jurisdictionError(form.jurisdiction)
+    if (error) { ElMessage.warning(error); return }
+    const institution = form.partyType === 'PROVIDER' ? { ...form.institution, kind: form.institution.kind || null } : null
+    if (institution && (!institution.code.trim() || !institution.ownership || !institution.grade)) {
+      ElMessage.warning('请填写机构编码、性质和等级')
+      return
+    }
+    const payload = { ...form, institution, reportingDetailsRequired: true, jurisdiction: serializeJurisdiction(form.jurisdiction) }
     if (!isLeader.value) {
       // 办案人员：提交 FILE_CASE 审批单，负责人批准时才真正建案（ApprovalService.execute）
       await client.post('/bureau/approvals', {
         kind: 'FILE_CASE', clueId: form.clueId || null,
-        payload: { ...form }, reason: `立案申请：${form.partyName}`,
+        payload, reason: `立案申请：${form.partyName}`,
       })
       ElMessage.success('立案申请已提交，待负责人批准后自动建案')
       createVisible.value = false
       router.push('/case/approvals')
       return
     }
-    const resp = await client.post('/bureau/cases', form)
+    const resp = await client.post('/bureau/cases', payload)
     ElMessage.success(`已立案：${resp.data.data.caseNo}`)
     createVisible.value = false
     router.push(`/case/detail/${resp.data.data.id}`)

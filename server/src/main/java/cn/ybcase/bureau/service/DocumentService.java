@@ -7,6 +7,8 @@ import cn.ybcase.bureau.repository.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.util.*;
@@ -22,6 +24,8 @@ public class DocumentService {
     private final CaseDecisionRepository decisionRepository;
     private final BureauConfig config;
     private final JdbcTemplate jdbc;
+    private final MaterialAccess materialAccess;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     /** 案卷装订顺序（一案一卷，按文书类型排序，第57条） */
     private static final List<String> ARCHIVE_ORDER = List.of(
@@ -55,7 +59,11 @@ public class DocumentService {
             "TERMINATE", "终止调查审批表", "DEFER", "暂缓分期缴纳审批表");
 
     /** 按模板渲染文书草稿 */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Map<String, String> render(Long caseId, String docType) {
+        materialAccess.requireCurrentCaseReader(caseId);
+        if (docType == null || docType.isBlank() || docType.indexOf('\0') >= 0 || docType.codePointCount(0, docType.length()) > 32)
+            throw new BizException(2053, "该文书类型无模板，可直接手工制作");
         CaseFile c = caseRepository.findById(caseId)
                 .orElseThrow(() -> new BizException(2043, "案件不存在"));
         var rows = jdbc.queryForList("select title_tpl, content_tpl from doc_template where doc_type = ?", docType);
@@ -74,10 +82,15 @@ public class DocumentService {
         vars.put("partyTypeText", switch (c.getPartyType()) {
             case "AGENCY" -> "经办机构"; case "PROVIDER" -> "定点医药机构";
             case "INDIVIDUAL" -> "自然人"; default -> "其他主体"; });
-        vars.put("summary", nv(c.getSummary()));
-        vars.put("amountInvolved", c.getAmountInvolved() == null ? "0" : c.getAmountInvolved().toPlainString());
+        boolean decisionDocument = "DECISION".equals(docType) && decision != null;
+        vars.put("summary", decisionDocument && c.getConfirmedViolationFacts() != null
+                ? c.getConfirmedViolationFacts() : nv(c.getSummary()));
+        var amount = decisionDocument && c.getConfirmedViolationAmount() != null
+                ? c.getConfirmedViolationAmount() : c.getAmountInvolved();
+        vars.put("amountInvolved", amount == null ? "0" : amount.toPlainString());
         vars.put("causeText", cause == null ? "" : cause.getCategory() + "——" + cause.getDescription());
-        vars.put("basisText", basisText(c));
+        vars.put("basisText", decisionDocument && decision.getPenaltyBasis() != null
+                ? decision.getPenaltyBasis() : basisText(c));
         vars.put("orgName", config.str("org_name", "医疗保障局"));
         vars.put("today", LocalDate.now().toString());
         vars.put("statementDays", String.valueOf(config.intVal("statement_deadline_days", 3)));
@@ -102,12 +115,16 @@ public class DocumentService {
      * 最先被翻的必备件，此前一件都不进卷内目录与合成打印，办案人只能逐个页面截屏手工插页。
      * 去重：同类型若已有手工录入的文书，以手工件为准，不再重复上目录。
      */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public List<Map<String, Object>> archiveEntries(Long caseId) {
+        materialAccess.requireCurrentCaseReader(caseId);
         return archiveEntries(caseId, true);
     }
 
     /** withContent=false 时不返回正文：卷内目录只用类型/标题/日期，正文只有合成打印才需要 */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public List<Map<String, Object>> archiveEntries(Long caseId, boolean withContent) {
+        materialAccess.requireCurrentCaseReader(caseId);
         List<Map<String, Object>> all = archiveEntriesFull(caseId);
         if (!withContent) all.forEach(e -> e.remove("content"));
         return all;
@@ -135,7 +152,9 @@ public class DocumentService {
     }
 
     /** 案卷目录：按法定顺序编排 + 必备文书齐全性检查 */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Map<String, Object> archiveCatalog(Long caseId) {
+        materialAccess.requireCurrentCaseReader(caseId);
         CaseFile c = caseRepository.findById(caseId)
                 .orElseThrow(() -> new BizException(2043, "案件不存在"));
         List<Map<String, Object>> docs = archiveEntries(caseId, false);
@@ -174,33 +193,59 @@ public class DocumentService {
      * 两处若各写一遍，任何对审核范围的调整都会让"能不能决定"与"卷齐不齐"再次漂移。
      */
     public boolean legalReviewRequired(Long caseId, CaseDecision d) {
+        return legalReviewRequired(caseId, d == null ? null : d.getFineAmount(),
+                d == null ? null : d.getRecoupAmount(), d == null ? null : d.getConfiscateAmount());
+    }
+
+    public boolean legalReviewRequired(Long caseId, java.math.BigDecimal fineAmount,
+                                      java.math.BigDecimal recoupAmount, java.math.BigDecimal confiscateAmount) {
         if ("ALL".equalsIgnoreCase(config.str("legal_review_mode", "THRESHOLD"))) return true;
         // 与 CaseService.punitiveAmount 同口径：没收违法所得计入"数额较大"（参数可关）
-        java.math.BigDecimal fine = d == null || d.getFineAmount() == null
-                ? java.math.BigDecimal.ZERO : d.getFineAmount();
-        java.math.BigDecimal conf = d == null || d.getConfiscateAmount() == null
-                ? java.math.BigDecimal.ZERO : d.getConfiscateAmount();
+        java.math.BigDecimal fine = fineAmount == null ? java.math.BigDecimal.ZERO : fineAmount;
+        java.math.BigDecimal conf = confiscateAmount == null ? java.math.BigDecimal.ZERO : confiscateAmount;
         java.math.BigDecimal punitive = config.bool("threshold_include_confiscate", true)
                 ? fine.add(conf) : fine;
         if (punitive.compareTo(config.decimal("legal_review_fine_threshold", "100000")) >= 0) return true;
+        if (recoupAmount != null && recoupAmount.compareTo(config.decimal("legal_review_recoup_threshold", "100000")) >= 0)
+            return true;
         Integer held = jdbc.queryForObject(
-                "select count(*) from case_notice where case_id = ? and hearing_held_at is not null",
+                "select count(*) from case_hearing where case_id = ? and status in ('HELD','OPINION_DONE') and held_at <= current_date and coalesce(btrim(record),'') <> ''",
                 Integer.class, caseId);
         return held != null && held > 0;
+    }
+
+    /** Always render the approved application's snapshot; current case corrections must not rewrite filing history. */
+    private String filingJurisdictionSnapshot(Object payload) {
+        if (payload == null) return "\n管辖事实：历史审批未载明（请另查补录/更正记录）";
+        try {
+            var facts = objectMapper.readTree(payload.toString()).path("jurisdiction");
+            if (!facts.isObject()) return "\n管辖事实：历史审批未载明（请另查补录/更正记录）";
+            String type = facts.path("type").asText("PENDING");
+            StringBuilder text = new StringBuilder("\n管辖事实（立案审批时快照，仅记录事实）：")
+                    .append("\n管辖分类：").append(CaseService.JURISDICTION_TYPE_LABELS.getOrDefault(type, type));
+            String[][] fields = {{"basis", "管辖依据"}, {"violationPlace", "违法行为地"}, {"treatmentPlace", "就医地"},
+                    {"insuredPlace", "参保地"}, {"designatedNo", "指定管辖文号"}, {"disputeNote", "管辖争议及处理情况"}};
+            for (String[] field : fields)
+                text.append("\n").append(field[1]).append("：").append(facts.path(field[0]).asText("（未记录）"));
+            return text.toString();
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            return "\n管辖事实：历史审批快照无法解析，请核查原审批单";
+        }
     }
 
     /** 由结构化记录渲染的虚拟卷内件（不落库，随查随生成） */
     private List<Map<String, Object>> recordEntries(Long caseId) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (var a : jdbc.queryForList("""
-                select kind, reason, applicant, approver, opinion, decided_at
+                select kind, reason, applicant, approver, opinion, decided_at, payload
                 from biz_approval where case_id = ? and status = 'APPROVED' order by id""", caseId)) {
             String kind = (String) a.get("kind");
             out.add(entry("FILE_CASE".equals(kind) ? "FILING_APPROVAL" : "APPROVAL_FORM",
                     APPROVAL_KIND_NAMES.getOrDefault(kind, "审批表"),
                     "申请人：" + sv(a.get("applicant")) + "\n申请事由：" + sv(a.get("reason"))
                             + "\n批准人：" + sv(a.get("approver")) + "\n批准意见：" + sv(a.get("opinion"))
-                            + "\n批准时间：" + dt(a.get("decided_at")),
+                            + "\n批准时间：" + dt(a.get("decided_at"))
+                            + ("FILE_CASE".equals(kind) ? filingJurisdictionSnapshot(a.get("payload")) : ""),
                     dt(a.get("decided_at")), sv(a.get("approver"))));
         }
         // 告知书与决定书同样只存在于 case_notice / case_decision：不手工制作文书就不进卷，
@@ -254,12 +299,14 @@ public class DocumentService {
                     dt(dd.get("decided_at")), ""));
         }
         for (var r : jdbc.queryForList("""
-                select reviewer, opinion_type, opinion, submitted_at, reviewed_at, required_reason, passed
+                select id, reviewer, opinion_type, opinion, submitted_at, reviewed_at, required_reason, passed, material_fingerprint
                 from case_review where case_id = ? and reviewed_at is not null order by id""", caseId)) {
             out.add(entry("LEGAL_OPINION", "法制审核意见书",
                     "审核事由：" + sv(r.get("required_reason")) + "\n提交日期：" + dt(r.get("submitted_at"))
                             + "\n审核人：" + sv(r.get("reviewer")) + "\n意见类型：" + sv(r.get("opinion_type"))
                             + "\n审核意见：" + sv(r.get("opinion"))
+                            + "\n送审记录：#" + sv(r.get("id")) + "\n送审材料指纹："
+                            + (r.get("material_fingerprint") == null ? "历史记录未绑定材料版本" : sv(r.get("material_fingerprint")))
                             + "\n结论：" + (Boolean.TRUE.equals(r.get("passed")) ? "通过" : "未通过"),
                     dt(r.get("reviewed_at")), sv(r.get("reviewer"))));
         }
@@ -355,7 +402,9 @@ public class DocumentService {
     }
 
     /** 案件大事记：全过程记录时间轴 */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public List<Map<String, Object>> timeline(Long caseId) {
+        materialAccess.requireCurrentCaseReader(caseId);
         CaseFile c = caseRepository.findById(caseId)
                 .orElseThrow(() -> new BizException(2043, "案件不存在"));
         List<Map<String, Object>> events = new ArrayList<>();

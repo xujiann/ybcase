@@ -36,6 +36,22 @@ public class CaseFile {
     @Column(nullable = false)
     private Long causeId;
 
+    /** Recorded jurisdiction facts; PENDING preserves legacy and incomplete cases without blocking them. */
+    @Column(nullable = false, length = 24)
+    private String jurisdictionType = "PENDING";
+    @Column(length = 2000)
+    private String jurisdictionBasis;
+    @Column(length = 255)
+    private String violationPlace;
+    @Column(length = 255)
+    private String treatmentPlace;
+    @Column(length = 255)
+    private String insuredPlace;
+    @Column(length = 128)
+    private String designatedNo;
+    @Column(length = 2000)
+    private String jurisdictionDisputeNote;
+
     /** NORMAL 普通程序 / SUMMARY 简易程序 */
     @Column(nullable = false, length = 16)
     private String procedureType = "NORMAL";
@@ -48,6 +64,25 @@ public class CaseFile {
 
     @Column(length = 64)
     private String partyCreditNo;
+
+    @Column(length = 64)
+    private String institutionCode;
+
+    @Column(nullable = false)
+    private boolean reportingDetailsRequired;
+    @Column(length = 16)
+    private String institutionOwnership;
+    @Column(length = 16)
+    private String institutionGrade;
+    @Column(length = 16)
+    private String institutionKind;
+
+    private LocalDate confirmedViolationStart;
+    private LocalDate confirmedViolationEnd;
+    @Column(columnDefinition = "text")
+    private String confirmedViolationFacts;
+    @Column(precision = 14, scale = 2)
+    private BigDecimal confirmedViolationAmount;
 
     @Column(length = 255)
     private String partyAddress;
@@ -110,6 +145,19 @@ public class CaseFile {
     /** 已申请法院强制执行（第55条） */
     @Column(nullable = false)
     private Boolean courtEnforceApplied = false;
+    private String courtEnforceStatus;
+    private LocalDate courtAppliedAt;
+    private String courtReceiptNo;
+    private LocalDate courtReceivedAt;
+    @Column(columnDefinition = "text")
+    private String courtResultNote;
+    private LocalDate reliefDeadline;
+    @Column(nullable = false)
+    private Boolean reliefPending = false;
+    @Column(columnDefinition = "text")
+    private String reliefBasis;
+    private String reliefRegisteredBy;
+    private LocalDate deferUntil;
 
     /** 关联执法事项（2024年版清单） */
     private Long enforceItemId;

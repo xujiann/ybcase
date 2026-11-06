@@ -1,5 +1,6 @@
 <template>
   <div v-loading="loading">
+    <el-alert v-if="failed" type="error" :closable="false" title="工作台加载失败，请重新进入本页重试。" class="mb" />
     <el-row :gutter="12" class="mb">
       <el-col :span="6">
         <el-card><div class="stat-label">我的在办案件</div>
@@ -31,9 +32,14 @@
         </el-table-column>
         <el-table-column label="有效期限 / 剩余" width="200">
           <template #default="{ row }">
-            <span :class="{ danger: daysLeft(row.effective_deadline) < 0, warn: daysLeft(row.effective_deadline) <= 10 && daysLeft(row.effective_deadline) >= 0 }">
+            <span v-if="row.effective_deadline" :class="{ danger: daysLeft(row.effective_deadline) < 0, warn: daysLeft(row.effective_deadline) <= 10 && daysLeft(row.effective_deadline) >= 0 }">
               {{ row.effective_deadline }}（{{ daysLeft(row.effective_deadline) < 0 ? `超期 ${-daysLeft(row.effective_deadline)} 天` : `剩 ${daysLeft(row.effective_deadline)} 天` }}）
             </span>
+            <span v-else-if="row.execution_deadline" class="hint">
+              {{ EXECUTION_DEADLINE_STATE[row.execution_deadline.state] || '等待执行期限记录' }}
+              <template v-if="row.execution_deadline.applicationDeadline">（至 {{ row.execution_deadline.applicationDeadline }}）</template>
+            </span>
+            <span v-else class="hint">当前阶段不计调查期限</span>
           </template>
         </el-table-column>
       </el-table>
@@ -53,15 +59,32 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
-import { CASE_STATUS } from './labels'
+import { CASE_STATUS, EXECUTION_DEADLINE_STATE } from './labels'
+import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../../api/sessionExpiry'
 
 const auth = useAuthStore()
 const d = ref<any>({})
 const loading = ref(false)
+const failed = ref(false)
 const isLeader = computed(() => auth.user?.roles?.some((r) => ['LEADER', 'ADMIN'].includes(r)))
+let disposed = false, loadGeneration = 0
+
+function identity() {
+  return JSON.stringify([auth.token, auth.user?.id, auth.user?.username, [...(auth.user?.roles || [])].sort()])
+}
+function active() {
+  return !disposed && !!auth.token && !!auth.user
+    && !sessionExpiry.isExpired(sessionExpiry.capture(auth.token), auth.token)
+}
+function invalidate() {
+  loadGeneration++; d.value = {}; loading.value = false; failed.value = false
+}
+function onSessionExpired() { invalidate() }
+watch(identity, invalidate, { flush: 'sync' })
+onUnmounted(() => { disposed = true; invalidate(); window.removeEventListener(SESSION_EXPIRED_EVENT, onSessionExpired) })
 
 function daysLeft(deadline: string) {
   // 'YYYY-MM-DD' 被 Date 当作 UTC 零点解析，与本地 now 相减会在 UTC+8 的同一天内漂移一天，
@@ -73,14 +96,23 @@ function daysLeft(deadline: string) {
   return Math.round((end - today) / 86400000)
 }
 
-onMounted(async () => {
+async function load() {
+  if (!active()) return
+  const run = ++loadGeneration, user = identity(), stamp = sessionExpiry.capture(auth.token)
+  const current = () => run === loadGeneration && active() && user === identity()
+    && sessionExpiry.isCurrent(stamp, auth.token)
   loading.value = true
+  failed.value = false; d.value = {}
   try {
-    d.value = (await client.get('/bureau/my/workbench')).data.data
+    const response = await client.get('/bureau/my/workbench')
+    if (current()) d.value = response.data.data
+  } catch {
+    if (current()) { d.value = {}; failed.value = true }
   } finally {
-    loading.value = false
+    if (run === loadGeneration) loading.value = false
   }
-})
+}
+onMounted(() => { window.addEventListener(SESSION_EXPIRED_EVENT, onSessionExpired); return load() })
 </script>
 
 <style scoped>

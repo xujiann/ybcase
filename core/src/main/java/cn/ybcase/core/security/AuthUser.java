@@ -12,11 +12,13 @@ public class AuthUser extends User {
 
     private final Long userId;
     private final int tokenVersion;
+    private final boolean mustChangePassword;
 
-    public AuthUser(String username, String password, boolean enabled, int tokenVersion, Long userId,
+    public AuthUser(String username, String password, boolean enabled, int tokenVersion, Long userId, boolean mustChangePassword,
                     Collection<? extends GrantedAuthority> authorities) {
         super(username, password, enabled, true, true, true, authorities);
         this.userId = userId;
         this.tokenVersion = tokenVersion;
+        this.mustChangePassword = mustChangePassword;
     }
 }

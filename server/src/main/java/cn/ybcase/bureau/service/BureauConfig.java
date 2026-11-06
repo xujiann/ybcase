@@ -26,18 +26,23 @@ public class BureauConfig {
     private volatile long cacheAt;
     private volatile Holidays holidayCache;
     private volatile long holidayAt;
+    private final Object holidayCacheMonitor = new Object();
+    private long holidayGeneration;
 
     private record Holidays(java.util.Set<LocalDate> off, java.util.Set<LocalDate> shiftWork) {}
 
     @org.springframework.context.event.EventListener
     public void onConfigChanged(cn.ybcase.core.common.ConfigChangedEvent e) {
         cache = null;
-        holidayCache = null;
+        evictHolidays();
     }
 
     /** 节假日表变更后由调用方显式失效（新增/删除节假日） */
     public void evictHolidays() {
-        holidayCache = null;
+        synchronized (holidayCacheMonitor) {
+            holidayGeneration++;
+            holidayCache = null;
+        }
     }
 
     private Map<String, String> snapshot() {
@@ -84,19 +89,46 @@ public class BureauConfig {
 
     /** 工作日推算（第58条：期间届满遇法定节假日顺延；sys_holiday：HOLIDAY 放假 / SHIFT_WORK 调休上班） */
     public LocalDate plusWorkdays(LocalDate from, int n) {
-        Holidays h = holidayCache;
-        if (h == null || System.currentTimeMillis() - holidayAt >= TTL_MS) {
-            var off = new java.util.HashSet<LocalDate>();
-            var shiftWork = new java.util.HashSet<LocalDate>();
-            for (var r : jdbc.queryForList("select day, kind from sys_holiday")) {
-                LocalDate d = ((java.sql.Date) r.get("day")).toLocalDate();
-                if ("SHIFT_WORK".equals(r.get("kind"))) shiftWork.add(d); else off.add(d);
-            }
-            h = new Holidays(off, shiftWork);
-            holidayCache = h;
-            holidayAt = System.currentTimeMillis();
-        }
+        Holidays h = holidays();
         return Workdays.plus(from, n, h.off(), h.shiftWork());
+    }
+
+    public boolean isWorkingDay(LocalDate day) {
+        Holidays h = holidays();
+        return Workdays.isWorkingDay(day, h.off(), h.shiftWork());
+    }
+
+    private Holidays holidays() {
+        // A transaction must use its own DB snapshot and uncommitted changes. It must
+        // neither consume a newer shared calendar nor publish an old/rolled-back one.
+        if (org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive())
+            return loadHolidays();
+        long generation;
+        synchronized (holidayCacheMonitor) {
+            Holidays h = holidayCache;
+            if (h != null && System.currentTimeMillis() - holidayAt < TTL_MS) return h;
+            generation = holidayGeneration;
+        }
+        // Do not hold the monitor while acquiring a DB connection. afterCommit
+        // invalidation may run on a writer that still owns its pool connection.
+        Holidays loaded = loadHolidays();
+        synchronized (holidayCacheMonitor) {
+            if (generation == holidayGeneration) {
+                holidayCache = loaded;
+                holidayAt = System.currentTimeMillis();
+            }
+        }
+        return loaded;
+    }
+
+    private Holidays loadHolidays() {
+        var off = new java.util.HashSet<LocalDate>();
+        var shiftWork = new java.util.HashSet<LocalDate>();
+        for (var r : jdbc.queryForList("select day, kind from sys_holiday")) {
+            LocalDate d = ((java.sql.Date) r.get("day")).toLocalDate();
+            if ("SHIFT_WORK".equals(r.get("kind"))) shiftWork.add(d); else off.add(d);
+        }
+        return new Holidays(java.util.Set.copyOf(off), java.util.Set.copyOf(shiftWork));
     }
 
     /**

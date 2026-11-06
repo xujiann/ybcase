@@ -2,6 +2,8 @@ package cn.ybcase.bureau.web;
 
 import cn.ybcase.bureau.common.BizException;
 import cn.ybcase.bureau.service.MessageService;
+import cn.ybcase.bureau.service.MaterialAccess;
+import cn.ybcase.bureau.service.WorkflowUserAccess;
 import cn.ybcase.core.common.R;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpHeaders;
@@ -26,6 +28,7 @@ public class FeedbackController {
 
     private final MessageService messageService;
     private final JdbcTemplate jdbc;
+    private final MaterialAccess materialAccess;
 
     private static final List<String> KINDS = List.of("BUG", "FEATURE", "QUESTION");
     private static final int MAX_SCREENSHOT = 5 * 1024 * 1024;
@@ -37,8 +40,13 @@ public class FeedbackController {
                               String requestId, String recentErrors, String screenshotBase64) {}
 
     @PostMapping
-    public R<Map<String, Object>> submit(@RequestBody FeedbackReq req, Authentication auth) {
-        if (!KINDS.contains(req.kind())) throw new BizException(2090, "反馈类型须为 BUG/FEATURE/QUESTION");
+    @org.springframework.transaction.annotation.Transactional
+    public R<Map<String, Object>> submit(@RequestBody Map<String, Object> body, Authentication auth) {
+        var req = new FeedbackReq(text(body, "kind", 16, 2090), text(body, "title", 255, 2090), text(body, "content", 0, 2090),
+                text(body, "pageRoute", 128, 2090), text(body, "caseRef", 64, 2090), text(body, "appVersion", 32, 2090),
+                text(body, "userAgent", 255, 2090), text(body, "requestId", 64, 2090), text(body, "recentErrors", 0, 2090),
+                text(body, "screenshotBase64", 0, 2090));
+        if (req.kind() == null || !KINDS.contains(req.kind())) throw new BizException(2090, "反馈类型须为 BUG/FEATURE/QUESTION");
         if (req.title() == null || req.title().isBlank()) throw new BizException(2090, "请填写标题");
         if (req.content() == null || req.content().isBlank()) throw new BizException(2090, "请描述问题或需求");
         byte[] screenshot = null;
@@ -48,9 +56,11 @@ public class FeedbackController {
             if ((long) b64.length() * 3 / 4 > MAX_SCREENSHOT)
                 throw new BizException(2090, "截图不得超过 5MB");
             int comma = b64.indexOf(',');
-            screenshot = Base64.getDecoder().decode(comma >= 0 ? b64.substring(comma + 1) : b64);
+            try { screenshot = Base64.getDecoder().decode(comma >= 0 ? b64.substring(comma + 1) : b64); }
+            catch (IllegalArgumentException ex) { throw new BizException(2090, "截图编码无效，请重新选择截图"); }
             if (screenshot.length > MAX_SCREENSHOT) throw new BizException(2090, "截图不得超过 5MB");
         }
+        actor(auth, true, false);
         Long id = jdbc.queryForObject("""
                 insert into feedback (kind, title, content, page_route, case_ref, app_version,
                                       user_agent, request_id, recent_errors, screenshot, username)
@@ -66,7 +76,9 @@ public class FeedbackController {
 
     /** 我的反馈 */
     @GetMapping("/mine")
+    @org.springframework.transaction.annotation.Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public R<List<Map<String, Object>>> mine(Authentication auth) {
+        actor(auth, false, false);
         return R.ok(jdbc.queryForList("""
                 select id, kind, title, content, page_route, status, reply, handler, created_at, handled_at
                 from feedback where username = ? order by id desc limit 100""", auth.getName()));
@@ -75,8 +87,10 @@ public class FeedbackController {
     /** 管理员列表 + 统计（按状态/类型/页面聚合） */
     @PreAuthorize("hasRole('ADMIN')")
     @GetMapping
+    @org.springframework.transaction.annotation.Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public R<Map<String, Object>> list(@RequestParam(required = false) String status,
-                                       @RequestParam(required = false) String kind) {
+                                       @RequestParam(required = false) String kind, Authentication auth) {
+        actor(auth, false, true);
         StringBuilder where = new StringBuilder(" where 1=1 ");
         List<Object> args = new java.util.ArrayList<>();
         if (status != null && !status.isBlank()) { where.append(" and status = ? "); args.add(status); }
@@ -99,28 +113,35 @@ public class FeedbackController {
     /** 管理员处理：状态流转+回复（通知提交人） */
     @PreAuthorize("hasRole('ADMIN')")
     @PostMapping("/{id}/handle")
-    public R<Void> handle(@PathVariable Long id, @RequestBody Map<String, String> body, Authentication auth) {
-        String status = body.get("status");
-        if (!List.of("PROCESSING", "RESOLVED", "REJECTED").contains(status))
+    @org.springframework.transaction.annotation.Transactional
+    public R<Void> handle(@PathVariable Long id, @RequestBody Map<String, Object> body, Authentication auth) {
+        String status = text(body, "status", 16, 2091), reply = text(body, "reply", 0, 2091);
+        if (status == null || !List.of("PROCESSING", "RESOLVED", "REJECTED").contains(status))
             throw new BizException(2091, "处理状态须为 PROCESSING/RESOLVED/REJECTED");
         if ((status.equals("RESOLVED") || status.equals("REJECTED"))
-                && (body.get("reply") == null || body.get("reply").isBlank()))
+                && (reply == null || reply.isBlank()))
             throw new BizException(2091, "解决/不采纳须填写回复说明");
-        var rows = jdbc.queryForList("select username, title from feedback where id = ?", id);
+        var rows = jdbc.queryForList("select username, title, status from feedback where id = ? for update", id);
         if (rows.isEmpty()) throw new BizException(2091, "反馈不存在");
+        actor(auth, true, true);
+        if ("CLOSED".equals(rows.get(0).get("status"))) throw new BizException(2091, "已关闭反馈不可重新处理，请提交新反馈");
         jdbc.update("""
                 update feedback set status = ?, reply = coalesce(?, reply), handler = ?, handled_at = now()
-                where id = ?""", status, body.get("reply"), auth.getName(), id);
+                where id = ?""", status, reply, auth.getName(), id);
         String label = switch (status) { case "PROCESSING" -> "处理中"; case "RESOLVED" -> "已解决（请确认关闭）"; default -> "不采纳"; };
         messageService.send((String) rows.get(0).get("username"), "SYSTEM",
                 "您的反馈「" + rows.get(0).get("title") + "」" + label,
-                body.get("reply"), "/my/feedback", null);
+                reply, "/my/feedback", null);
         return R.ok();
     }
 
     /** 提交人确认关闭（已解决 → 关闭闭环） */
     @PostMapping("/{id}/close")
+    @org.springframework.transaction.annotation.Transactional
     public R<Void> close(@PathVariable Long id, Authentication auth) {
+        var rows = jdbc.queryForList("select username, status from feedback where id = ? for update", id);
+        if (rows.isEmpty()) throw new BizException(2091, "仅本人已解决的反馈可确认关闭");
+        actor(auth, true, false);
         int n = jdbc.update("""
                 update feedback set status = 'CLOSED' where id = ? and username = ? and status = 'RESOLVED'""",
                 id, auth.getName());
@@ -129,10 +150,12 @@ public class FeedbackController {
     }
 
     @GetMapping("/{id}/screenshot")
+    @org.springframework.transaction.annotation.Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
     public ResponseEntity<byte[]> screenshot(@PathVariable Long id, Authentication auth) {
+        var actor = actor(auth, false, false);
         var rows = jdbc.queryForList("select username, screenshot from feedback where id = ?", id);
         if (rows.isEmpty() || rows.get(0).get("screenshot") == null) return ResponseEntity.notFound().build();
-        boolean admin = auth.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
+        boolean admin = actor.roles().contains("ADMIN");
         if (!admin && !auth.getName().equals(rows.get(0).get("username")))
             return ResponseEntity.status(403).build();
         return ResponseEntity.ok().contentType(MediaType.IMAGE_PNG).body((byte[]) rows.get(0).get("screenshot"));
@@ -141,18 +164,16 @@ public class FeedbackController {
     /** 导出 CSV（给开发排期的原始输入） */
     @PreAuthorize("hasRole('ADMIN')")
     @GetMapping("/export")
-    public ResponseEntity<byte[]> export() {
+    @org.springframework.transaction.annotation.Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public ResponseEntity<byte[]> export(Authentication auth) {
+        actor(auth, false, true);
         var rows = jdbc.queryForList("""
                 select id, kind, status, title, content, page_route, app_version, request_id,
                        username, created_at, handler, reply from feedback order by id limit 5000""");
         StringBuilder sb = new StringBuilder("﻿id,类型,状态,标题,描述,页面,版本,request_id,提交人,时间,处理人,回复\n");
         for (var r : rows) {
-            sb.append(r.get("id")).append(',').append(r.get("kind")).append(',').append(r.get("status")).append(',')
-              .append(csv(r.get("title"))).append(',').append(csv(r.get("content"))).append(',')
-              .append(csv(r.get("page_route"))).append(',').append(csv(r.get("app_version"))).append(',')
-              .append(csv(r.get("request_id"))).append(',').append(r.get("username")).append(',')
-              .append(r.get("created_at")).append(',').append(csv(r.get("handler"))).append(',')
-              .append(csv(r.get("reply"))).append('\n');
+            sb.append(java.util.stream.Stream.of("id", "kind", "status", "title", "content", "page_route", "app_version", "request_id", "username", "created_at", "handler", "reply")
+                    .map(key -> cn.ybcase.bureau.common.Csv.cell(r.get(key))).collect(java.util.stream.Collectors.joining(","))).append('\n');
         }
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=feedback.csv")
@@ -160,12 +181,21 @@ public class FeedbackController {
                 .body(sb.toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String csv(Object v) {
-        // 标准 CSV 转义 + 公式注入防护（与前端 StatsView.csvCell 同口径）：
-        // 以 = + - @ 制表回车开头的值前置单引号，Excel 打开时不会当公式执行
-        if (v == null) return "";
-        String s = String.valueOf(v);
-        if (!s.isEmpty() && "=+-@\t\r".indexOf(s.charAt(0)) >= 0) s = "'" + s;
-        return "\"" + s.replace("\"", "\"\"") + "\"";
+    private WorkflowUserAccess.User actor(Authentication auth, boolean write, boolean admin) {
+        var actor = write ? materialAccess.lockActor(auth.getName(), false) : materialAccess.readActor(auth.getName());
+        boolean allowed = admin ? actor.roles().contains("ADMIN")
+                : actor.roles().stream().anyMatch(java.util.Set.of("HANDLER", "LEGAL", "LEADER", "ADMIN")::contains);
+        if (!allowed) throw new BizException(403, "当前岗位无权访问此项反馈");
+        return actor;
     }
+
+    private String text(Map<String, Object> body, String key, int max, int code) {
+        Object value = body.get(key);
+        if (value == null) return null;
+        if (!(value instanceof String text) || text.indexOf('\0') >= 0
+                || (max > 0 && text.codePointCount(0, text.length()) > max))
+            throw new BizException(code, "反馈字段 " + key + " 须为有效文本" + (max > 0 ? "，最多" + max + "字" : ""));
+        return text;
+    }
+
 }

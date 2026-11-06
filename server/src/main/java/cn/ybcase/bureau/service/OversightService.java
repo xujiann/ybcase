@@ -18,29 +18,59 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class OversightService {
 
+    // reward.amount is numeric(12,2), narrower than execution/installment monetary columns.
+    private static final BigDecimal MAX_REWARD_AMOUNT = new BigDecimal("9999999999.99");
+
     private final ClueService clueService;
     private final ExecutionService executionService;
     private final CaseClueRepository clueRepository;
+    private final cn.ybcase.bureau.repository.CaseFileRepository caseRepository;
     private final JdbcTemplate jdbc;
     private final BizSeqService seq;
+    private final SourceAttachmentAccess sourceAttachmentAccess;
+    private final MaterialAccess materialAccess;
 
     // ---------- 行政检查（清单第10-12项） ----------
 
     public record InspectionReq(Long itemId, String objectName, String objectType,
-                                String officers, LocalDate plannedAt) {}
+                                String officers, LocalDate plannedAt, String taskLevel) {
+        public InspectionReq(Long itemId, String objectName, String objectType, String officers, LocalDate plannedAt) {
+            this(itemId, objectName, objectType, officers, plannedAt, null);
+        }
+    }
 
+    /** Trusted domain callers supply a recorded creator rather than acting on the HTTP principal. */
     @Transactional
     public Map<String, Object> createInspection(InspectionReq req, String username) {
-        if (req.officers() == null || req.officers().split("[、,，]").length < 2)
-            throw new BizException(2063, "检查人员不得少于2人（第16条）");
+        return createInspection(req, username, materialAccess.departmentScope(username).deptId());
+    }
+
+    @Transactional
+    public Map<String, Object> createInspectionForCurrentActor(InspectionReq req, String username) {
+        // A new inspection has no source row yet; authorize before taking its numbering row.
+        return createInspection(req, username, materialAccess.creationDepartment(username));
+    }
+
+    private Map<String, Object> createInspection(InspectionReq req, String username, Long ownerDeptId) {
+        if (req.officers() == null || java.util.Arrays.stream(req.officers().split("[、,，]"))
+                .map(String::strip).filter(name -> !name.isBlank()).distinct().limit(2).count() < 2)
+            throw new BizException(2063, "须填写至少2名不同的检查人员");
+        if (req.taskLevel() != null && !List.of("NATIONAL", "PROVINCIAL", "MUNICIPAL", "CITY_CROSS_CHECK").contains(req.taskLevel()))
+            throw new BizException(2063, "检查任务类别无效");
         int year = LocalDate.now().getYear();
         String no = "JC" + year + String.format("%04d", seq.next("INSP", year));
         jdbc.update("""
-                insert into inspection (insp_no, item_id, object_name, object_type, officers, planned_at, created_by)
-                values (?,?,?,?,?,?,?)""",
+                insert into inspection (insp_no, item_id, object_name, object_type, officers, planned_at, created_by, task_level, owner_dept_id)
+                values (?,?,?,?,?,?,?,?,?)""",
                 no, req.itemId(), req.objectName(), req.objectType(), req.officers(),
-                req.plannedAt() != null ? req.plannedAt() : LocalDate.now(), username);
+                req.plannedAt() != null ? req.plannedAt() : LocalDate.now(), username, req.taskLevel(), ownerDeptId);
         return jdbc.queryForMap("select * from inspection where insp_no = ?", no);
+    }
+
+    @Transactional
+    public void completeInspection(Long id, String result, boolean violationFound, String username) {
+        sourceAttachmentAccess.lockWritable("INSPECTION", id, username);
+        completeInspection(id, result, violationFound);
     }
 
     @Transactional
@@ -56,6 +86,7 @@ public class OversightService {
     /** 检查发现违法 → 一键转线索（打通 检查→线索→立案 闭环） */
     @Transactional
     public CaseClue inspectionToClue(Long id, String username) {
+        sourceAttachmentAccess.lockInspectionForTransition(id, username);
         var rows = jdbc.queryForList("select * from inspection where id = ?", id);
         if (rows.isEmpty()) throw new BizException(2063, "检查任务不存在");
         var insp = rows.get(0);
@@ -67,7 +98,8 @@ public class OversightService {
                 "INSPECTION",
                 "行政检查发现（" + insp.get("insp_no") + "）：" + insp.get("result"),
                 (String) insp.get("object_name"), (String) insp.get("object_type"),
-                LocalDate.now(), (String) insp.get("officers")), username);
+                LocalDate.now(), (String) insp.get("officers")), username,
+                insp.get("owner_dept_id") instanceof Number dept ? dept.longValue() : null);
         int n = jdbc.update("update inspection set clue_id = ? where id = ? and clue_id is null", clue.getId(), id);
         if (n == 0) throw new BizException(2063, "该检查已转线索（请勿重复提交）");
         return clue;
@@ -79,12 +111,21 @@ public class OversightService {
 
     @Transactional
     public void createReward(RewardReq req) {
+        // Keep source -> existing cases -> actor order, without imposing attachment lifecycle restrictions.
+        var sources = jdbc.queryForList("select id from case_clue where id=? for update", req.clueId());
+        if (sources.isEmpty()) throw new BizException(2025, "线索不存在");
+        for (Long caseId : jdbc.queryForList("select id from case_file where clue_id=? order by id", Long.class, req.clueId()))
+            CaseGuards.lock(jdbc, caseId);
+        var actor = materialAccess.requireCurrentRoles("HANDLER", "LEADER", "ADMIN");
+        if (actor != null) sourceAttachmentAccess.assertRead("CLUE", req.clueId(), actor.username());
         CaseClue clue = clueRepository.findById(req.clueId())
                 .orElseThrow(() -> new BizException(2025, "线索不存在"));
         if (!"FILED".equals(clue.getStatus()))
             throw new BizException(2064, "举报线索查实（立案）后方可启动奖励程序（条例35条）");
         if (req.reporterName() == null || req.reporterName().isBlank())
             throw new BizException(2064, "须登记举报人（信息严格保密）");
+        if (jdbc.queryForObject("select count(*) from reward where clue_id=?", Integer.class, req.clueId()) > 0)
+            throw new BizException(2064, "该线索已登记奖励，请勿重复登记");
         jdbc.update("""
                 insert into reward (clue_id, reporter_name, reporter_contact, verified, note)
                 values (?,?,?,true,?)""",
@@ -93,7 +134,15 @@ public class OversightService {
 
     @Transactional
     public void approveReward(Long rewardId, BigDecimal amount, String approvedBy) {
-        if (amount == null || amount.signum() <= 0) throw new BizException(2064, "奖励金额须为正数");
+        lockRewardSupervisor(rewardId);
+        if (amount == null || amount.signum() <= 0 || amount.compareTo(MAX_REWARD_AMOUNT) > 0)
+            throw new BizException(2064, "奖励金额须在0.01至9999999999.99元之间");
+        try {
+            // Approval is one-shot: the database must never round the only recorded amount.
+            amount = amount.setScale(2, java.math.RoundingMode.UNNECESSARY);
+        } catch (ArithmeticException ex) {
+            throw new BizException(2064, "奖励金额最多保留两位小数");
+        }
         int n = jdbc.update("""
                 update reward set amount = ?, approved_by = ?, approved_at = ?
                 where id = ? and approved_at is null""",
@@ -103,9 +152,24 @@ public class OversightService {
 
     @Transactional
     public void payReward(Long rewardId) {
+        lockRewardSupervisor(rewardId);
         int n = jdbc.update("update reward set paid_at = ? where id = ? and approved_at is not null and paid_at is null",
                 LocalDate.now(), rewardId);
         if (n == 0) throw new BizException(2064, "奖励未审批或已发放");
+    }
+
+    private void lockRewardSupervisor(Long rewardId) {
+        var sources = jdbc.queryForList("select clue_id from reward where id=? for update", Long.class, rewardId);
+        if (!sources.isEmpty()) {
+            Long clueId = sources.getFirst();
+            // The linked case can change owner while a reward is waiting for approval.
+            // Keep source rows ahead of the actor lock, as for reward registration.
+            jdbc.queryForList("select id from case_clue where id=? for update", clueId);
+            jdbc.queryForList("select id from case_file where clue_id=? order by id for update", clueId);
+        }
+        var actor = materialAccess.requireCurrentRoles("LEADER", "ADMIN");
+        if (actor != null && actor.district() && !sources.isEmpty())
+            sourceAttachmentAccess.assertRead("CLUE", sources.getFirst(), actor.username());
     }
 
     // ---------- 裁量建议（衔接裁量基准表） ----------
@@ -135,6 +199,8 @@ public class OversightService {
 
     @Transactional
     public void addInstallment(Long caseId, InstallmentReq req) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         var rows = jdbc.queryForList("select defer_approved from case_file where id = ?", caseId);
         if (rows.isEmpty()) throw new BizException(2043, "案件不存在");
         if (!Boolean.TRUE.equals(rows.get(0).get("defer_approved")))
@@ -142,8 +208,9 @@ public class OversightService {
         String kind = req.kind() == null || req.kind().isBlank() ? "FINE" : req.kind();
         if (!INSTALLMENT_KINDS.contains(kind))
             throw new BizException(2065, "分期款项类型须为 罚款/退回基金/没收违法所得");
-        if (req.amount() == null || req.amount().signum() <= 0)
-            throw new BizException(2065, "分期金额须为正数");
+        BigDecimal amount = cn.ybcase.bureau.common.Money.positive(req.amount(), "分期金额");
+        if (req.seq() == null || req.seq() < 1 || req.dueAt() == null)
+            throw new BizException(2065, "须填写正整数期号与缴纳期限");
         // 分期计划总额不得超过决定书就该类款项确定的金额：否则缴完计划仍判"未缴清"，
         // 或反过来把超额款项入了账（入账侧的封顶在 ExecutionService，这里是计划侧的前置）
         var dec = jdbc.queryForList(
@@ -161,11 +228,14 @@ public class OversightService {
         BigDecimal planned = jdbc.queryForObject(
                 "select coalesce(sum(amount), 0) from case_installment where case_id = ? and kind = ?",
                 BigDecimal.class, caseId, kind);
-        if (planned.add(req.amount()).compareTo(decided) > 0)
-            throw new BizException(2065, "分期计划累计（" + planned.add(req.amount())
+        BigDecimal directPaid = executionService.sum(caseId, kind).subtract(jdbc.queryForObject(
+                "select coalesce(sum(amount),0) from case_installment where case_id = ? and kind = ? and paid_at is not null",
+                BigDecimal.class, caseId, kind)).max(BigDecimal.ZERO);
+        if (planned.add(amount).add(directPaid).compareTo(decided) > 0)
+            throw new BizException(2065, "分期计划与直接缴纳款项累计（" + planned.add(amount).add(directPaid)
                     + "）超出决定书确定的金额（" + decided + "）");
         jdbc.update("insert into case_installment (case_id, seq, due_at, amount, kind) values (?,?,?,?,?)",
-                caseId, req.seq(), req.dueAt(), req.amount(), kind);
+                caseId, req.seq(), req.dueAt(), amount, kind);
     }
 
     @Transactional
@@ -179,6 +249,8 @@ public class OversightService {
                 installmentId);
         if (rows.isEmpty()) throw new BizException(2065, "分期记录不存在或已缴清");
         Long caseId = ((Number) rows.get(0).get("case_id")).longValue();
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         Integer seq = ((Number) rows.get(0).get("seq")).intValue();
         BigDecimal amount = (BigDecimal) rows.get(0).get("amount");
         String kind = (String) rows.get(0).get("kind");
@@ -200,6 +272,8 @@ public class OversightService {
      */
     @Transactional
     public void withdrawPublish(Long caseId, String reason, String operator) {
+        CaseGuards.lock(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
         if (reason == null || reason.isBlank()) throw new BizException(2138, "须填写撤回公开的理由（撤销/变更/确认违法的文书依据）");
         var rows = jdbc.queryForList(
                 "select published, publish_withdrawn from case_decision where case_id = ?", caseId);
@@ -220,6 +294,9 @@ public class OversightService {
     @Transactional
     /** 起始日在"启动评审"时登记（可为实际开始日，受校验），结束时不得再改——否则期限扣除等于由客户端随意设定 */
     public void startExpertReview(Long caseId, String experts, LocalDate startedAt) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        CaseGuards.requireActive(CaseGuards.get(caseRepository, caseId));
         if (experts == null || experts.isBlank()) throw new BizException(2066, "须填写评审专家");
         var cf = jdbc.queryForList("select filed_at from case_file where id = ?", caseId);
         if (cf.isEmpty()) throw new BizException(2043, "案件不存在");
@@ -238,6 +315,8 @@ public class OversightService {
 
     @Transactional
     public void endExpertReview(Long caseId, Long reviewId, String opinion, LocalDate startedAt, LocalDate endedAt) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
         if (opinion == null || opinion.isBlank()) throw new BizException(2066, "须填写评审意见");
         var rows = jdbc.queryForList("select started_at from expert_review where id = ? and case_id = ? and ended_at is null",
                 reviewId, caseId);
@@ -247,6 +326,8 @@ public class OversightService {
         LocalDate end = endedAt != null ? endedAt : LocalDate.now();
         if (end.isBefore(start)) throw new BizException(2066, "评审结束日期不得早于开始日期（" + start + "）");
         if (end.isAfter(LocalDate.now())) throw new BizException(2066, "评审结束日期不得晚于今天");
+        LocalDate cutoff = CaseService.exclusionCutoff(CaseGuards.get(caseRepository, caseId));
+        if (end.isAfter(cutoff)) throw new BizException(2066, "评审结束日期不得晚于调查办理结束日期（" + cutoff + "）");
         jdbc.update("update expert_review set ended_at = ?, opinion = ? where id = ?", end, opinion, reviewId);
         // 第45条：专家评审时间不计入办案期限——自动登记期限扣除。
         // 与既有扣除区间（鉴定/听证等）裁剪去重后再落库：重叠部分会被 sum(end_at-start_at)

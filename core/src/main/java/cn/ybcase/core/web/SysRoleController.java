@@ -20,6 +20,8 @@ public class SysRoleController {
 
     private final SysRoleRepository roleRepository;
     private final SysMenuRepository menuRepository;
+    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
+    private final cn.ybcase.core.security.AdminWriteAccess adminWrites;
 
     @org.springframework.security.access.prepost.PreAuthorize("hasRole('ADMIN')")
     @GetMapping
@@ -49,14 +51,21 @@ public class SysRoleController {
     @PreAuthorize("hasRole('ADMIN')")
     @Transactional
     public R<Void> grant(@PathVariable Long id, @RequestBody GrantRequest req) {
-        SysRole role = roleRepository.findById(id).orElse(null);
-        if (role == null) return R.fail(1301, "角色不存在");
-        if ("ADMIN".equals(role.getCode())) return R.fail(1302, "内置管理员角色不可修改授权");
-        role.getMenus().clear();
-        if (req.menuIds() != null) {
-            role.getMenus().addAll(menuRepository.findAllById(req.menuIds()));
-        }
-        roleRepository.save(role);
+        // NO KEY UPDATE serializes replacements while allowing user-role FK KEY SHARE, so a
+        // concurrent account update can finish before this request locks its administrator.
+        var rows = jdbc.queryForList("select code from sys_role where id=? for no key update", id);
+        if (rows.isEmpty()) return R.fail(1301, "角色不存在");
+        adminWrites.requireCurrentAdmin();
+        if ("ADMIN".equals(rows.get(0).get("code"))) return R.fail(1302, "内置管理员角色不可修改授权");
+        if (req == null || req.menuIds() == null || req.menuIds().stream().anyMatch(menu -> menu == null || menu <= 0))
+            return R.fail(1303, "请选择有效菜单，清空授权请提交空数组");
+        var ids = req.menuIds().stream().distinct().sorted().toList();
+        var menus = menuRepository.findAllById(ids);
+        if (menus.size() != ids.size()) return R.fail(1303, "包含不存在的菜单，请刷新后重新选择");
+        // Explicit SQL replacement starts from the latest locked row, not an eager JPA collection
+        // cached before another grant committed. Invalid input never clears existing permissions.
+        jdbc.update("delete from sys_role_menu where role_id=?", id);
+        for (Long menu : ids) jdbc.update("insert into sys_role_menu(role_id,menu_id) values (?,?)", id, menu);
         return R.ok();
     }
 }

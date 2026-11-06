@@ -10,6 +10,7 @@ const router = createRouter({
       children: [
         { path: '', redirect: '/dashboard' },
         { path: 'dashboard', component: () => import('../views/case/MyWorkbenchView.vue') },
+        { path: 'agency/agreements', component: () => import('../views/agency/AgencyAgreementsView.vue') },
         { path: 'case/clues', component: () => import('../views/case/CluesView.vue') },
         { path: 'case/list', component: () => import('../views/case/CasesView.vue') },
         { path: 'case/detail/:id', component: () => import('../views/case/CaseDetailView.vue') },
@@ -17,6 +18,8 @@ const router = createRouter({
         { path: 'case/enforce-items', component: () => import('../views/case/EnforceItemsView.vue') },
         { path: 'case/transfers', component: () => import('../views/case/TransfersView.vue') },
         { path: 'case/inspections', component: () => import('../views/case/InspectionsView.vue') },
+        { path: 'case/interviews', component: () => import('../views/case/InterviewsView.vue') },
+        { path: 'case/department-handoffs', component: () => import('../views/case/DepartmentHandoffsView.vue') },
         { path: 'case/rewards', component: () => import('../views/case/RewardsView.vue') },
         { path: 'case/delegates', component: () => import('../views/case/DelegatesView.vue') },
         { path: 'case/approvals', component: () => import('../views/case/ApprovalsView.vue') },
