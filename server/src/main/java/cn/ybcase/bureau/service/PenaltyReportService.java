@@ -16,16 +16,75 @@ import java.util.Map;
 @Service
 @RequiredArgsConstructor
 public class PenaltyReportService {
+    private static final String PENALTY_SOURCE = """
+             from case_decision d join case_file cf on cf.id = d.case_id
+             left join case_reporting_facts rf on rf.case_id = cf.id
+            """;
+    private static final String PENALTY_POPULATION = """
+            d.decision_type = 'PUNISH' and cf.party_type in ('PROVIDER', 'INDIVIDUAL')
+            and d.decided_at between t.starts and t.ends
+            """;
+    private static final String PARTY_CODE = """
+            case when cf.party_type = 'INDIVIDUAL' then rf.party_credit_no else rf.institution_code end
+            """;
+    private static final String MISSING_PENALTIES = """
+            with period as (select cast(? as date) as starts, cast(? as date) as ends),
+            checked as (
+                select cf.id, cf.case_no, cf.party_name, d.decided_at, array_remove(array[
+                    case when coalesce((%s), '') !~ '[^[:space:]]' then
+                        case when cf.party_type = 'PROVIDER' then '机构编码' else '参保人证件号码' end end,
+                    case when cf.party_type = 'PROVIDER' and rf.institution_ownership is null then '机构性质' end,
+                    case when cf.party_type = 'PROVIDER' and rf.institution_grade is null then '机构等级' end,
+                    case when rf.confirmed_violation_start is null or rf.confirmed_violation_end is null then '违法发生期间' end,
+                    case when coalesce(rf.confirmed_violation_facts, '') !~ '[^[:space:]]' then '认定违法事实' end,
+                    case when rf.confirmed_violation_amount is null then '认定违法违规金额' end,
+                    case when coalesce(rf.penalty_basis, '') !~ '[^[:space:]]' then '处罚依据' end
+                ], null) as missing_fields
+                %s cross join period t where %s
+            )
+            """.formatted(PARTY_CODE, PENALTY_SOURCE, PENALTY_POPULATION);
     private final JdbcTemplate jdbc;
     private final MaterialAccess materialAccess;
 
+    public record MissingPenalty(String caseNo, String partyName, LocalDate decidedAt, List<String> missingFields) {}
+
+    public record MissingPenalties(List<MissingPenalty> rows, long total, LocalDate start, LocalDate end, LocalDate cutoff) {}
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ, timeout = 12)
+    public MissingPenalties missingFields(int year, LocalDate start, LocalDate end, LocalDate cutoff, int page, int size) {
+        requireReportReader();
+        var period = ReportExport.AnnualPeriod.of(year, start, end, cutoff, LocalDate.now());
+        if (page < 1 || size < 1 || size > 100)
+            throw new BizException(2100, "页码须大于零，每页须为1至100条");
+
+        String missingOnly = " from checked where cardinality(missing_fields) > 0 ";
+        long total = jdbc.queryForObject(MISSING_PENALTIES + "select count(*)" + missingOnly,
+                Long.class, period.start(), period.end());
+        long offset = (page - 1L) * size;
+        List<MissingPenalty> rows = offset >= total ? List.of() : jdbc.query(
+                MISSING_PENALTIES + "select case_no, party_name, decided_at, missing_fields" + missingOnly
+                        + " order by decided_at, id limit ? offset ?",
+                (rs, index) -> {
+                    var fields = rs.getArray("missing_fields");
+                    try {
+                        return new MissingPenalty(rs.getString("case_no"), rs.getString("party_name"),
+                                rs.getObject("decided_at", LocalDate.class), List.of((String[]) fields.getArray()));
+                    } finally {
+                        fields.free();
+                    }
+                }, period.start(), period.end(), size, offset);
+        return new MissingPenalties(rows, total, period.start(), period.end(), period.cutoff());
+    }
+
+    private void requireReportReader() {
+        var actor = materialAccess.requireCurrentReadRoles("LEADER", "LEGAL", "ADMIN");
+        if (actor == null || !"BUREAU".equals(actor.accountCategory()))
+            throw new BizException(403, "全局行政处罚报表由局机关授权岗位查看和导出");
+    }
+
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public ReportExport export(Integer year, LocalDate start, LocalDate end, LocalDate cutoff) {
-        var actor = materialAccess.requireCurrentReadRoles("LEADER", "LEGAL", "ADMIN");
-        if (actor != null && !Boolean.TRUE.equals(jdbc.queryForObject(
-                "select account_category = 'BUREAU' from sys_user where id = ?", Boolean.class, actor.id())))
-            throw new BizException(403, "全局行政处罚报表由局机关授权岗位导出");
-
+        requireReportReader();
         boolean annual = year != null;
         var today = LocalDate.now();
         if (!annual && (start != null || end != null || cutoff != null))
@@ -39,15 +98,14 @@ public class PenaltyReportService {
         ReportExport.query(jdbc, """
                 with period as (select cast(? as date) as starts, cast(? as date) as ends, cast(? as date) as cutoff,
                                        cast(? as boolean) as current_state, cast(? as boolean) as legacy)
-                select d.decided_at, cf.filed_at, cf.party_name,
-                       case when cf.party_type = 'INDIVIDUAL' then cf.party_credit_no
-                            else cf.institution_code end as party_code,
-                       case cf.institution_ownership when 'PUBLIC' then '公立' when 'SOCIAL' then '社会办' end as ownership,
-                       case cf.institution_grade when 'TERTIARY' then '三级' when 'SECONDARY' then '二级'
+                select d.decided_at, cf.filed_at, cf.party_name, coalesce(rf.has_approved_supplement, false) as supplemental,
+                       %s as party_code,
+                       case rf.institution_ownership when 'PUBLIC' then '公立' when 'SOCIAL' then '社会办' end as ownership,
+                       case rf.institution_grade when 'TERTIARY' then '三级' when 'SECONDARY' then '二级'
                             when 'PRIMARY' then '一级' when 'UNGRADED' then '未定级' end as grade,
-                       cf.confirmed_violation_start, cf.confirmed_violation_end,
-                       cf.confirmed_violation_facts, cf.confirmed_violation_amount,
-                       d.penalty_basis, d.content, d.other_measures,
+                       rf.confirmed_violation_start, rf.confirmed_violation_end,
+                       rf.confirmed_violation_facts, rf.confirmed_violation_amount,
+                       rf.penalty_basis, d.content, d.other_measures,
                        d.fine_amount, d.recoup_amount, d.confiscate_amount,
                        coalesce(p.fine_paid, 0) as fine_paid, coalesce(p.recoup_paid, 0) as recoup_paid,
                        coalesce(p.late_fee_paid, 0) as late_fee_paid,
@@ -67,7 +125,7 @@ public class PenaltyReportService {
                             when not cf.court_enforce_applied then false
                             when t.current_state then cf.court_enforce_applied end as enforced,
                        d.publish_withdrawn and (d.withdrawn_at at time zone 'Asia/Shanghai')::date <= t.cutoff as withdrawn
-                from case_decision d join case_file cf on cf.id = d.case_id cross join period t
+                %s cross join period t
                 left join lateral (
                     select sum(amount) filter (where kind = 'FINE') as fine_paid,
                            sum(amount) filter (where kind = 'RECOUP') as recoup_paid,
@@ -75,10 +133,9 @@ public class PenaltyReportService {
                     from case_execution where case_id = cf.id and kind in ('FINE', 'RECOUP', 'LATE_FEE')
                          and paid_at <= t.cutoff
                 ) p on true
-                where d.decision_type = 'PUNISH' and cf.party_type in ('PROVIDER', 'INDIVIDUAL')
-                  and d.decided_at between t.starts and t.ends
+                where %s
                 order by d.decided_at, cf.id
-                """, rs -> {
+                """.formatted(PARTY_CODE, PENALTY_SOURCE, PENALTY_POPULATION), rs -> {
             LocalDate decided = rs.getObject("decided_at", LocalDate.class);
             boolean includeFiling = annual || decided.getYear() == 2026;
             List<Object[]> sheet = includeFiling ? current : historical;
@@ -118,7 +175,7 @@ public class PenaltyReportService {
             cells.add(yesNo(enforced));
             budget.add(sheet, cells.toArray());
             if (annual) reconciliation.record(fine, paid, unpaid, recoup, recoupPaid,
-                    rs.getBigDecimal("late_fee_paid"), partyCode, facts, rs.getBoolean("withdrawn"));
+                    rs.getBigDecimal("late_fee_paid"), partyCode, facts, rs.getBoolean("withdrawn"), rs.getBoolean("supplemental"));
         }, period.start(), period.end(), period.cutoff(), period.cutoff().equals(today), !annual);
 
         byte[] workbook = annual
@@ -147,10 +204,10 @@ public class PenaltyReportService {
     private static final class Reconciliation {
         private BigDecimal fine = BigDecimal.ZERO, finePaid = BigDecimal.ZERO, unpaid = BigDecimal.ZERO;
         private BigDecimal recoup = BigDecimal.ZERO, recoupPaid = BigDecimal.ZERO, lateFee = BigDecimal.ZERO;
-        private int missingCode, missingFacts, withdrawn;
+        private int missingCode, missingFacts, withdrawn, supplemented;
 
         void record(BigDecimal fine, BigDecimal finePaid, BigDecimal unpaid, BigDecimal recoup, BigDecimal recoupPaid,
-                    BigDecimal lateFee, String partyCode, String facts, boolean withdrawn) {
+                    BigDecimal lateFee, String partyCode, String facts, boolean withdrawn, boolean supplemental) {
             this.fine = this.fine.add(fine);
             this.finePaid = this.finePaid.add(finePaid);
             this.unpaid = this.unpaid.add(unpaid);
@@ -160,6 +217,7 @@ public class PenaltyReportService {
             if (partyCode == null || partyCode.isBlank()) missingCode++;
             if (facts == null || facts.isBlank()) missingFacts++;
             if (withdrawn) this.withdrawn++;
+            if (supplemental) this.supplemented++;
         }
 
         List<Object[]> rows(ReportExport.AnnualPeriod period, int count) {
@@ -180,6 +238,8 @@ public class PenaltyReportService {
                     new Object[]{"撤回口径", "撤回的是对外公示，处罚决定仍列入台账。"},
                     new Object[]{"空值口径", "空值表示未登记、不适用或历史状态不可核实。历史救济状态缺少快照，留空。"},
                     new Object[]{"历史更正", "当事人、机构与决定字段按当前登记资料列示。"},
+                    new Object[]{"有已审核补录台账的案件数", supplemented},
+                    new Object[]{"报表补录", "历史缺项使用已批准的报表专用补录值，来源及审核记录见报表补录台账。"},
                     new Object[]{"金额口径", "仅计入截至日内登记的付款，罚款本金、加处罚款和退回基金分别核算。"});
         }
     }

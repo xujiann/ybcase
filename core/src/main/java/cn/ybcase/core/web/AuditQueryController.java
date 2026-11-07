@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** 审计日志查询——审计属平台横切能力，自 server 下沉 core */
 @RestController
@@ -21,11 +22,14 @@ public class AuditQueryController {
     private final cn.ybcase.core.security.AdminReadAccess adminReads;
 
     private static final int MAX_SIZE = 500;
+    private static final Set<String> REPORT_TYPES = Set.of("PENALTIES", "ENFORCEMENT_WORK", "INTERVIEWS");
+    private static final String REPORT_EXPORT = "(http_status = 200 and report_type is not null and report_row_count is not null)";
 
     /**
      * 审计日志查询（sensitive=true 只看本域敏感操作：决定/执行/卷宗/附件/审计导出/举报人/账号权限）。
      * 不传 page/size 时保持旧契约（数组、最近 200 条，E2E 依赖）；传了任一分页参数则返回 {total,page,size,rows}。
      * from/to 为 yyyy-MM-dd 闭区间（按 created_at，to 取次日 0 点做 <）；path 模糊、requestId 精确。
+     * maxId 用于分页时排除首屏查询之后写入的更大编号；reportType 可筛选成功的结构化报表导出。
      */
     @GetMapping("/api/audit/logs")
     @PreAuthorize("hasRole('ADMIN')")
@@ -37,6 +41,8 @@ public class AuditQueryController {
                                @RequestParam(required = false) String to,
                                @RequestParam(required = false) String path,
                                @RequestParam(required = false) String requestId,
+                               @RequestParam(required = false) String reportType,
+                               @RequestParam(required = false) Long maxId,
                                @RequestParam(required = false) Integer page,
                                @RequestParam(required = false) Integer size) {
         adminReads.requireCurrentAdmin();
@@ -47,7 +53,8 @@ public class AuditQueryController {
                  or path like '%/archive-full%' or path like '%/attachments%'
                  or path like '%/audit/export%' or path like '%/rewards%'
                  or path like '%/publish%' or path like '%/screenshot%'
-                 or path like '%/system/users%' or path like '%/roles%' or path like '%/menus%')
+                 or path like '%/system/users%' or path like '%/roles%' or path like '%/menus%'
+                 or path = '/api/bureau/stats/penalties/missing-fields')
                 """;
         StringBuilder where = new StringBuilder(" where 1=1 ");
         List<Object> args = new ArrayList<>();
@@ -55,7 +62,16 @@ public class AuditQueryController {
             where.append(" and username = ? ");
             args.add(username);
         }
-        if (sensitive) where.append(" and ").append(sensitiveWhere);
+        if (sensitive) where.append(" and (").append(sensitiveWhere).append(" or ").append(REPORT_EXPORT).append(")");
+        if (reportType != null && !reportType.isBlank()) {
+            if (!"ALL_REPORTS".equals(reportType) && !REPORT_TYPES.contains(reportType))
+                return R.fail(2139, "报表类型无效");
+            where.append(" and ").append(REPORT_EXPORT);
+            if (!"ALL_REPORTS".equals(reportType)) {
+                where.append(" and report_type = ? ");
+                args.add(reportType);
+            }
+        }
         if (from != null && !from.isBlank()) {
             LocalDate d = parseDay(from);
             if (d == null) return R.fail(2139, "from 须为 yyyy-MM-dd");
@@ -75,6 +91,11 @@ public class AuditQueryController {
         if (requestId != null && !requestId.isBlank()) {
             where.append(" and request_id = ? ");
             args.add(requestId);
+        }
+        if (maxId != null) {
+            if (maxId <= 0) return R.fail(2139, "maxId 须为正整数");
+            where.append(" and id <= ? ");
+            args.add(maxId);
         }
 
         if (page == null && size == null) {

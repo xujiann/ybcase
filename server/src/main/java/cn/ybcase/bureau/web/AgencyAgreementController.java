@@ -20,9 +20,21 @@ import java.util.List;
 @RequiredArgsConstructor
 public class AgencyAgreementController {
     private final AgencyAgreementService agreements;
+    private final cn.ybcase.bureau.service.AgencyInterviewService interviews;
 
     public record Cycle(Integer cycle) {}
     public record ReturnRequest(Integer cycle, String reason) {}
+    public record InterviewRequest(Integer cycle, String institutionCode, String interviewType, String reason,
+                                   String content, String participants, java.time.LocalDate interviewDate) {}
+
+    @PostMapping("/{id}/interview")
+    public R<java.util.Map<String, Long>> interview(@PathVariable long id, @RequestBody InterviewRequest body,
+                                                   Authentication auth) {
+        return R.ok(java.util.Map.of("id", interviews.register(id, body.cycle(),
+                new cn.ybcase.bureau.service.AgencyInterviewService.ActualInterview(body.institutionCode(),
+                        body.interviewType(), body.reason(), body.content(), body.participants(), body.interviewDate()),
+                auth.getName())));
+    }
 
     @GetMapping
     public R<List<AgencyAgreementService.Handoff>> list(Authentication auth) {

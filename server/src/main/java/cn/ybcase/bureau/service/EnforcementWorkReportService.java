@@ -36,17 +36,17 @@ public class EnforcementWorkReportService {
                 select dept.name as department, officers.leads, c.party_name, officers.members,
                        case c.institution_kind when 'SINGLE_PHARMACY' then '单体药店'
                             when 'CHAIN_PHARMACY' then '连锁药店' when 'MEDICAL' then
-                            case c.institution_ownership when 'PUBLIC' then '公立医疗机构'
+                            case rf.institution_ownership when 'PUBLIC' then '公立医疗机构'
                                  when 'SOCIAL' then '非公立医疗机构' end end as institution_type,
-                       case c.institution_grade when 'TERTIARY' then '三级' when 'SECONDARY' then '二级'
+                       case rf.institution_grade when 'TERTIARY' then '三级' when 'SECONDARY' then '二级'
                             when 'PRIMARY' then '一级' when 'UNGRADED' then '无等级' end as grade,
                        cl.source, cl.clue_no,
                        (c.closed_at <= p.ends or c.terminated_at <= p.ends) is true as complete,
                        case when d.decision_type = 'PUNISH' then true
                             when d.decision_type = 'NOT_ESTABLISHED' then false end as violation,
-                       case when c.reported_at <= p.ends or d.id is not null then c.confirmed_violation_facts end as facts,
+                       case when c.reported_at <= p.ends or d.id is not null then rf.confirmed_violation_facts end as facts,
                        case when d.decision_type = 'PUNISH' then concat_ws(E'\\n',
-                           d.decision_no, nullif(d.penalty_basis,''), nullif(d.content,''),
+                           d.decision_no, nullif(rf.penalty_basis,''), nullif(d.content,''),
                            '罚款 ' || d.fine_amount || ' 元，责令退回基金 ' || d.recoup_amount || ' 元',
                            nullif(d.other_measures,'')) end as penalty,
                        agreement.results, agreement.termination,
@@ -60,6 +60,7 @@ public class EnforcementWorkReportService {
                                  '日常检查：' || inspections.ordinary) as remarks,
                        inspections.national, inspections.provincial, inspections.municipal
                 from case_file c cross join period p
+                left join case_reporting_facts rf on rf.case_id = c.id
                 left join sys_dept dept on dept.id = c.owner_dept_id
                 left join case_clue cl on cl.id = c.clue_id
                 left join case_decision d on d.case_id = c.id and d.decided_at <= p.ends
@@ -166,6 +167,7 @@ public class EnforcementWorkReportService {
                 new Object[]{"归属部门待核", rows.stream().filter(row -> row[1] == null).count()},
                 new Object[]{"案件纳入范围", "机构案件在区间内办理，或有关协议、移送、检查活动在区间内发生。关联检查随案件列示。"},
                 new Object[]{"协议处理", "实际追回金额、协议生效日、暂停截止日和回执文号取已登记的结构化办结结果。"},
+                new Object[]{"报表补录", "机构性质、等级、认定事实及处罚依据的历史缺项使用已批准的报表专用补录值，来源见报表补录台账。"},
                 new Object[]{"协议解除", "结构化办结以解除生效时间为准。历史文本复函按既有规则列示，解除结果需核对原件。"},
                 new Object[]{"历史口径", "状态、决定、协助和移送按已登记日期判断，部门名称和办案人员采用当前登记资料。"}
         ) : List.of();

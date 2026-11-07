@@ -20,7 +20,7 @@ public class DepartmentInterviewService {
     private static final Set<String> SUPERVISOR_ROLES = Set.of("LEADER", "LEGAL", "ADMIN");
     private static final String SELECT = """
             select id, department_name, institution_code, institution_name, interview_type,
-                   reason, content, participants, interview_date, dept_id, created_by
+                   reason, content, participants, interview_date, dept_id, created_by, source_agreement_id
             from department_interview
             where interview_date >= ? and interview_date < ?
             """;
@@ -87,7 +87,7 @@ public class DepartmentInterviewService {
         int changed = jdbc.update("""
                 update department_interview set institution_code = ?, institution_name = ?, interview_type = ?,
                     reason = ?, content = ?, participants = ?, interview_date = ?, updated_at = now()
-                where id = ? and dept_id = ? and (created_by = ? or ?)
+                where id = ? and dept_id = ? and (created_by = ? or ?) and source_agreement_id is null
                 """, value.institutionCode(), value.institutionName(), value.interviewType(), value.reason(),
                 value.content(), value.participants(), value.interviewDate(), id, actor.deptId(), actor.id(), canManageDepartment(actor));
         if (changed == 0) throw new BizException(403, "约谈记录不存在或不在当前账号编辑范围内");
@@ -133,7 +133,8 @@ public class DepartmentInterviewService {
                         rs.getString("institution_code"), rs.getString("institution_name"),
                         rs.getString("interview_type"), rs.getString("reason"), rs.getString("content"),
                         rs.getString("participants"), rs.getObject("interview_date", LocalDate.class),
-                        canWrite && actor.deptId() != null && actor.deptId().equals(rs.getLong("dept_id"))
+                        canWrite && rs.getObject("source_agreement_id") == null
+                                && actor.deptId() != null && actor.deptId().equals(rs.getLong("dept_id"))
                                 && (canManageDepartment(actor) || actor.id().equals(rs.getLong("created_by")))),
                 scope.params(start, limit, offset));
     }
@@ -174,7 +175,7 @@ public class DepartmentInterviewService {
         return actor.roles().contains("LEADER") || actor.roles().contains("ADMIN");
     }
 
-    private static InterviewInput validate(InterviewInput input) {
+    static InterviewInput validate(InterviewInput input) {
         if (input == null || input.interviewDate() == null || input.interviewDate().getYear() < 1900
                 || input.interviewDate().isAfter(LocalDate.now()))
             throw new BizException(2100, "请填写实际约谈日期，日期不得晚于今天");

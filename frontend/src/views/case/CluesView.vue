@@ -251,7 +251,8 @@ async function onPullMonitor() {
       ElMessage.warning('监控疑点网关尚未启用')
       return
     }
-    ElMessage.success(`已导入 ${data.data.fetched} 条，跳过重复 ${data.data.skipped ?? 0} 条`)
+    const more = data.data.hasMore === true ? '，可继续拉取下一批' : ''
+    ElMessage.success(`已导入 ${data.data.fetched} 条，跳过重复 ${data.data.skipped ?? 0} 条${more}`)
     reload()
   } catch {
     // The shared client reports the request failure.

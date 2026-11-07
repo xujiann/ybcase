@@ -70,6 +70,19 @@ public class BureauStatsController {
         return downloadWorkbook(request, filename, () -> penaltyReport.export(year, start, end, cutoff));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('LEADER','LEGAL','ADMIN')")
+    @GetMapping("/penalties/missing-fields")
+    public org.springframework.http.ResponseEntity<R<cn.ybcase.bureau.service.PenaltyReportService.MissingPenalties>> missingPenaltyFields(
+            @RequestParam int year,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate start,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate end,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate cutoff,
+            @RequestParam(defaultValue = "1") int page, @RequestParam(defaultValue = "30") int size) {
+        return org.springframework.http.ResponseEntity.ok()
+                .cacheControl(org.springframework.http.CacheControl.noStore())
+                .body(R.ok(penaltyReport.missingFields(year, start, end, cutoff, page, size)));
+    }
+
     private org.springframework.http.ResponseEntity<byte[]> downloadWorkbook(
             HttpServletRequest request, String name, Supplier<ReportExport> generate) {
         if (!reportSlots.tryAcquire()) throw new BizException(2100, "报表导出繁忙，请稍后重试");

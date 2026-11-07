@@ -3,7 +3,10 @@
     <el-alert v-if="!isAdmin" type="info" :closable="false" title="当前页面仅供管理员使用。" style="margin-bottom: 12px" />
     <div class="toolbar">
       <h3>用户管理</h3>
-      <el-button v-if="isAdmin" :disabled="loading || failed || !directoriesReady || directoryFailed || saving || rowAction !== null" type="primary" @click="openCreate">新增用户</el-button>
+      <div v-if="isAdmin">
+        <el-button :disabled="loading || failed || !directoriesReady || directoryFailed || saving || rowAction !== null" @click="rosterVisible = true">批量导入账号名册</el-button>
+        <el-button :disabled="loading || failed || !directoriesReady || directoryFailed || saving || rowAction !== null" type="primary" @click="openCreate">新增用户</el-button>
+      </div>
     </div>
     <el-alert v-if="failed || directoryFailed" type="error" :closable="false" title="用户或岗位目录加载失败，请刷新页面后重试。" />
     <el-table :data="records" v-loading="loading" border stripe>
@@ -46,6 +49,8 @@
     <el-pagination v-model:current-page="pageNo" :page-size="pageSize" :total="total"
                    layout="total, prev, pager, next" style="margin-top: 12px"
                    @current-change="load" />
+
+    <UserRosterDialog v-if="isAdmin && rosterVisible" @close="rosterVisible = false" @applied="load" />
 
     <el-dialog v-model="dialogVisible" :title="form.id ? '编辑用户' : '新增用户'" width="480px" :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
       <el-form :model="form" label-width="90px" :disabled="saving">
@@ -95,6 +100,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
+import UserRosterDialog from '../../components/UserRosterDialog.vue'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import { adminOperationAccess } from '../../api/caseWriteAccess'
@@ -132,6 +138,7 @@ const directoriesReady = ref(false)
 const saving = ref(false)
 const rowAction = ref<number | null>(null)
 const dialogVisible = ref(false)
+const rosterVisible = ref(false)
 const depts = ref<{ id: number; name: string; enabled?: boolean; orgKind?: string | null }[]>([])
 const roles = ref<{ code: string; name: string }[]>([])
 
@@ -169,6 +176,7 @@ function resetForm() {
 function invalidate(clearDraft = true) {
   loadGeneration++; directoryGeneration++; saveGeneration++; actionGeneration++
   records.value = []; total.value = 0; loading.value = false; failed.value = false; saving.value = false; rowAction.value = null
+  rosterVisible.value = false
   if (clearDraft) {
     dialogVisible.value = false; resetForm(); depts.value = []; roles.value = []; directoriesReady.value = false; directoryFailed.value = false
   }

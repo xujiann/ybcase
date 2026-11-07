@@ -173,6 +173,7 @@ public class MessageService {
                 n++;
             }
         }
+        n += remindAgencyDeadlines(ahead);
         // 已解决反馈超期未确认 → 自动关闭并告知提交人
         for (var r : closingFeedback) {
             int closed = jdbc.update("update feedback set status = 'CLOSED' where id = ? and status = 'RESOLVED'"
@@ -194,6 +195,50 @@ public class MessageService {
         }
         log.info("期限提醒生成 {} 条", n);
         return n;
+    }
+
+    private int remindAgencyDeadlines(int ahead) {
+        LocalDate today = LocalDate.now();
+        var candidates = jdbc.queryForList("""
+                select a.id from agreement_action a join sys_dept d on d.id=a.agency_dept_id
+                where a.agency_status in ('PENDING','ACCEPTED') and a.agency_due_at<=?
+                  and d.enabled and d.org_kind='AGENCY'
+                  and (a.agency_auto_reminded_at is null or a.agency_auto_reminded_at<?)
+                order by a.id
+                """, today.plusDays(ahead), today);
+        int count = 0;
+        for (var candidate : candidates) {
+            long id = ((Number) candidate.get("id")).longValue();
+            int changed = jdbc.update("""
+                    update agreement_action a set agency_auto_reminded_at=?
+                    where a.id=? and a.agency_status in ('PENDING','ACCEPTED') and a.agency_due_at<=?
+                      and (a.agency_auto_reminded_at is null or a.agency_auto_reminded_at<?)
+                      and exists(select 1 from sys_dept d where d.id=a.agency_dept_id and d.enabled and d.org_kind='AGENCY')
+                      and exists(select 1 from case_file c where c.id=a.case_id and c.party_type='PROVIDER')
+                    """, today, id, today.plusDays(ahead), today);
+            if (changed == 0) continue;
+            jdbc.update("""
+                    insert into agency_agreement_event(agreement_id,agency_cycle,event_type,agency_dept_id,
+                        department_name,detail,due_at)
+                    select id,agency_cycle,'AUTO_REMINDED',agency_dept_id,org,'系统按办理期限提醒',agency_due_at
+                    from agreement_action where id=?
+                    """, id);
+            var row = jdbc.queryForList("""
+                    select a.agency_cycle,a.agency_due_at,c.id,c.case_no,u.username
+                    from agreement_action a join case_file c on c.id=a.case_id
+                    left join sys_user u on u.username=c.owner_user and u.enabled
+                      and exists(select 1 from sys_user_role ur join sys_role r on r.id=ur.role_id
+                                 where ur.user_id=u.id and r.code in ('HANDLER','LEADER','LEGAL','ADMIN'))
+                    where a.id=?
+                    """, id).getFirst();
+            LocalDate due = ((java.sql.Date) row.get("agency_due_at")).toLocalDate();
+            if (row.get("username") instanceof String recipient)
+                send(recipient, "DEADLINE", (due.isBefore(today) ? "【超期】" : "【临期】") + "经办事项 " + row.get("case_no"),
+                        "经办办理期限 " + due + "，请核对进度，接收部门待办已标记系统提醒。",
+                        "/case/detail/" + row.get("id"), "AGENCY-DUE-" + id + "-" + row.get("agency_cycle") + "-" + today);
+            count++;
+        }
+        return count;
     }
 
     /** Re-evaluate source access at read time: recipients may have lost a case or supervisory role. */

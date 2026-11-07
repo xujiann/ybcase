@@ -22,6 +22,8 @@
       </el-col>
     </el-row>
 
+    <NextStepTasks domain="bureau" :refresh-key="loading ? undefined : d" />
+
     <el-card class="mb">
       <h4>我的在办案件（按有效期限升序，临期置顶）</h4>
       <el-table :data="d.myCases" border size="small" @row-click="(r: any) => $router.push(`/case/detail/${r.id}`)">
@@ -61,6 +63,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import client from '../../api/client'
+import NextStepTasks from '../../components/NextStepTasks.vue'
 import { useAuthStore } from '../../stores/auth'
 import { CASE_STATUS, EXECUTION_DEADLINE_STATE } from './labels'
 import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../../api/sessionExpiry'

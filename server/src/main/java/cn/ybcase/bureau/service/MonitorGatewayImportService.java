@@ -17,6 +17,7 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @Service
 @RequiredArgsConstructor
@@ -28,15 +29,23 @@ public class MonitorGatewayImportService {
     private final PlatformTransactionManager transactions;
     private final ObjectMapper mapper;
 
+    private record Checkpoint(String cursor, long revision) {}
+
     public Map<String, Object> pull(GatewayMonitorFeedAdapter adapter, String username) {
         var authorization = new TransactionTemplate(transactions);
         authorization.setReadOnly(true);
-        authorization.executeWithoutResult(status -> requireAccess(access.readActor(username)));
-        List<Map<String, String>> items = adapter.fetchSuspects().stream()
+        var before = authorization.execute(status -> {
+            requireAccess(access.readActor(username));
+            return checkpoint(false);
+        });
+        var page = adapter.fetchPage(before.cursor());
+        List<Map<String, String>> items = page.items().stream()
                 .sorted(Comparator.comparing(item -> item.get("externalId"))).toList();
         return new TransactionTemplate(transactions).execute(status -> {
             var actor = access.lockActor(username, true);
             requireAccess(actor);
+            if (checkpoint(true).revision() != before.revision())
+                throw new BizException(2163, "已有其他人员推进拉取进度，请重新拉取");
             List<String> numbers = new ArrayList<>();
             for (var item : items) {
                 String externalId = item.get("externalId");
@@ -57,9 +66,19 @@ public class MonitorGatewayImportService {
                 jdbc.update("update external_monitor_clue set clue_id=? where external_id=?", clue.getId(), externalId);
                 numbers.add(clue.getClueNo());
             }
+            if (page.nextCursor() != null && !Objects.equals(page.nextCursor(), before.cursor()))
+                jdbc.update("""
+                        update external_monitor_checkpoint set cursor_value=?, revision=revision+1 where singleton
+                        """, page.nextCursor());
             return Map.of("fetched", numbers.size(), "skipped", items.size() - numbers.size(),
-                    "clueNos", numbers, "adapter", "GatewayMonitorFeedAdapter");
+                    "clueNos", numbers, "hasMore", page.hasMore(), "adapter", "GatewayMonitorFeedAdapter");
         });
+    }
+
+    private Checkpoint checkpoint(boolean lock) {
+        String sql = "select cursor_value, revision from external_monitor_checkpoint where singleton";
+        return jdbc.queryForObject(lock ? sql + " for update" : sql,
+                (row, number) -> new Checkpoint(row.getString("cursor_value"), row.getLong("revision")));
     }
 
     private void requireAccess(WorkflowUserAccess.User actor) {

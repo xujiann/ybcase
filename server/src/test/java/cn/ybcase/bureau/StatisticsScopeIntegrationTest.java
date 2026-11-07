@@ -184,6 +184,159 @@ class StatisticsScopeIntegrationTest {
         }
     }
 
+    @Test void penaltyMissingFieldsUsesAnnualPopulationAndOnlyApplicableSourceFields() throws Exception {
+        var bureau = actor("LEGAL");
+        var district = actor("LEADER");
+        var unclassified = actor("ADMIN");
+        jdbc.update("update sys_user set account_category='BUREAU' where id=?", bureau.id());
+        jdbc.update("update sys_user set account_category='DISTRICT', dept_id=2 where id=?", district.id());
+
+        LocalDate first = LocalDate.of(1907, 3, 1);
+        LocalDate second = first.plusDays(1);
+        String provider = penaltyQualityFixture("缺项核对机构", "PROVIDER", "PUNISH", first);
+        jdbc.update("""
+                update case_file set institution_code=?, confirmed_violation_facts=?,
+                    confirmed_violation_start=date '1907-01-01', confirmed_violation_amount=0 where case_no=?
+                """, " \t", " \n", provider);
+        jdbc.update("""
+                update case_decision set penalty_basis=?, publish_withdrawn=true, withdrawn_at=timestamptz '1907-03-01 09:00:00+08'
+                where case_id=(select id from case_file where case_no=?)
+                """, " \t", provider);
+
+        String individual = penaltyQualityFixture("缺项核对自然人", "INDIVIDUAL", "PUNISH", second);
+        String complete = penaltyQualityFixture("字段齐全机构", "PROVIDER", "PUNISH", second);
+        jdbc.update("""
+                update case_file set confirmed_violation_start=date '1907-01-01', confirmed_violation_end=date '1907-01-02',
+                    confirmed_violation_facts='确认事实' where case_no in (?,?)
+                """, individual, complete);
+        jdbc.update("""
+                update case_file set institution_code='0009', institution_ownership='SOCIAL',
+                    institution_grade='UNGRADED', confirmed_violation_amount=0 where case_no=?
+                """, complete);
+        jdbc.update("update case_decision set penalty_basis='有效依据' where case_id in (select id from case_file where case_no in (?,?))",
+                individual, complete);
+        penaltyQualityFixture("非处罚记录", "PROVIDER", "NO_PUNISH", second);
+        penaltyQualityFixture("其他主体记录", "OTHER", "PUNISH", second);
+        penaltyQualityFixture("区间外记录", "PROVIDER", "PUNISH", second.plusDays(1));
+
+        String filters = "?year=1907&start=" + first + "&end=" + second + "&cutoff=1907-04-01";
+        String path = "/stats/penalties/missing-fields" + filters;
+        call(district, path, 403);
+        call(unclassified, path, 403);
+        call(actor("HANDLER"), path, 403);
+        call(bureau, path + "&size=101", 2100);
+        call(bureau, path + "&page=0", 2100);
+        var firstPage = call(bureau, path + "&size=1", 0);
+        assertEquals(2, firstPage.path("total").asInt());
+        assertEquals(first.toString(), firstPage.path("start").asText());
+        assertEquals(second.toString(), firstPage.path("end").asText());
+        assertEquals("1907-04-01", firstPage.path("cutoff").asText());
+        var firstRow = firstPage.path("rows").get(0);
+        assertEquals(provider, firstRow.path("caseNo").asText());
+        assertEquals(first.toString(), firstRow.path("decidedAt").asText());
+        assertEquals("缺项核对机构", firstRow.path("partyName").asText());
+        assertEquals(mapper.valueToTree(List.of("机构编码", "机构性质", "机构等级", "违法发生期间", "认定违法事实", "处罚依据")),
+                firstRow.path("missingFields"));
+
+        var secondRow = call(bureau, path + "&page=2&size=1", 0).path("rows").get(0);
+        assertEquals(individual, secondRow.path("caseNo").asText());
+        assertEquals(mapper.valueToTree(List.of("参保人证件号码", "认定违法违规金额")), secondRow.path("missingFields"));
+        var outsidePage = call(bureau, path + "&page=2147483647&size=100", 0);
+        assertEquals(2, outsidePage.path("total").asInt());
+        assertTrue(outsidePage.path("rows").isEmpty());
+
+        var check = mvc.perform(get("/api/bureau" + path)
+                .header("Authorization", "Bearer " + bureau.token())).andReturn().getResponse();
+        assertEquals("no-store", check.getHeader("Cache-Control"));
+
+        var response = mvc.perform(get("/api/bureau/stats/penalties/download" + filters)
+                .header("Authorization", "Bearer " + bureau.token())).andReturn().getResponse();
+        var sheets = reportSheets(response.getContentAsByteArray());
+        var details = sheets.get("xl/worksheets/sheet1.xml");
+        var notes = sheets.get("xl/worksheets/sheet2.xml");
+        assertTrue(reportRow(details, "F", "缺项核对机构") >= 4);
+        assertTrue(reportRow(details, "F", "缺项核对自然人") >= 4);
+        assertTrue(reportRow(details, "F", "字段齐全机构") >= 4);
+        assertEquals("3", reportCell(notes, "B" + reportRow(notes, "A", "处罚记录数")).getTextContent());
+    }
+
+    @Test void approvedReportingSupplementsFeedBothWorkbooksWithoutChangingSourceFacts() throws Exception {
+        var handler = actor("HANDLER");
+        var reviewer = actor("LEGAL");
+        jdbc.update("update sys_user set account_category='DISTRICT', dept_id=1 where id=?", handler.id());
+        jdbc.update("update sys_user set account_category='BUREAU', dept_id=(select id from sys_dept where code='DL_OFF_LEGAL') where id=?",
+                reviewer.id());
+        var date = LocalDate.of(1908, 3, 1);
+        String number = penaltyQualityFixture("历史补录报表机构", "PROVIDER", "PUNISH", date);
+        long id = jdbc.queryForObject("select id from case_file where case_no=?", Long.class, number);
+        jdbc.update("""
+                update case_file set owner_user=?, owner_dept_id=1, institution_kind='MEDICAL',
+                    confirmed_violation_amount=0, status='CLOSED', closed_at=? where id=?
+                """, handler.name(), date, id);
+        String filters = "?year=1908&start=1908-03-01&end=1908-03-01&cutoff=1908-03-01";
+        assertEquals(1, call(reviewer, "/stats/penalties/missing-fields" + filters, 0).path("total").asInt());
+        var requested = mvc.perform(post("/api/bureau/cases/" + id + "/report-supplements")
+                .header("Authorization", "Bearer " + handler.token()).contentType("application/json")
+                .content(mapper.writeValueAsString(Map.of("reason", "依据原卷补齐报表字段", "sourceReference", "原卷第2至5页",
+                        "values", Map.of("institutionCode", "001-history", "institutionOwnership", "SOCIAL",
+                                "institutionGrade", "UNGRADED", "confirmedViolationStart", "1908-01-01",
+                                "confirmedViolationEnd", "1908-01-02", "confirmedViolationFacts", "原卷确认的历史事实",
+                                "penaltyBasis", "原决定载明的依据")))))
+                .andReturn().getResponse();
+        var request = mapper.readTree(requested.getContentAsString());
+        assertEquals(0, request.path("code").asInt(-1), request.toString());
+        long requestId = request.path("data").path("id").asLong();
+        assertEquals(1, call(reviewer, "/stats/penalties/missing-fields" + filters, 0).path("total").asInt());
+        var reviewed = mvc.perform(post("/api/bureau/cases/" + id + "/report-supplements/" + requestId + "/review")
+                .header("Authorization", "Bearer " + reviewer.token()).contentType("application/json")
+                .content("{\"approve\":true,\"opinion\":\"已核原卷材料\"}")).andReturn().getResponse();
+        assertEquals(0, mapper.readTree(reviewed.getContentAsString()).path("code").asInt(-1));
+        assertEquals(0, call(reviewer, "/stats/penalties/missing-fields" + filters, 0).path("total").asInt());
+
+        var penalty = mvc.perform(get("/api/bureau/stats/penalties/download" + filters)
+                .header("Authorization", "Bearer " + reviewer.token())).andReturn().getResponse();
+        var sheets = reportSheets(penalty.getContentAsByteArray());
+        var penaltySheet = sheets.get("xl/worksheets/sheet1.xml");
+        int row = reportRow(penaltySheet, "E", "001-history");
+        assertTrue(row >= 4);
+        assertEquals("社会办", reportCell(penaltySheet, "G" + row).getTextContent());
+        assertEquals("未定级", reportCell(penaltySheet, "H" + row).getTextContent());
+        assertEquals("原卷确认的历史事实", reportCell(penaltySheet, "I" + row).getTextContent());
+        assertEquals("0.00", reportCell(penaltySheet, "J" + row).getTextContent());
+        assertTrue(reportCell(penaltySheet, "K" + row).getTextContent().contains("原决定载明的依据"));
+        var notes = sheets.get("xl/worksheets/sheet2.xml");
+        assertEquals("1", reportCell(notes, "B" + reportRow(notes, "A", "有已审核补录台账的案件数")).getTextContent());
+
+        var work = mvc.perform(get("/api/bureau/stats/enforcement-work/download?start=1908-03-01&end=1908-03-01")
+                .header("Authorization", "Bearer " + reviewer.token())).andReturn().getResponse();
+        var workSheet = reportSheets(work.getContentAsByteArray()).get("xl/worksheets/sheet1.xml");
+        int workRow = reportRow(workSheet, "D", "历史补录报表机构");
+        assertEquals("非公立医疗机构", reportCell(workSheet, "E" + workRow).getTextContent());
+        assertEquals("无等级", reportCell(workSheet, "F" + workRow).getTextContent());
+        assertEquals("原卷确认的历史事实", reportCell(workSheet, "K" + workRow).getTextContent());
+        assertTrue(reportCell(workSheet, "L" + workRow).getTextContent().contains("原决定载明的依据"));
+
+        var original = jdbc.queryForMap("""
+                select c.institution_code, c.institution_ownership, c.institution_grade,
+                       c.confirmed_violation_start, c.confirmed_violation_end, c.confirmed_violation_facts,
+                       c.confirmed_violation_amount, d.penalty_basis
+                from case_file c join case_decision d on d.case_id=c.id where c.id=?
+                """, id);
+        assertEquals(new java.math.BigDecimal("0.00"), original.remove("confirmed_violation_amount"));
+        assertTrue(original.values().stream().allMatch(Objects::isNull));
+    }
+
+    private String penaltyQualityFixture(String partyName, String partyType, String decisionType, LocalDate date) {
+        String number = "QUALITY-" + System.nanoTime();
+        long id = jdbc.queryForObject("""
+                insert into case_file (case_no, name, cause_id, party_name, party_type, filed_at, deadline_at)
+                values (?, '缺项核对测试', (select min(id) from case_cause), ?, ?, ?, ?) returning id
+                """, Long.class, number, partyName, partyType, date.minusDays(1), date);
+        jdbc.update("insert into case_decision(case_id, decision_type, content, decided_at) values (?, ?, '测试决定', ?)",
+                id, decisionType, date);
+        return number;
+    }
+
     @Test void traceCodeCluesCanBeFilteredBeforePagination() throws Exception {
         var handler = actor("HANDLER");
         var marker = "trace-" + System.nanoTime();

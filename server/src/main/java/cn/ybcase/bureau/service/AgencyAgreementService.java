@@ -25,15 +25,18 @@ public class AgencyAgreementService {
 
     private final JdbcTemplate jdbc;
     private final MaterialAccess materialAccess;
+    private final AgencyInterviewService interviews;
 
     public record Department(long id, String name) {}
     public record Handoff(long id, String caseNo, String institutionName, String action,
                           LocalDate sentAt, String note, String status, int cycle, LocalDate dueAt,
                           LocalDate receivedAt, LocalDate returnedAt, String returnReason, LocalDate remindedAt,
                           LocalDate repliedAt, String result, String resultType, BigDecimal recoveredAmount,
-                          LocalDate effectiveAt, LocalDate endAt, String reference) {}
+                          LocalDate effectiveAt, LocalDate endAt, String reference, Long interviewId,
+                          LocalDate autoRemindedAt) {}
     public record Reply(Integer cycle, String result, String resultType, BigDecimal recoveredAmount,
-                        LocalDate effectiveAt, LocalDate endAt, String reference) {}
+                        LocalDate effectiveAt, LocalDate endAt, String reference,
+                        AgencyInterviewService.ActualInterview interview) {}
     public record Reassignment(Integer cycle, Long agencyDeptId, LocalDate dueAt, String reason) {}
     public record Event(int cycle, String type, String department, String actor, String detail,
                         LocalDate dueAt, OffsetDateTime createdAt) {}
@@ -88,7 +91,7 @@ public class AgencyAgreementService {
                 update agreement_action set agency_dept_id = ?, org = ?, agency_status = 'PENDING',
                     agency_cycle = agency_cycle + 1, agency_due_at = ?, agency_received_at = null,
                     agency_received_by = null, agency_returned_at = null, agency_return_reason = null,
-                    agency_reminded_at = null
+                    agency_reminded_at = null, agency_auto_reminded_at = null
                 where id = ? and agency_cycle = ? and agency_status in ('PENDING', 'RETURNED')
                 """, dept, department, request.dueAt(), id, cycle);
         if (changed == 0) throw new BizException(2073, "仅待接收或已退回事项可重新分派，请刷新后重试");
@@ -129,7 +132,8 @@ public class AgencyAgreementService {
                        a.agency_status, a.agency_cycle, a.agency_due_at, a.agency_received_at,
                        a.agency_returned_at, a.agency_return_reason, a.agency_reminded_at, a.agency_result_type,
                        a.agency_recovered_amount, a.agency_result_effective_at, a.agency_result_end_at,
-                       a.agency_result_reference
+                       a.agency_result_reference, a.agency_auto_reminded_at,
+                       (select i.id from department_interview i where i.source_agreement_id=a.id) as interview_id
                 from agreement_action a join case_file c on c.id = a.case_id
                 where a.agency_dept_id = ? and c.party_type = 'PROVIDER'
                 order by (a.agency_status not in ('PENDING', 'ACCEPTED')), a.agency_due_at nulls last,
@@ -142,7 +146,8 @@ public class AgencyAgreementService {
                 rs.getObject("agency_reminded_at", LocalDate.class), rs.getObject("replied_at", LocalDate.class),
                 rs.getString("result"), rs.getString("agency_result_type"), rs.getBigDecimal("agency_recovered_amount"),
                 rs.getObject("agency_result_effective_at", LocalDate.class), rs.getObject("agency_result_end_at", LocalDate.class),
-                rs.getString("agency_result_reference")), deptId);
+                rs.getString("agency_result_reference"), rs.getObject("interview_id", Long.class),
+                rs.getObject("agency_auto_reminded_at", LocalDate.class)), deptId);
     }
 
     @Transactional
@@ -181,6 +186,9 @@ public class AgencyAgreementService {
                 """, String.class, id, deptId, cycle);
         checkChanged(actions.size());
         String result = requiredText(reply.result(), 4000, "办理结果");
+        if (reply.interview() != null && !("INTERVIEW".equals(actions.getFirst())
+                && "COMPLETED".equals(reply.resultType())))
+            throw new BizException(2192, "实际约谈资料仅用于已落实的约谈事项");
         BigDecimal amount = validateResult(actions.getFirst(), reply);
         String reference = reply.reference() == null || reply.reference().isBlank()
                 ? null : requiredText(reply.reference(), 128, "回执文号");
@@ -193,6 +201,7 @@ public class AgencyAgreementService {
                 reply.endAt(), reference, id, deptId, cycle);
         checkChanged(changed);
         recordEvent(id, "COMPLETED", username, null);
+        if (reply.interview() != null) interviews.registerLocked(id, cycle, reply.interview(), actor);
     }
 
     private static BigDecimal validateResult(String action, Reply reply) {

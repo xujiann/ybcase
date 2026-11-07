@@ -10,6 +10,7 @@
       <el-date-picker v-model="penaltyStart" type="date" value-format="YYYY-MM-DD" placeholder="决定起始日（选填）" />
       <el-date-picker v-model="penaltyEnd" type="date" value-format="YYYY-MM-DD" placeholder="决定结束日（选填）" />
       <el-date-picker v-model="penaltyCutoff" type="date" value-format="YYYY-MM-DD" placeholder="执行截至日（默认今天）" />
+      <PenaltyMissingFields :params="penaltyParams" />
       <el-button :loading="penaltyExporting" :disabled="!penaltyYear" @click="onAnnualPenaltyExport">导出内部核对版</el-button>
       <el-button :loading="penaltyExporting" @click="onPenaltyExport">导出 2024–2026 年原表</el-button>
     </el-card>
@@ -29,6 +30,11 @@
       <el-date-picker v-model="interviewCutoff" type="date" value-format="YYYY-MM-DD" placeholder="统计截至日（默认今天）" />
       <el-button :loading="penaltyExporting" :disabled="!interviewYear" @click="onInterviewExport">导出 Excel</el-button>
     </el-card>
+    <el-alert v-if="canExportPenalties && lastReportExport" type="success" :closable="false"
+              title="最近一次成功导出" class="mb">
+      <span>{{ lastReportExport.filename }} · 请求号 <code>{{ lastReportExport.requestId }}</code></span>
+    </el-alert>
+    <HistoricalReportSupplement v-if="canReviewReportSupplements" />
     <el-row :gutter="12" class="mb">
       <el-col :span="4" v-for="card in cards" :key="card.label">
         <el-card>
@@ -103,7 +109,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import client from '../../api/client'
 import { createResourceLoader, resourceState } from '../../api/loadableResource'
@@ -111,11 +117,19 @@ import { CASE_STATUS, PARTY_TYPE } from './labels'
 import { useAuthStore } from '../../stores/auth'
 import { sessionExpiry } from '../../api/sessionExpiry'
 import { localDate } from '../../api/dates'
+import PenaltyMissingFields from './PenaltyMissingFields.vue'
+import HistoricalReportSupplement from './HistoricalReportSupplement.vue'
 
 const auth = useAuthStore()
 const canExportPenalties = computed(() => auth.user?.accountCategory === 'BUREAU'
   && auth.user?.roles.some(role => ['LEADER', 'LEGAL', 'ADMIN'].includes(role)))
+const canReviewReportSupplements = computed(() => auth.user?.accountCategory === 'BUREAU'
+  && auth.user?.roles.some(role => ['LEADER', 'LEGAL'].includes(role)))
 const penaltyExporting = ref(false)
+const lastReportExport = ref<{ filename: string; requestId: string }>()
+watch(() => [auth.token, auth.user?.id, canExportPenalties.value], () => {
+  lastReportExport.value = undefined
+}, { flush: 'sync' })
 const workEnd = ref(localDate())
 const workStart = ref(workEnd.value.slice(0, 4) + '-01-01')
 const penaltyDownload = new AbortController()
@@ -132,6 +146,13 @@ const penaltyYear = ref<number | undefined>(reportYear)
 const penaltyStart = ref<string>()
 const penaltyEnd = ref<string>()
 const penaltyCutoff = ref<string>()
+const penaltyParams = computed(() => {
+  const year = penaltyYear.value
+  if (!year) return undefined
+  const params = annualReportParams(year, penaltyStart.value, penaltyCutoff.value)
+  if (penaltyEnd.value) params.end = penaltyEnd.value
+  return params
+})
 const interviewYear = ref<number | undefined>(reportYear)
 const interviewStart = ref<string>()
 const interviewCutoff = ref<string>()
@@ -164,9 +185,8 @@ function onPenaltyExport() {
 
 function onAnnualPenaltyExport() {
   const year = penaltyYear.value
-  if (!year) return
-  const params = annualReportParams(year, penaltyStart.value, penaltyCutoff.value)
-  if (penaltyEnd.value) params.end = penaltyEnd.value
+  const params = penaltyParams.value
+  if (!year || !params) return
   return downloadWorkbook('/bureau/stats/penalties/download', `${year}年行政处罚情况统计表（内部核对）.xlsx`, params)
 }
 
@@ -193,18 +213,22 @@ function onInterviewExport() {
 async function downloadWorkbook(path: string, filename: string, params?: Record<string, string>) {
   if (penaltyExporting.value || !canExportPenalties.value) return
   const token = auth.token
+  const userId = auth.user?.id
   const stamp = sessionExpiry.capture(token)
   const signal = penaltyDownload.signal
   penaltyExporting.value = true
   try {
     const response = await client.get<Blob>(path, { responseType: 'blob', signal, params, timeout: 120_000 })
-    if (signal.aborted || !canExportPenalties.value || !sessionExpiry.isCurrent(stamp, auth.token)
+    if (signal.aborted || auth.user?.id !== userId || !canExportPenalties.value || !sessionExpiry.isCurrent(stamp, auth.token)
       || sessionExpiry.isExpired(stamp, auth.token)) return
     if (response.headers['content-type'] !== 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') {
       ElMessage.error('未收到有效的 Excel 报表')
       return
     }
     download(response.data, filename)
+    const requestId = response.headers['x-request-id']
+    lastReportExport.value = typeof requestId === 'string' && requestId.trim()
+      ? { filename, requestId: requestId.trim() } : undefined
   } catch {
     // The shared client displays request and business errors.
   } finally {

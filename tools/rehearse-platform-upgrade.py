@@ -159,8 +159,8 @@ class Drill:
                                   + " union all ".join(queries) + ") snapshot"))
         return columns, rows
 
-    def login(self):
-        result = api(self.port, "/auth/login", {"username": "admin", "password": self.admin_password})
+    def login(self, username="admin", password=None):
+        result = api(self.port, "/auth/login", {"username": username, "password": password or self.admin_password})
         return result["token"]
 
     def workbook(self, path, token):
@@ -178,10 +178,109 @@ class Drill:
             error = json.loads(data) if data.startswith(b"{") else {}
             raise RuntimeError(f"Attachment download failed: HTTP {status}, {error.get('code')}, {error.get('message')}")
 
+    def verify_report_audit(self, token):
+        audit = "/audit/logs?page=1&size=20&reportType="
+        combined = api(self.port, audit + "ALL_REPORTS", token=token)
+        assert combined["total"] == 3
+        assert {row["report_type"] for row in combined["rows"]} == {"PENALTIES", "ENFORCEMENT_WORK", "INTERVIEWS"}
+        for row in combined["rows"]:
+            assert row["username"] == "admin" and row["request_id"] and row["report_row_count"] >= 1
+            assert row["report_start"] <= row["report_end"] and row["report_cutoff"]
+            exact = api(self.port, audit + row["report_type"] + "&requestId=" + row["request_id"], token=token)
+            assert exact["total"] == 1 and exact["rows"][0]["id"] == row["id"]
+
+    def verify_reporting_supplement(self, database, token):
+        case_id = int(self.sql(database, "select id from case_file where case_no='DRILL-2026-1'"))
+        source_query = f"""
+            select md5(jsonb_build_object('case',to_jsonb(c),'decision',to_jsonb(d))::text)
+            from case_file c join case_decision d on d.case_id=c.id where c.id={case_id}
+            """
+        original = self.sql(database, source_query)
+        route = f"/bureau/cases/{case_id}/report-supplements"
+        supplement = api(self.port, route, {
+            "reason": "合成旧案报表补录演练", "sourceReference": "合成案卷资料第1页",
+            "values": {
+                "institutionCode": "DRILL-SUPPLEMENT", "institutionOwnership": "PUBLIC",
+                "institutionGrade": "UNGRADED", "confirmedViolationStart": "2026-09-01",
+                "confirmedViolationEnd": "2026-09-01", "confirmedViolationFacts": "合成核实事实",
+                "confirmedViolationAmount": 0, "penaltyBasis": "合成报表依据",
+            },
+        }, token)
+        reviewer_password = "Reviewer-" + secrets.token_hex(16)
+        department = int(self.sql(database, "select id from sys_dept where code='DL_OFF_LEGAL'"))
+        api(self.port, "/system/users", {
+            "username": "drill_reviewer", "password": reviewer_password, "realName": "演练审核员",
+            "deptId": department, "accountCategory": "BUREAU", "roleCodes": ["LEGAL"],
+        }, token)
+        reviewer = self.login("drill_reviewer", reviewer_password)
+        changed_password = "Changed-" + secrets.token_hex(16)
+        api(self.port, "/auth/change-password", {
+            "oldPassword": reviewer_password, "newPassword": changed_password,
+        }, reviewer)
+        reviewer = self.login("drill_reviewer", changed_password)
+        api(self.port, route + f"/{supplement['id']}/review", {
+            "approve": True, "opinion": "合成资料核实通过，仅供报表",
+        }, reviewer)
+        state = api(self.port, route, token=token)
+        assert not state["missingFields"]
+        assert state["original"]["institutionCode"] is None
+        assert state["effective"]["institutionCode"] == "DRILL-SUPPLEMENT"
+        assert self.sql(database, source_query) == original
+        quality = api(self.port, "/bureau/stats/penalties/missing-fields?year=2026&page=1&size=20", token=token)
+        assert quality["total"] == 0
+        assert b"DRILL-SUPPLEMENT" in self.workbook("/bureau/stats/penalties/download?year=2026", token)
+
+    def verify_workflow_automation(self, database, token):
+        today = time.strftime("%Y-%m-%d")
+        department = api(self.port, "/system/depts", {
+            "name": "演练经办部门", "code": "DRILL_AGENCY", "type": "ADMIN", "orgKind": "AGENCY",
+        }, token)
+        password = "Agency-" + secrets.token_hex(16)
+        api(self.port, "/system/users", {
+            "username": "drill_agency", "password": password, "realName": "演练经办员",
+            "deptId": department["id"], "accountCategory": "AGENCY", "roleCodes": ["AGENCY"],
+        }, token)
+        agency = self.login("drill_agency", password)
+        changed = "Changed-" + secrets.token_hex(16)
+        api(self.port, "/auth/change-password", {"oldPassword": password, "newPassword": changed}, agency)
+        agency = self.login("drill_agency", changed)
+        case_id = int(self.sql(database, "select id from case_file where case_no='DRILL-2026-1'"))
+        api(self.port, f"/bureau/cases/{case_id}/agreement-actions", {
+            "action": "INTERVIEW", "agencyDeptId": str(department["id"]), "sentAt": today, "dueAt": today,
+        }, token)
+        inbox = api(self.port, "/agency/agreement-actions", token=agency)
+        assert len(inbox) == 1
+        agreement = inbox[0]["id"]
+        task = api(self.port, "/agency/my/tasks", token=agency)
+        assert task["total"] == 1 and task["rows"][0]["sourceId"] == agreement
+        before = task["rows"][0]["taskKey"]
+        api(self.port, "/bureau/messages/generate-reminders", {}, token)
+        assert api(self.port, "/agency/agreement-actions", token=agency)[0]["autoRemindedAt"] == today
+        base = f"/agency/agreement-actions/{agreement}"
+        api(self.port, base + "/receive", {"cycle": 1}, agency)
+        task = api(self.port, "/agency/my/tasks", token=agency)
+        assert task["total"] == 1 and task["rows"][0]["taskKey"] != before
+        details = {"interviewType": "经办约谈", "reason": "合成演练事由", "content": "合成实际约谈记录",
+                   "participants": "演练甲、演练乙", "interviewDate": today}
+        api(self.port, base + "/reply", {"cycle": 1, "result": "已落实", "resultType": "COMPLETED",
+                                       "interview": details}, agency)
+        assert api(self.port, "/agency/my/tasks", token=agency)["total"] == 0
+        result = api(self.port, "/agency/agreement-actions", token=agency)[0]
+        assert result["interviewId"]
+        repeated = api(self.port, base + "/interview", {"cycle": 1, **details}, agency)
+        assert repeated["id"] == result["interviewId"]
+        assert self.sql(database, f"select count(*) from department_interview where source_agreement_id={agreement}") == "1"
+        assert "合成实际约谈记录".encode() in self.workbook(
+            "/bureau/stats/interviews/download?year=" + today[:4], token)
+
     def scale(self, database, token):
         count = self.args.scale_rows
         if not count:
             return {}
+        initial_interviews = int(self.sql(database, """
+            select count(*) from department_interview
+            where interview_date >= date '2026-01-01' and interview_date < date '2027-01-01'
+            """))
         self.sql(database, f"""
             insert into case_file (case_no,name,cause_id,party_name,party_type,filed_at,deadline_at,status)
             select 'DRILL-SCALE-'||n,'合成演练案件',(select min(id) from case_cause),
@@ -212,7 +311,7 @@ class Drill:
             assert {int(item) for item in re.findall(rb"DRILL-SCALE-(\d+)", xml)} == expected, label
             measurements[label] = {"syntheticRows": count, "seconds": round(time.monotonic() - started, 2)}
         page_size = 50
-        total = count + 1
+        total = count + initial_interviews
         last_page = (total + page_size - 1) // page_size
         started = time.monotonic()
         first = api(self.port, f"/bureau/interviews/page?year=2026&page=1&size={page_size}", token=token)
@@ -274,8 +373,8 @@ class Drill:
         assert digest(attachment) == digest(target)
 
         self.start(self.args.candidate, new, restored, "candidate")
-        version = self.sql(new, "select max(version::integer) from flyway_schema_history where success")
-        assert int(version) >= 42
+        version = int(self.sql(new, "select max(version::integer) from flyway_schema_history where success"))
+        assert version >= 42
         after = self.snapshot(new, columns)[1]
         for table in before:
             if table != "flyway_schema_history":
@@ -291,6 +390,15 @@ class Drill:
             "participants": "演练员", "interviewDate": "2026-10-15",
         }, token)
         assert "发布演练约谈".encode() in self.workbook("/bureau/stats/interviews/download?year=2026", token)
+        if version >= 44:
+            quality = api(self.port, "/bureau/stats/penalties/missing-fields?year=2026&page=1&size=20", token=token)
+            assert quality["total"] == 1 and quality["rows"][0]["caseNo"] == "DRILL-2026-1"
+            assert quality["rows"][0]["missingFields"]
+            self.verify_report_audit(token)
+        if version >= 45:
+            self.verify_reporting_supplement(new, token)
+        if version >= 46:
+            self.verify_workflow_automation(new, token)
         measurements = self.scale(new, token)
         self.stop()
 
@@ -308,9 +416,10 @@ class Drill:
         assert self.sql(rollback, "select max(version::integer) from flyway_schema_history where success") == "34"
         assert self.sql(rollback, "select count(*) from case_file where case_no='DRILL-2026-1'") == "1"
         assert digest(attachment) == digest(target)
-        return {"previousSchema": 34, "candidateSchema": int(version), "tablesRestored": len(before),
+        return {"previousSchema": 34, "candidateSchema": version, "tablesRestored": len(before),
                 "attachmentVerified": True, "threeReportsWithData": True, "rollbackBinaryHealthy": True,
-                "javaHeapMiB": 512, "scale": measurements}
+                "reportQualityAndAuditVerified": version >= 44, "historicalSupplementVerified": version >= 45,
+                "workflowTasksAndInterviewVerified": version >= 46, "javaHeapMiB": 512, "scale": measurements}
 
     def cleanup(self):
         self.stop()

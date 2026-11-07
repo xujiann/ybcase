@@ -26,8 +26,12 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -37,11 +41,14 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 @AutoConfigureMockMvc
 class ExternalGatewayIntegrationTest {
     private static final AtomicReference<String> MONITOR = new AtomicReference<>("合成疑点");
+    private static final AtomicReference<Function<JsonNode, Object>> MONITOR_PAGE =
+            new AtomicReference<>(request -> Map.of("items", List.of(monitorItem("monitor-fixture-1", MONITOR.get()))));
     private static final AtomicReference<String> AMOUNT = new AtomicReference<>("23.45");
     private static final AtomicInteger SIGN = new AtomicInteger();
     private static final AtomicInteger RECEIPT = new AtomicInteger();
     private static final AtomicInteger VERIFY = new AtomicInteger();
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final java.util.concurrent.ExecutorService HTTP_WORKERS = Executors.newVirtualThreadPerTaskExecutor();
     private static final HttpServer GATEWAY = gateway();
 
     @Autowired MockMvc mvc;
@@ -60,7 +67,10 @@ class ExternalGatewayIntegrationTest {
         }
     }
 
-    @AfterAll static void stop() { GATEWAY.stop(0); }
+    @AfterAll static void stop() {
+        GATEWAY.stop(0);
+        HTTP_WORKERS.shutdownNow();
+    }
 
     @Test void monitorDeduplicatesAndRefusesChangedExternalItem() throws Exception {
         var bureau = actor("BUREAU", 1);
@@ -82,6 +92,74 @@ class ExternalGatewayIntegrationTest {
             MONITOR.set("合成疑点");
             setMonitor(Boolean.parseBoolean(old));
         }
+    }
+
+    @Test void monitorAdvancesOnlyWithACommittedPageAndRejectsStaleConcurrentPages() throws Exception {
+        var bureau = actor("BUREAU", 1);
+        var second = actor("BUREAU", 1);
+        String old = jdbc.queryForObject("select cfg_value from sys_config where cfg_key='monitor_feed_enabled'", String.class);
+        var original = MONITOR_PAGE.get();
+        var cursors = new java.util.concurrent.ConcurrentLinkedQueue<String>();
+        var reached = new CountDownLatch(1);
+        var resume = new CountDownLatch(1);
+        String path = "/clues/fetch-monitor";
+        setMonitor(true);
+        try (var requests = Executors.newVirtualThreadPerTaskExecutor()) {
+            MONITOR_PAGE.set(input -> {
+                assertEquals(500, input.path("limit").asInt());
+                cursors.add(input.path("cursor").asText(""));
+                return Map.of("items", List.of(monitorItem("cursor-first", "原始疑点")),
+                        "nextCursor", "page-1", "hasMore", true);
+            });
+            assertTrue(postAs(bureau, path, Map.of()).path("data").path("hasMore").asBoolean());
+            assertEquals(List.of(""), List.copyOf(cursors));
+            assertEquals("page-1", savedMonitorCursor());
+
+            MONITOR_PAGE.set(input -> {
+                cursors.add(input.path("cursor").asText(""));
+                return Map.of("items", List.of(monitorItem("cursor-first", "冲突疑点"), monitorItem("cursor-0-rolled-back", "无效批次")),
+                        "nextCursor", "page-2");
+            });
+            assertEquals(2162, postAs(bureau, path, Map.of()).path("code").asInt());
+            assertEquals("page-1", savedMonitorCursor());
+            assertEquals(0, jdbc.queryForObject(
+                    "select count(*) from external_monitor_clue where external_id='cursor-0-rolled-back'", Integer.class));
+
+            var received = new AtomicInteger();
+            MONITOR_PAGE.set(input -> {
+                cursors.add(input.path("cursor").asText(""));
+                if (received.incrementAndGet() != 1)
+                    return Map.of("items", List.of(monitorItem("cursor-next", "接收疑点")), "nextCursor", "page-2");
+                reached.countDown();
+                try {
+                    if (!resume.await(6, TimeUnit.SECONDS)) throw new IllegalStateException("No concurrent test request");
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(error);
+                }
+                return Map.of("items", List.of(monitorItem("cursor-stale", "过时疑点")), "nextCursor", "older-page");
+            });
+            var stale = requests.submit(() -> postAs(bureau, path, Map.of()));
+            try {
+                assertTrue(reached.await(4, TimeUnit.SECONDS));
+                assertEquals(0, postAs(second, path, Map.of()).path("code").asInt());
+            } finally {
+                resume.countDown();
+            }
+            assertEquals(2163, stale.get(6, TimeUnit.SECONDS).path("code").asInt());
+            assertEquals("page-2", savedMonitorCursor());
+            assertEquals(0, jdbc.queryForObject(
+                    "select count(*) from external_monitor_clue where external_id='cursor-stale'", Integer.class));
+            assertEquals(List.of("", "page-1", "page-1", "page-1"), List.copyOf(cursors));
+        } finally {
+            MONITOR_PAGE.set(original);
+            jdbc.update("update external_monitor_checkpoint set cursor_value=null, revision=0 where singleton");
+            setMonitor(Boolean.parseBoolean(old));
+        }
+    }
+
+    private String savedMonitorCursor() {
+        return jdbc.queryForObject("select cursor_value from external_monitor_checkpoint where singleton", String.class);
     }
 
     @Test void treasuryChecksButDoesNotChangeExecutionAndCaSigningIsBoundToActor() throws Exception {
@@ -152,8 +230,8 @@ class ExternalGatewayIntegrationTest {
     private static HttpServer gateway() {
         try {
             var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-            server.createContext("/clues/pull", ex -> send(ex, Map.of("items", List.of(Map.of(
-                    "externalId", "monitor-fixture-1", "suspectName", "合成对象", "suspectType", "PROVIDER", "content", MONITOR.get())))));
+            server.setExecutor(HTTP_WORKERS);
+            server.createContext("/clues/pull", ex -> send(ex, MONITOR_PAGE.get().apply(JSON.readTree(ex.getRequestBody()))));
             server.createContext("/receipts/lookup", ex -> {
                 RECEIPT.incrementAndGet();
                 send(ex, Map.of("status", "FOUND", "receiptNo", "GW-RECEIPT-1", "paid", true,
@@ -179,6 +257,10 @@ class ExternalGatewayIntegrationTest {
         } catch (IOException e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    private static Map<String, String> monitorItem(String id, String content) {
+        return Map.of("externalId", id, "suspectName", "合成对象", "suspectType", "PROVIDER", "content", content);
     }
 
     private static void send(HttpExchange exchange, Object result) throws IOException {

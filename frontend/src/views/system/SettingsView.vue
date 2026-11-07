@@ -4,6 +4,7 @@
     <div class="toolbar">
       <h3>参数设置<span class="hint">（期限/限额/阈值全部可配；默认=新《行政处罚法》+国家局令第4号，辽宁口径可切换，修改留痕（可查历史））</span></h3>
       <div>
+        <el-button v-if="isAdmin" size="small" style="margin-right: 8px" @click="auditVisible = true">查询审计日志</el-button>
         <el-input v-model="auditMonth" placeholder="YYYY-MM" style="width: 110px; margin-right: 6px" />
         <el-button v-if="isAdmin" size="small" :loading="exporting" @click="onAuditExport">导出审计日志</el-button>
         <el-input v-model="filter" placeholder="搜索参数" clearable style="width: 200px; margin-left: 12px" />
@@ -25,6 +26,8 @@
       </el-table-column>
     </el-table>
 
+    <AuditLogDrawer v-if="isAdmin && auditVisible" @close="auditVisible = false" />
+
     <el-drawer v-model="historyVisible" :title="`变更历史：${historyKey}`" size="520px" @close="clearHistory">
       <el-alert v-if="history.failed" type="error" :closable="false" title="历史加载失败，请关闭后重新打开重试。" />
       <el-table :data="history.data" border stripe size="small" v-loading="history.loading"
@@ -43,6 +46,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import AuditLogDrawer from '../../components/AuditLogDrawer.vue'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import { adminOperationAccess } from '../../api/caseWriteAccess'
@@ -57,6 +61,7 @@ const loading = ref(false)
 const filter = ref('')
 const pendingKeys = reactive(new Set<string>())
 const exporting = ref(false)
+const auditVisible = ref(false)
 let disposed = false, loadGeneration = 0, writeGeneration = 0, exportGeneration = 0, historyGeneration = 0
 
 function identity() {
@@ -74,6 +79,7 @@ function invalidate() {
   loadGeneration++; writeGeneration++; exportGeneration++
   rows.value = []; loading.value = false; pendingKeys.clear(); exporting.value = false
   historyVisible.value = false; historyKey.value = ''; clearHistory()
+  auditVisible.value = false
 }
 function onSessionExpired() { invalidate() }
 watch(identity, invalidate, { flush: 'sync' })

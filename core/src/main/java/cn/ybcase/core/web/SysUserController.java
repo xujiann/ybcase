@@ -5,7 +5,10 @@ import cn.ybcase.core.entity.SysRole;
 import cn.ybcase.core.entity.SysUser;
 import cn.ybcase.core.repository.SysRoleRepository;
 import cn.ybcase.core.repository.SysUserRepository;
+import cn.ybcase.core.security.AdminReadAccess;
 import cn.ybcase.core.spi.UserDeactivationGuard;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.constraints.NotBlank;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.ObjectProvider;
@@ -13,11 +16,22 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.security.Principal;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/system/users")
@@ -25,11 +39,17 @@ import java.util.Map;
 @PreAuthorize("hasRole('ADMIN')")
 public class SysUserController {
 
+    private static final int MAX_ROSTER_SIZE = 100;
+    private static final Set<String> ACCOUNT_CATEGORIES = Set.of("DISTRICT", "BUREAU", "AGENCY");
+    private static final Set<String> BUILT_IN_ACCOUNTS = Set.of("admin", "banban", "fazhi", "juzhang");
+    private static final SecureRandom ROSTER_RANDOM = new SecureRandom();
+
     private final SysUserRepository userRepository;
     private final SysRoleRepository roleRepository;
     private final PasswordEncoder passwordEncoder;
     // 业务模块（server）注册的停用守卫；core 不依赖 server，故经 SPI 反向询问
     private final ObjectProvider<UserDeactivationGuard> deactivationGuards;
+    private final AdminReadAccess adminReads;
     private final cn.ybcase.core.security.AdminWriteAccess adminWrites;
     private final jakarta.persistence.EntityManager entityManager;
     private final org.springframework.jdbc.core.JdbcTemplate jdbc;
@@ -53,6 +73,15 @@ public class SysUserController {
         }
     }
 
+    public record RosterRequest(List<RosterRow> rows) {}
+    public record RosterRow(String action, String username, String realName, String departmentCode,
+                            String accountCategory, List<String> roleCodes) {}
+    public record RosterPreviewRow(int row, String username, String status, String message) {}
+    public record RosterAppliedRow(int row, String username,
+                                   @JsonInclude(JsonInclude.Include.NON_NULL) String initialPassword) {}
+    private record RosterDepartment(long id, String code, String kind, boolean enabled) {}
+    private record RosterCheck(RosterPreviewRow preview, RosterDepartment department, SysUser existing) {}
+
     @GetMapping
     public R<Map<String, Object>> list(@RequestParam(defaultValue = "0") int page,
                                        @RequestParam(defaultValue = "20") int size) {
@@ -69,7 +98,7 @@ public class SysUserController {
         if (fieldError != null) return R.fail(1106, fieldError);
         // Distinct administrators can both observe an absent username. Serialize that absent key
         // before actor locking, so the loser returns the existing 1101 without touching the winner.
-        jdbc.queryForList("select pg_advisory_xact_lock(hashtextextended('sys_user.username:' || ?,0))",req.username());
+        lockUsername(req.username());
         adminWrites.requireCurrentAdmin();
         String assignmentError = assignmentError(req, null);
         if (assignmentError != null) return R.fail(1106, assignmentError);
@@ -80,12 +109,174 @@ public class SysUserController {
         if (pwdError != null) {
             return R.fail(1102, pwdError);
         }
-        SysUser u = new SysUser();
-        u.setUsername(req.username());
-        u.setPassword(passwordEncoder.encode(req.password()));
-        u.setMustChangePassword(true);   // 管理员设的初始口令，首次登录须改
-        applyFields(u, req);
-        return R.ok(UserDto.from(userRepository.save(u)));
+        return R.ok(UserDto.from(createAccount(req, req.password())));
+    }
+
+    @PostMapping("/roster/preview")
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public R<Map<String, List<RosterPreviewRow>>> previewRoster(@RequestBody RosterRequest request,
+                                                               Principal principal, HttpServletResponse response) {
+        adminReads.requireCurrentAdmin();
+        response.setHeader("Cache-Control", "no-store");
+        if (invalidRosterSize(request)) return R.fail(1106, "名册须包含1至100行");
+        var rows = checkRoster(request.rows(), rosterDepartments(request.rows(), false), principal.getName(), false);
+        return R.ok(Map.of("rows", rows.stream().map(RosterCheck::preview).toList()));
+    }
+
+    @PostMapping("/roster/apply")
+    @Transactional
+    public R<Map<String, List<RosterAppliedRow>>> applyRoster(@RequestBody RosterRequest request,
+                                                             HttpServletResponse response) {
+        response.setHeader("Cache-Control", "no-store");
+        if (invalidRosterSize(request)) return R.fail(1106, "名册须包含1至100行");
+        List<RosterRow> rows = request.rows();
+        var names = rows.stream().filter(Objects::nonNull).map(RosterRow::username)
+                .filter(name -> rosterText(name, 64)).distinct().sorted().toList();
+        // Match single-account creation's absent-key lock, then lock department and user rows in ID order.
+        names.forEach(this::lockUsername);
+        var departments = rosterDepartments(rows, true);
+        Long[] userIds = names.isEmpty() ? new Long[0] : jdbc.queryForList(
+                "select id from sys_user where username in (" + placeholders(names.size()) + ")",
+                Long.class, names.toArray()).toArray(Long[]::new);
+        String operator = adminWrites.requireCurrentAdmin(userIds);
+        var checked = checkRoster(rows, departments, operator, true);
+        for (var row : checked) {
+            if ("ERROR".equals(row.preview().status()))
+                return R.fail(1106, "第" + row.preview().row() + "行：" + row.preview().message());
+        }
+
+        var applied = new ArrayList<RosterAppliedRow>(rows.size());
+        var passwords = new HashSet<String>();
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+            var check = checked.get(i);
+            String initialPassword = null;
+            if (check.existing() == null) {
+                initialPassword = initialPassword(passwords);
+                createAccount(rosterAccount(row, check.department().id()), initialPassword);
+            } else {
+                var existing = check.existing();
+                existing.setDeptId(check.department().id());
+                existing.setAccountCategory(row.accountCategory());
+                existing.setTokenVersion(existing.getTokenVersion() + 1);
+            }
+            applied.add(new RosterAppliedRow(i + 1, row.username(), initialPassword));
+        }
+        return R.ok(Map.of("rows", applied));
+    }
+
+    private List<RosterCheck> checkRoster(List<RosterRow> rows, Map<String, RosterDepartment> departments,
+                                          String operator, boolean forWrite) {
+        var counts = rows.stream().filter(Objects::nonNull).map(RosterRow::username).filter(Objects::nonNull)
+                .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+        var checked = new ArrayList<RosterCheck>(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+            String error = rosterInputError(row, operator);
+            SysUser existing = null;
+            RosterDepartment dept = null;
+            if (error == null && counts.get(row.username()) > 1)
+                error = "同一用户名在名册中重复";
+            if (error == null) {
+                dept = departments.get(row.departmentCode());
+                if (dept == null || !dept.enabled() || !row.accountCategory().equals(dept.kind())) {
+                    error = "机构编码须对应已启用且类别匹配的正式机构";
+                } else {
+                    existing = userRepository.findByUsername(row.username()).orElse(null);
+                    if (forWrite && existing != null) existing = lockedUser(existing.getId());
+                    error = rosterAccountError(row, dept, existing);
+                }
+            }
+            checked.add(new RosterCheck(new RosterPreviewRow(i + 1, row == null || row.username() == null ? "" : row.username(),
+                    error == null ? "READY" : "ERROR", error == null ? "校验通过" : error), dept, existing));
+        }
+        return checked;
+    }
+
+    private String rosterInputError(RosterRow row, String operator) {
+        if (row == null || !("CREATE".equals(row.action()) || "CLASSIFY".equals(row.action())))
+            return "操作须为新建或归类";
+        if (!rosterText(row.username(), 64) || !rosterText(row.realName(), 64)
+                || !rosterText(row.departmentCode(), 32))
+            return "请填写有效的用户名、姓名和机构编码，且首尾不得有空格";
+        if (BUILT_IN_ACCOUNTS.contains(row.username())) return "内置账号不可通过名册处理";
+        if ("CLASSIFY".equals(row.action()) && row.username().equals(operator))
+            return "请由另一位管理员归类当前登录账号";
+        if (row.accountCategory() == null || !ACCOUNT_CATEGORIES.contains(row.accountCategory()))
+            return "请选择有效的账号类别";
+        var roles = row.roleCodes();
+        if ("CLASSIFY".equals(row.action()))
+            return roles != null && !roles.isEmpty() ? "旧账号归类沿用现有岗位" : null;
+        if (roles == null || roles.isEmpty() || roles.size() > 32 || roles.stream().anyMatch(code -> !rosterText(code, 32))
+                || roles.stream().distinct().count() != roles.size())
+            return "新建账号须填写有效且不重复的岗位编码";
+        return null;
+    }
+
+    private String rosterAccountError(RosterRow row, RosterDepartment dept, SysUser existing) {
+        if ("CREATE".equals(row.action())) {
+            if (existing != null) return "用户名已存在";
+            String fields = fieldError(rosterAccount(row, dept.id()), true);
+            return fields != null ? fields : roleAssignmentError(row.accountCategory(), row.roleCodes());
+        }
+        if (existing == null) return "待归类账号不存在";
+        if (existing.getAccountCategory() != null) return "账号已归类";
+        if (!row.realName().equals(existing.getRealName())) return "姓名与现有账号不一致";
+        if (existing.getDeptId() != null && existing.getDeptId() != dept.id())
+            return "已有其他所属机构，请使用正常的人员调动流程";
+        return roleAssignmentError(row.accountCategory(), existing.getRoles().stream().map(SysRole::getCode).toList());
+    }
+
+    private Map<String, RosterDepartment> rosterDepartments(List<RosterRow> rows, boolean lock) {
+        var codes = rows.stream().filter(Objects::nonNull).map(RosterRow::departmentCode)
+                .filter(code -> rosterText(code, 32)).distinct().toList();
+        if (codes.isEmpty()) return Map.of();
+        return jdbc.query("select id, code, org_kind, enabled from sys_dept where code in (" + placeholders(codes.size())
+                        + ") order by id" + (lock ? " for share" : ""),
+                (rs, index) -> new RosterDepartment(rs.getLong("id"), rs.getString("code"),
+                        rs.getString("org_kind"), rs.getBoolean("enabled")), codes.toArray()).stream()
+                .collect(Collectors.toMap(RosterDepartment::code, Function.identity()));
+    }
+
+    private static SaveUserRequest rosterAccount(RosterRow row, long departmentId) {
+        return new SaveUserRequest(row.username(), null, row.realName(), null, departmentId, null,
+                row.roleCodes(), row.accountCategory());
+    }
+
+    private static boolean invalidRosterSize(RosterRequest request) {
+        return request == null || request.rows() == null || request.rows().isEmpty() || request.rows().size() > MAX_ROSTER_SIZE;
+    }
+
+    private static boolean rosterText(String value, int length) {
+        return value != null && !value.isBlank() && value.length() <= length
+                && value.equals(value.strip()) && value.codePoints().noneMatch(Character::isISOControl);
+    }
+
+    private static String initialPassword(Set<String> generated) {
+        byte[] random = new byte[18];
+        String password;
+        do {
+            ROSTER_RANDOM.nextBytes(random);
+            password = "R7!" + Base64.getUrlEncoder().withoutPadding().encodeToString(random);
+        } while (!generated.add(password));
+        return password;
+    }
+
+    private void lockUsername(String username) {
+        jdbc.queryForList("select pg_advisory_xact_lock(hashtextextended('sys_user.username:' || ?,0))", username);
+    }
+
+    private static String placeholders(int size) {
+        return String.join(",", Collections.nCopies(size, "?"));
+    }
+
+    private SysUser createAccount(SaveUserRequest request, String password) {
+        SysUser user = new SysUser();
+        user.setUsername(request.username());
+        user.setPassword(passwordEncoder.encode(password));
+        user.setMustChangePassword(true);
+        applyFields(user, request);
+        return userRepository.save(user);
     }
 
     @PutMapping("/{id}")
@@ -186,7 +377,7 @@ public class SysUserController {
         if (req.realName() == null || req.realName().isBlank() || req.realName().length() > 64)
             return "姓名不能为空且不能超过64字";
         if (req.accountCategory() != null
-                && !java.util.Set.of("DISTRICT", "BUREAU", "AGENCY").contains(req.accountCategory()))
+                && !ACCOUNT_CATEGORIES.contains(req.accountCategory()))
             return "账号类别须为区市县办案人员、局机关各处室或医保中心经办人员";
         if (req.title() != null && req.title().length() > 32) return "职务不能超过32字";
         if (req.phone() != null && req.phone().length() > 32) return "联系电话不能超过32字";
@@ -204,15 +395,8 @@ public class SysUserController {
                 ? req.accountCategory() : existing.getAccountCategory();
         List<String> roles = req.roleCodes() != null || existing == null
                 ? req.roleCodes() : existing.getRoles().stream().map(SysRole::getCode).toList();
-        boolean agencyRole = roles != null && roles.contains("AGENCY");
-        if ("AGENCY".equals(category)) {
-            if (!agencyRole || roles.stream().anyMatch(role -> !"AGENCY".equals(role)))
-                return "医保中心经办账号仅可配置医保中心经办角色";
-        } else if (agencyRole) {
-            return "医保中心经办角色仅可配置给医保中心经办账号";
-        }
-        if ("DISTRICT".equals(category) && roles != null && roles.contains("ADMIN"))
-            return "区市县账号不能配置系统管理员角色";
+        String roleError = roleAssignmentError(category, roles);
+        if (roleError != null) return roleError;
         if (req.deptId() == null) {
             return category == null ? null : "请选择账号所属机构";
         }
@@ -225,6 +409,19 @@ public class SysUserController {
         if ("ROOT".equals(kind)) return "机构分组不能用于分配账号";
         if (kind != null && !kind.equals(category) || "AGENCY".equals(category) && kind == null)
             return "账号类别与所属机构不匹配";
+        return null;
+    }
+
+    private String roleAssignmentError(String category, List<String> roles) {
+        boolean agencyRole = roles != null && roles.contains("AGENCY");
+        if ("AGENCY".equals(category)) {
+            if (!agencyRole || roles.stream().anyMatch(role -> !"AGENCY".equals(role)))
+                return "医保中心经办账号仅可配置医保中心经办角色";
+        } else if (agencyRole) {
+            return "医保中心经办角色仅可配置给医保中心经办账号";
+        }
+        if ("DISTRICT".equals(category) && roles != null && roles.contains("ADMIN"))
+            return "区市县账号不能配置系统管理员角色";
         return null;
     }
 

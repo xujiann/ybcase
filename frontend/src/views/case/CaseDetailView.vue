@@ -193,6 +193,9 @@
       </div>
     </el-card>
 
+    <HistoricalReportSupplement v-if="caseReady && ['DECIDED', 'DELIVERED', 'CLOSED'].includes(c.status)
+                                && ['PROVIDER', 'INDIVIDUAL'].includes(c.partyType)"
+                                :key="id" :case-id="Number(id)" />
     <el-card>
       <el-tabs>
         <el-tab-pane :label="`办案人员(${detail.officers?.length || 0})`">
@@ -1056,6 +1059,7 @@ import { reviewVersion, cloneReview, type MaterialReview } from '../../api/revie
 import EvidenceCatalog from '../../components/EvidenceCatalog.vue'
 import { evidenceCatalogHtml } from '../../api/evidenceCatalog'
 import JurisdictionForm from '../../components/JurisdictionForm.vue'
+import HistoricalReportSupplement from './HistoricalReportSupplement.vue'
 import JurisdictionSummary from '../../components/JurisdictionSummary.vue'
 import { emptyJurisdiction, serializeJurisdiction, jurisdictionError, canEditJurisdiction } from '../../api/jurisdiction'
 import PreflightChecklist from '../../components/PreflightChecklist.vue'
@@ -1510,7 +1514,8 @@ const AGREEMENT_STATUS: Record<string, string> = {
   PENDING: '待接收', ACCEPTED: '已接收', RETURNED: '已退回', COMPLETED: '已回复',
 }
 const AGREEMENT_EVENT: Record<string, string> = {
-  DISPATCHED: '移交', ACCEPTED: '接收', RETURNED: '退回', REASSIGNED: '重派', REMINDED: '催办', COMPLETED: '回复',
+  DISPATCHED: '移交', ACCEPTED: '接收', RETURNED: '退回', REASSIGNED: '重派', REMINDED: '催办',
+  AUTO_REMINDED: '系统到期提醒', COMPLETED: '回复',
 }
 interface OnlineAgreement { id: number; agency_cycle: number; agency_status: string; agency_due_at?: string }
 const agreementForm = reactive({

@@ -40,6 +40,8 @@ public class BureauAuditFilter extends OncePerRequestFilter {
             boolean sensitiveRead = "GET".equals(request.getMethod())
                     && (uri.contains("/download") || uri.contains("/publish-export") || uri.startsWith("/api/audit")
                         || uri.contains("/screenshot") || uri.contains("/archive-full")
+                        || uri.equals("/api/bureau/stats/penalties/missing-fields")
+                        || uri.contains("/report-supplements")
                         || uri.equals("/api/bureau/audit/export"));
             // 登录（含失败）必须留痕：此前被显式排除，等保要求的"谁在什么时候从哪台机器登录"
             // 在审计里完全查不到，账号被爆破也无从追溯。过滤器只记
