@@ -35,14 +35,14 @@ test('department editing keeps its existing parent in the real PUT payload', asy
 })
 test('creating after editing a child explicitly clears its hidden parent in the real POST payload', async t => {
   const f = fixture(); t.after(f.stop); f.openEdit(child); f.openCreate()
-  Object.assign(f.form, { name: '新根科室', code: 'NEWROOT', type: 'ADMIN' })
+  Object.assign(f.form, { name: '新根科室', code: 'NEWROOT', type: 'ADMIN', orgKind: 'BUREAU' })
   assert.equal(f.form.id, null); assert.equal(f.form.parentId, null); await f.save()
   assert.equal(f.writes.length, 1); assert.equal(f.writes[0].method, 'POST'); assert.equal(f.writes[0].url, '/system/depts')
   assert.equal(f.writes[0].body.parentId, null); assert.equal(f.writes[0].body.name, '新根科室')
 })
 test('fresh department creation serializes an explicit null parent', async t => {
   const f = fixture(); t.after(f.stop); assert.equal(f.form.parentId, null); f.openCreate()
-  Object.assign(f.form, { name: '新建科室', code: 'FRESH' }); await f.save()
+  Object.assign(f.form, { name: '新建科室', code: 'FRESH', orgKind: 'DISTRICT' }); await f.save()
   assert.equal(f.writes[0].method, 'POST'); assert.equal(f.writes[0].body.parentId, null)
 })
 test('editing a root department after a child keeps the root null parent', async t => {

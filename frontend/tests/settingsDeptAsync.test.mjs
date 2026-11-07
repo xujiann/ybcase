@@ -28,7 +28,7 @@ function fixture(t, kind) {
   const source = readFileSync(new URL('../src/views/system/' + file, import.meta.url), 'utf8')
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .+\r?\n/gm, '')
   const exposed = kind === 'settings' ? 'load,onSave,onHistory,clearHistory,onAuditExport,rows,loading,history,historyVisible,historyKey,auditMonth'
-    : 'load,openCreate,openEdit,save,toggleEnabled,records,loading,saving,dialogVisible,form'
+    : 'load,openCreate,openEdit,save,toggleEnabled,records,loading,saving,dialogVisible,form,categoryFilter,categoryCounts,visibleRecords,parentOptions,departmentName,categoryDescription,search'
   const scope = Vue.effectScope(), listeners = new Map()
   const view = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) + ';({' + exposed + ',expireView:typeof onSessionExpired === "function" ? onSessionExpired : ()=>{}})', {
     ...Vue, client, useAuthStore: () => auth, adminOperationAccess, sessionExpiry, SESSION_EXPIRED_EVENT, createResourceLoader, resourceState,
@@ -149,7 +149,7 @@ test('settings: late audit export cannot download into another session', async t
 })
 
 test('depts: duplicate save submits only one creation', async t => {
-  const f = fixture(t, 'depts'); await ready(f, 'depts'); f.openCreate(); f.form.name = '新科室'; f.form.code = 'new'
+  const f = fixture(t, 'depts'); await ready(f, 'depts'); f.openCreate(); f.form.name = '新机构'; f.form.code = 'new'; f.form.orgKind = 'BUREAU'
   const first = f.save(), second = f.save(); assert.equal(f.writes.length, 1)
   f.writes[0].resolve({}); await finish(f, Promise.all([first, second])); assert.equal(f.successes.length, 1)
 })
@@ -182,4 +182,90 @@ test('depts: expired session cannot submit a new form write or enabled change', 
 test('depts: read-only users can still load the existing department list', async t => {
   const f = fixture(t, 'depts'); f.auth.user.roles = ['HANDLER']; await ready(f, 'depts')
   assert.equal(f.records.value.length, 1); f.openEdit(dept()); await f.toggleEnabled(dept()); assert.equal(f.writes.length, 0)
+})
+
+test('depts: business category counts keep directory groups and unclassified rows separate', async t => {
+  const f = fixture(t, 'depts')
+  const data = [
+    { ...dept(1), name: '中心目录', orgKind: 'ROOT' },
+    { ...dept(2), name: '法规处', orgKind: 'BUREAU', parentId: null },
+    { ...dept(3), name: '分局甲', orgKind: 'DISTRICT', parentId: null },
+    { ...dept(4), name: '核查一部', orgKind: 'AGENCY' },
+    { ...dept(5), name: '核查二部', orgKind: 'AGENCY' },
+    { ...dept(6), name: '核查三部', orgKind: 'AGENCY', enabled: false },
+    { ...dept(7), name: '局领导', orgKind: null, parentId: null },
+    { ...dept(8), name: '信息中心', orgKind: null, parentId: null },
+  ]
+  await ready(f, 'depts', data)
+  assert.deepEqual(plain(f.categoryCounts.value), { ALL: 8, BUREAU: 1, DISTRICT: 1, AGENCY: 3, ROOT: 1, UNCLASSIFIED: 2 })
+  f.categoryFilter.value = 'AGENCY'
+  assert.deepEqual(plain(f.visibleRecords.value.map(row => row.id)), [4, 5, 6])
+  assert.equal(f.departmentName(1), '中心目录')
+  assert.match(f.categoryDescription.value, /中心目录/)
+  f.categoryFilter.value = 'ROOT'
+  assert.deepEqual(plain(f.visibleRecords.value.map(row => row.id)), [1])
+  f.categoryFilter.value = 'UNCLASSIFIED'
+  assert.deepEqual(plain(f.visibleRecords.value.map(row => row.id)), [7, 8])
+  f.categoryFilter.value = 'ALL'
+  assert.equal(f.visibleRecords.value.length, 8)
+})
+
+test('depts: filtered search leaves the full parent directory and parent names available', async t => {
+  const f = fixture(t, 'depts')
+  const data = [
+    { ...dept(1), name: '医保中心目录', orgKind: 'ROOT', parentId: null },
+    { ...dept(2), name: '法规处', code: 'BUREAU-LEGAL', orgKind: 'BUREAU', parentId: null },
+    { ...dept(3), name: '核查一部', code: 'AGENCY-1', orgKind: 'AGENCY' },
+  ]
+  await ready(f, 'depts', data)
+  f.categoryFilter.value = 'BUREAU'
+  f.search.value = ' bureau-legal '
+  assert.deepEqual(plain(f.visibleRecords.value.map(row => row.id)), [2])
+  f.openEdit(f.records.value[1])
+  assert.deepEqual(plain(f.parentOptions.value.map(row => row.id)), [1, 3])
+  assert.equal(f.records.value.length, 3)
+  assert.equal(f.departmentName(1), '医保中心目录')
+  f.search.value = '核查'
+  assert.equal(f.visibleRecords.value.length, 0)
+  f.categoryFilter.value = 'AGENCY'
+  assert.deepEqual(plain(f.visibleRecords.value.map(row => row.id)), [3])
+  assert.equal(f.parentOptions.value.length, 2)
+})
+
+test('depts: new institutions use ADMIN and require one of the three business categories', async t => {
+  const f = fixture(t, 'depts')
+  await ready(f, 'depts')
+  f.openCreate()
+  assert.equal(f.form.type, 'ADMIN')
+  assert.equal(f.form.orgKind, null)
+  f.form.name = '新机构'; f.form.code = 'NEW'
+  await f.save()
+  assert.equal(f.writes.length, 0)
+  f.form.orgKind = 'ROOT'
+  await f.save()
+  assert.equal(f.writes.length, 0)
+  f.form.orgKind = 'AGENCY'
+  const pending = f.save()
+  assert.equal(f.writes.length, 1)
+  assert.equal(f.writes[0].body.type, 'ADMIN')
+  assert.equal(f.writes[0].body.orgKind, 'AGENCY')
+  f.writes[0].resolve({}); await finish(f, pending)
+})
+
+test('depts: editing a legacy or root institution preserves its existing type and category', async t => {
+  for (const original of [
+    { ...dept(10), type: 'MEDTECH', orgKind: null },
+    { ...dept(11), type: 'NURSING', orgKind: 'ROOT' },
+    { ...dept(12), type: 'CLINICAL', orgKind: 'DISTRICT' },
+  ]) {
+    const f = fixture(t, 'depts')
+    await ready(f, 'depts', [original])
+    f.openEdit(f.records.value[0])
+    f.form.name = '已调整名称'
+    const pending = f.save()
+    assert.equal(f.writes[0].body.type, original.type)
+    assert.equal(f.writes[0].body.orgKind, original.orgKind)
+    assert.equal(f.writes[0].body.parentId, original.parentId)
+    f.writes[0].resolve({}); await finish(f, pending)
+  }
 })

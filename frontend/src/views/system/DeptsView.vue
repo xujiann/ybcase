@@ -3,20 +3,29 @@
     <el-alert v-if="!isAdmin" type="info" :closable="false" title="当前为只读查看，维护操作需要管理员。" style="margin-bottom: 12px" />
     <div class="toolbar">
       <h3>机构管理</h3>
-      <el-button v-if="isAdmin" type="primary" @click="openCreate">新增科室</el-button>
+      <el-button v-if="isAdmin" type="primary" @click="openCreate">新增机构</el-button>
     </div>
-    <el-table :data="records" v-loading="loading" border stripe>
+    <div class="directory-filters">
+      <el-radio-group v-model="categoryFilter" aria-label="机构分类">
+        <el-radio-button v-for="item in categoryOptions" :key="item.value" :value="item.value">
+          {{ item.label }} {{ categoryCounts[item.value] }}
+        </el-radio-button>
+      </el-radio-group>
+      <el-input v-model="search" clearable placeholder="搜索机构名称或编码" style="width: 230px" />
+    </div>
+    <p class="directory-hint">{{ categoryDescription }}</p>
+    <el-alert v-if="failed" type="error" :closable="false" title="机构目录加载失败，请重新进入本页重试。" class="directory-alert" />
+    <el-table :data="visibleRecords" v-loading="loading" border stripe
+              :empty-text="failed ? '机构目录加载失败' : '暂无符合条件的机构'">
       <el-table-column prop="id" label="ID" width="70" />
-      <el-table-column prop="name" label="科室名称" width="180" />
+      <el-table-column prop="name" label="机构名称" width="180" />
       <el-table-column prop="code" label="编码" width="140" />
-      <el-table-column label="类型" width="120">
-        <template #default="{ row }">{{ typeNames[row.type] ?? row.type }}</template>
-      </el-table-column>
+
       <el-table-column label="上级机构" min-width="130" show-overflow-tooltip>
         <template #default="{ row }">{{ departmentName(row.parentId) }}</template>
       </el-table-column>
-      <el-table-column label="账号归属类别" width="130">
-        <template #default="{ row }">{{ orgKinds[row.orgKind] || '通用科室' }}</template>
+      <el-table-column label="机构分类" width="130">
+        <template #default="{ row }">{{ orgKinds[row.orgKind] || '待归类' }}</template>
       </el-table-column>
       <el-table-column prop="responsibility" label="职责" min-width="220" show-overflow-tooltip />
       <el-table-column prop="sortNo" label="排序" width="80" />
@@ -37,26 +46,23 @@
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="dialogVisible" :title="form.id ? '编辑科室' : '新增科室'" width="420px"
+    <el-dialog v-model="dialogVisible" :title="form.id ? '编辑机构' : '新增机构'" width="420px"
                :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
       <el-form :model="form" label-width="90px">
         <el-form-item label="名称" required><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="编码" required><el-input v-model="form.code" /></el-form-item>
-        <el-form-item label="类型" required>
-          <el-select v-model="form.type" style="width: 100%">
-            <el-option v-for="(label, value) in typeNames" :key="value" :label="label" :value="value" />
-          </el-select>
-        </el-form-item>
+
         <el-form-item label="上级机构">
           <el-select v-model="form.parentId" clearable style="width: 100%">
-            <el-option v-for="item in records.filter(row => row.id !== form.id)" :key="item.id!"
+            <el-option v-for="item in parentOptions" :key="item.id!"
                        :label="item.name" :value="item.id!" />
           </el-select>
         </el-form-item>
-        <el-form-item label="归属类别">
-          <el-select v-model="form.orgKind" :disabled="form.id !== null" placeholder="通用科室" style="width: 100%">
-            <el-option v-for="(label, code) in orgKinds" :key="code" :label="label" :value="code" />
+        <el-form-item label="机构分类" :required="form.id === null">
+          <el-select v-if="form.id === null" v-model="form.orgKind" placeholder="请选择机构分类" style="width: 100%">
+            <el-option v-for="(label, code) in businessOrgKinds" :key="code" :label="label" :value="code" />
           </el-select>
+          <span v-else>{{ orgKinds[form.orgKind || ''] || '待归类' }}</span>
         </el-form-item>
         <el-form-item label="机构职责">
           <el-input v-model="form.responsibility" type="textarea" :rows="3" maxlength="1000" />
@@ -94,17 +100,43 @@ interface DeptRow {
 const auth = useAuthStore()
 const isAdmin = computed(() => adminOperationAccess(auth.user?.roles))
 
-const typeNames: Record<string, string> = {
-  CLINICAL: '临床科室',
-  MEDTECH: '医技科室',
-  NURSING: '护理单元',
-  ADMIN: '行政后勤',
+const businessOrgKinds: Record<string, string> = {
+  BUREAU: '处室', DISTRICT: '分局', AGENCY: '医保中心',
 }
-
-const orgKinds: Record<string, string> = {
-  ROOT: '机构分组', BUREAU: '局机关处室', DISTRICT: '区市县单位', AGENCY: '医保中心经办',
-}
+const orgKinds: Record<string, string> = { ROOT: '目录分组', ...businessOrgKinds }
+const categoryOptions = [
+  { value: 'ALL', label: '全部' },
+  { value: 'BUREAU', label: '处室' },
+  { value: 'DISTRICT', label: '分局' },
+  { value: 'AGENCY', label: '医保中心' },
+  { value: 'ROOT', label: '目录分组' },
+  { value: 'UNCLASSIFIED', label: '待归类' },
+]
+const categoryFilter = ref('ALL')
+const search = ref('')
 const records = ref<DeptRow[]>([])
+const categoryCounts = computed(() => {
+  const counts: Record<string, number> = { ALL: records.value.length, BUREAU: 0, DISTRICT: 0, AGENCY: 0, ROOT: 0, UNCLASSIFIED: 0 }
+  for (const row of records.value) counts[row.orgKind || 'UNCLASSIFIED']++
+  return counts
+})
+const visibleRecords = computed(() => {
+  const query = search.value.trim().toLocaleLowerCase()
+  return records.value.filter(row => (categoryFilter.value === 'ALL'
+    || (categoryFilter.value === 'UNCLASSIFIED' ? !row.orgKind : row.orgKind === categoryFilter.value))
+    && (!query || row.name.toLocaleLowerCase().includes(query) || row.code.toLocaleLowerCase().includes(query)))
+})
+const parentOptions = computed(() => records.value.filter(row => row.id !== form.id))
+const categoryDescription = computed(() => {
+  if (categoryFilter.value === 'AGENCY') {
+    const parents = [...new Set(records.value.filter(row => row.orgKind === 'AGENCY')
+      .map(row => records.value.find(parent => parent.id === row.parentId)?.name).filter(Boolean))]
+    return '医保中心按实际经办机构计数。' + (parents.length ? '上级目录为' + parents.join('、') + '，各机构对应关系见上级机构列。' : '各机构对应关系见上级机构列。')
+  }
+  if (categoryFilter.value === 'ROOT') return '目录分组用于展示上级组织结构，业务机构列在相应分类中。'
+  if (categoryFilter.value === 'UNCLASSIFIED') return '以下机构尚未设置正式分类，保留原有登记信息。'
+  return '分类数量包含启用和停用机构，全部还包含目录分组及待归类机构。'
+})
 function departmentName(id: number | null) {
   return records.value.find(row => row.id === id)?.name || '—'
 }
@@ -113,7 +145,7 @@ const failed = ref(false)
 const saving = ref(false)
 const rowAction = ref<number | null>(null)
 const dialogVisible = ref(false)
-const form = reactive<DeptRow>({ id: null, parentId: null, name: '', code: '', type: 'CLINICAL', sortNo: 0, enabled: true, orgKind: null, responsibility: null })
+const form = reactive<DeptRow>({ id: null, parentId: null, name: '', code: '', type: 'ADMIN', sortNo: 0, enabled: true, orgKind: null, responsibility: null })
 let disposed = false, loadGeneration = 0, saveGeneration = 0, actionGeneration = 0
 
 function identity() {
@@ -128,12 +160,12 @@ function isContextCurrent(c: ReturnType<typeof context>) {
   return active() && c.identity === identity() && sessionExpiry.isCurrent(c.stamp, auth.token)
 }
 function resetForm() {
-  Object.assign(form, { id: null, parentId: null, name: '', code: '', type: 'CLINICAL', sortNo: 0, enabled: true, orgKind: null, responsibility: null })
+  Object.assign(form, { id: null, parentId: null, name: '', code: '', type: 'ADMIN', sortNo: 0, enabled: true, orgKind: null, responsibility: null })
 }
 function invalidate(clearDraft = true) {
   loadGeneration++; saveGeneration++; actionGeneration++
   records.value = []; loading.value = false; failed.value = false; saving.value = false; rowAction.value = null
-  if (clearDraft) { dialogVisible.value = false; resetForm() }
+  if (clearDraft) { dialogVisible.value = false; resetForm(); categoryFilter.value = 'ALL'; search.value = '' }
 }
 function onSessionExpired() { invalidate(false) }
 watch(identity, () => invalidate(), { flush: 'sync' })
@@ -170,6 +202,10 @@ function openEdit(row: DeptRow) {
 
 async function save() {
   if (!isAdmin.value || !active() || saving.value || rowAction.value !== null || loading.value || failed.value || !dialogVisible.value) return
+  if (form.id === null && !Object.hasOwn(businessOrgKinds, form.orgKind || '')) {
+    ElMessage.warning('请选择处室、分局或医保中心')
+    return
+  }
   const run = ++saveGeneration, captured = context(), id = form.id, payload = { ...form }
   const unchanged = () => run === saveGeneration && isContextCurrent(captured) && dialogVisible.value
     && JSON.stringify(form) === JSON.stringify(payload)
@@ -211,4 +247,7 @@ onMounted(() => { window.addEventListener(SESSION_EXPIRED_EVENT, onSessionExpire
   margin-bottom: 12px;
 }
 .toolbar h3 { margin: 0; }
+.directory-filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.directory-hint { margin: 10px 0; color: #666; font-size: 12px; }
+.directory-alert { margin-bottom: 12px; }
 </style>
