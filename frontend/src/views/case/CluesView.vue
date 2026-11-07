@@ -19,6 +19,7 @@
         <el-button v-if="canOperate" type="primary" @click="createVisible = true">登记线索</el-button>
       </div>
     </div>
+    <TaskFocusBanner :loading="loading" :failed="failed" :count="records.length" label="线索" @change="setTaskFocus" />
     <el-alert v-if="failed" type="error" :closable="false" title="线索列表加载失败，请重新搜索或筛选重试。" />
     <el-table :data="records" v-loading="loading" border stripe :empty-text="failed ? '加载失败' : '暂无数据'">
       <el-table-column prop="clueNo" label="线索编号" width="120" />
@@ -60,7 +61,7 @@
     </el-table>
     <el-pagination style="margin-top: 12px; justify-content: flex-end"
                    layout="total, prev, pager, next" :total="total" :page-size="pageSize"
-                   :current-page="page" @current-change="changePage" />
+                   :current-page="page" :disabled="focusId !== undefined || loading" @current-change="changePage" />
 
     <PrecaseAttachments v-model:visible="materialsVisible" :source="materialsSource" />
     <el-dialog v-model="createVisible" title="登记线索" width="560px">
@@ -97,13 +98,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import { caseOperationAccess } from '../../api/caseWriteAccess'
 import PrecaseAttachments from '../../components/PrecaseAttachments.vue'
+import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
 import { canWritePrecase, type PrecaseSource } from '../../api/precaseAttachments'
 import { CLUE_STATUS, PARTY_TYPE, SOURCE } from './labels'
 
@@ -129,6 +131,16 @@ const loading = ref(false)
 const failed = ref(false)
 let loadGeneration = 0
 let disposed = false
+let mounted = false
+const focusId = ref<number>()
+const readIdentity = () => JSON.stringify([auth.token, auth.user?.id, auth.user?.accountCategory, auth.user?.roles])
+watch(readIdentity, () => { loadGeneration++; records.value=[]; total.value=0; loading.value=false; failed.value=false; materialsVisible.value=false }, { flush: 'sync' })
+function setTaskFocus(value: number | undefined) {
+  if (value === focusId.value) return
+  focusId.value = value
+  materialsVisible.value = false
+  if (mounted) reload()
+}
 onUnmounted(() => { disposed = true; loadGeneration++; loading.value = false })
 const statusFilter = ref('')
 const sourceFilter = ref('')
@@ -155,18 +167,23 @@ function reload() {
 async function load() {
   if (disposed) return
   const run = ++loadGeneration
+  const identity = readIdentity()
   loading.value = true
   failed.value = false
   records.value = []
+  if (focusId.value === 0) { total.value=0; loading.value=false; return }
   try {
     const params: any = { page: page.value, size: pageSize }
-    if (statusFilter.value) params.status = statusFilter.value
-    if (sourceFilter.value) params.source = sourceFilter.value
-    if (q.value.trim()) params.q = q.value.trim()
-    if (range.value?.[0]) params.from = range.value[0]
-    if (range.value?.[1]) params.to = range.value[1]
+    if (focusId.value !== undefined) params.focusId = focusId.value
+    else {
+      if (statusFilter.value) params.status = statusFilter.value
+      if (sourceFilter.value) params.source = sourceFilter.value
+      if (q.value.trim()) params.q = q.value.trim()
+      if (range.value?.[0]) params.from = range.value[0]
+      if (range.value?.[1]) params.to = range.value[1]
+    }
     const resp = await client.get('/bureau/clues', { params })
-    if (run !== loadGeneration) return
+    if (run !== loadGeneration || identity !== readIdentity()) return
     // 分页接口返回 snake_case 行（JdbcTemplate），统一映射为模板与操作按钮读取的驼峰字段
     records.value = resp.data.data.rows.map((r: any) => ({
       id: r.id, clueNo: r.clue_no, source: r.source, suspectName: r.suspect_name, suspectType: r.suspect_type,
@@ -182,6 +199,7 @@ async function load() {
 }
 
 function changePage(value: number) {
+  if (focusId.value !== undefined) return
   if (value === page.value) return
   page.value = value
   return load()
@@ -287,7 +305,7 @@ function toFile(row: any) {
   router.push({ path: '/case/list', query: { clueId: row.id, suspectName: row.suspectName, suspectType: row.suspectType } })
 }
 
-onMounted(load)
+onMounted(() => { mounted = true; void load() })
 </script>
 
 <style scoped>

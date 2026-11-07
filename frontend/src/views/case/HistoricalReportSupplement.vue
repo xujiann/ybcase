@@ -1,14 +1,14 @@
 <template>
   <el-card v-if="!caseId || state?.eligible || failed" class="report-supplement">
     <div class="toolbar">
-      <h4>{{ caseId ? '历史报表缺项补录' : '历史报表补录审核' }}</h4>
+      <h4>{{ correction ? (caseId ? '报表补录纠错' : '报表补录纠错审核') : (caseId ? '历史报表缺项补录' : '历史报表补录审核') }}</h4>
       <el-button :loading="loading" :disabled="saving" @click="load()">刷新</el-button>
-      <el-button v-if="state?.canRequest" type="primary" :disabled="saving || loading" @click="openRequest">申请补录</el-button>
+      <el-button v-if="canApply" type="primary" :disabled="saving || loading" @click="openRequest">{{ correction ? '申请纠错' : '申请补录' }}</el-button>
     </div>
-    <p>补录依据原案卷材料提交，由另一名局机关法制或负责人审核后供报表取数。来源与审核意见记录在补录台账中。</p>
+    <p>{{ correction ? '对已批准的报表补录提出新值，由另一名局机关法制或负责人复核。旧值与材料出处保留在台账中。' : '补录依据原案卷材料提交，由另一名局机关法制或负责人审核后供报表取数。来源与审核意见记录在补录台账中。' }}</p>
     <el-alert v-if="failed" type="error" :closable="false" title="报表补录台账加载失败，请刷新重试。" />
-    <p v-if="state?.eligible && !state.canRequest && !rows.some(row => row.status === 'PENDING')">
-      当前没有可申请补录的缺项，或当前岗位无申请权限。
+    <p v-if="state?.eligible && !canApply && !rows.some(row => row.status === 'PENDING')">
+      当前没有可申请的字段，或当前岗位无申请权限。
     </p>
     <el-collapse v-if="state?.eligible">
       <el-collapse-item title="原登记与当前报表取值">
@@ -54,7 +54,7 @@
     <el-pagination v-if="!caseId" :current-page="page" :page-size="pageSize" :total="total" :disabled="loading || saving"
                    layout="total, prev, pager, next" @current-change="changePage" />
 
-    <el-dialog v-model="requestVisible" title="申请历史报表补录" width="650px" style="max-width: 95vw"
+    <el-dialog v-model="requestVisible" :title="correction ? '申请报表补录纠错' : '申请历史报表补录'" width="650px" style="max-width: 95vw"
                :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
       <el-form label-width="140px" :disabled="saving">
         <el-form-item label="本次补录字段" required>
@@ -122,14 +122,14 @@ interface Entry {
   reason: string; sourceReference: string; values: Record<string, string | number>
   originalSnapshot?: Record<string, string | number | null>; effectiveSnapshot?: Record<string, string | number | null>
   requestedBy: string; requestedAt: string; reviewedBy?: string; reviewedAt?: string; opinion?: string
-  canReview: boolean; canCancel: boolean
+  canReview: boolean; canCancel: boolean; requestKind?: string
 }
 interface CaseSupplements {
-  eligible: boolean; canRequest: boolean; canReview: boolean; missingFields: string[]
+  eligible: boolean; canRequest: boolean; canReview: boolean; canCorrect?: boolean; missingFields: string[]; correctableFields?: string[]
   original: Record<string, string | number | null>; effective: Record<string, string | number | null>; history: Entry[]
 }
 
-const props = defineProps<{ caseId?: number }>()
+const props = defineProps<{ caseId?: number; correction?: boolean }>()
 const auth = useAuthStore()
 const identity = computed(() => JSON.stringify([auth.token, auth.user?.id, auth.user?.accountCategory, auth.user?.roles]))
 const fields: Field[] = [
@@ -146,7 +146,9 @@ const fields: Field[] = [
 const state = ref<CaseSupplements>()
 const queue = ref<Entry[]>([])
 const rows = computed(() => props.caseId ? state.value?.history || [] : queue.value)
-const availableFields = computed(() => fields.filter(field => state.value?.missingFields.includes(field.key)))
+const canApply = computed(() => props.correction ? state.value?.canCorrect : state.value?.canRequest)
+const availableFields = computed(() => fields.filter(field =>
+  (props.correction ? state.value?.correctableFields : state.value?.missingFields)?.includes(field.key)))
 const selectedFields = ref<string[]>([])
 const selectedFormFields = computed(() => availableFields.value.filter(field => selectedFields.value.includes(field.key)))
 const loading = ref(false), failed = ref(false), saving = ref(false)
@@ -160,10 +162,10 @@ let readGeneration = 0
 let disposed = false
 
 function capture() {
-  return { identity: identity.value, caseId: props.caseId, stamp: sessionExpiry.capture(auth.token) }
+  return { identity: identity.value, caseId: props.caseId, correction: props.correction, stamp: sessionExpiry.capture(auth.token) }
 }
 function current(context: ReturnType<typeof capture>) {
-  return !disposed && context.identity === identity.value && context.caseId === props.caseId
+  return !disposed && context.identity === identity.value && context.caseId === props.caseId && context.correction === props.correction
     && sessionExpiry.isCurrent(context.stamp, auth.token) && !sessionExpiry.isExpired(context.stamp, auth.token)
 }
 function clear() {
@@ -185,7 +187,8 @@ async function load(next = page.value) {
   const context = capture(), run = ++readGeneration
   loading.value = true; failed.value = false
   try {
-    const url = props.caseId ? `/bureau/cases/${props.caseId}/report-supplements` : '/bureau/report-supplements/pending'
+    const path = props.correction ? 'report-supplement-corrections' : 'report-supplements'
+    const url = props.caseId ? `/bureau/cases/${props.caseId}/${path}` : `/bureau/${path}/pending`
     const { data } = await client.get(url, { params: props.caseId ? undefined : { page: next, size: pageSize } })
     if (run !== readGeneration || !current(context)) return
     if (props.caseId) state.value = data.data
@@ -220,13 +223,13 @@ function statusLabel(status: string) {
   return ({ PENDING: '待审核', APPROVED: '已通过', REJECTED: '已退回', CANCELLED: '已撤回' } as Record<string, string>)[status] || status
 }
 function openRequest() {
-  if (disposed || !state.value?.canRequest || saving.value || loading.value) return
+  if (disposed || !canApply.value || saving.value || loading.value) return
   selectedFields.value = []; reason.value = ''; sourceReference.value = ''
   for (const key of Object.keys(draft)) delete draft[key]
   requestVisible.value = true
 }
 async function submitRequest() {
-  if (disposed || !requestVisible.value || !state.value?.canRequest || !props.caseId || saving.value || loading.value) return
+  if (disposed || !requestVisible.value || !canApply.value || !props.caseId || saving.value || loading.value) return
   const values: Record<string, string | number> = {}
   for (const field of selectedFormFields.value) {
     const text = draft[field.key]?.trim()
@@ -237,8 +240,8 @@ async function submitRequest() {
     } else values[field.key] = text
   }
   if ('confirmedViolationStart' in values || 'confirmedViolationEnd' in values) {
-    const start = values.confirmedViolationStart ?? state.value.effective.confirmedViolationStart
-    const end = values.confirmedViolationEnd ?? state.value.effective.confirmedViolationEnd
+    const start = values.confirmedViolationStart ?? state.value?.effective.confirmedViolationStart
+    const end = values.confirmedViolationEnd ?? state.value?.effective.confirmedViolationEnd
     if (!start || !end || String(start) > String(end)) {
       ElMessage.warning('请补齐有效的违法发生起止日期')
       return
@@ -251,10 +254,10 @@ async function submitRequest() {
   const context = capture(), body = { values, reason: reason.value.trim(), sourceReference: sourceReference.value.trim() }
   saving.value = true
   try {
-    await client.post(`/bureau/cases/${context.caseId}/report-supplements`, body)
+    await client.post(`/bureau/cases/${context.caseId}/${props.correction ? 'report-supplement-corrections' : 'report-supplements'}`, body)
     if (!current(context)) return
     requestVisible.value = false
-    ElMessage.success('补录申请已提交')
+    ElMessage.success(props.correction ? '补录纠错申请已提交' : '补录申请已提交')
     await load()
   } catch {
     // The API client reports the failure and the draft remains available.
@@ -281,7 +284,7 @@ async function submitDecision() {
     // The API client reports the failure.
   } finally { saving.value = false }
 }
-watch([identity, () => props.caseId], () => { clear(); void load(1) }, { immediate: true, flush: 'sync' })
+watch([identity, () => props.caseId, () => props.correction], () => { clear(); void load(1) }, { immediate: true, flush: 'sync' })
 onMounted(() => window.addEventListener(SESSION_EXPIRED_EVENT, clear))
 onBeforeUnmount(() => { disposed = true; clear(); window.removeEventListener(SESSION_EXPIRED_EVENT, clear) })
 </script>

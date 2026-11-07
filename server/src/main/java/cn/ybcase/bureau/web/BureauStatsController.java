@@ -23,7 +23,7 @@ import java.util.function.Supplier;
 @RequestMapping("/api/bureau/stats")
 @RequiredArgsConstructor
 public class BureauStatsController {
-    private final Semaphore reportSlots = new Semaphore(2);
+    private final Semaphore reportSlots = ReportExport.GENERATION_SLOTS;
 
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.BusinessStatisticsService statistics;

@@ -19,20 +19,26 @@ public class ExecutionAlerts {
 
     public List<Map<String,Object>> rows(LocalDate today) {
         var rows = jdbc.queryForList("""
+                with effective_decisions as (select * from case_effective_decisions(?,clock_timestamp())),
+                     effective_executions as (select * from case_effective_executions(?,clock_timestamp()))
                 select cf.*, cf.id as case_id, su.enabled,
                        d.fine_amount, d.recoup_amount, d.confiscate_amount,
-                       (select coalesce(sum(e.amount),0) from case_execution e
+                       (select coalesce(sum(e.amount),0) from effective_executions e
                          where e.case_id=cf.id and e.kind in ('FINE','RECOUP','CONFISCATE')) as paid,
                        (select max(del.delivered_at) from case_delivery del join case_document doc on doc.id=del.document_id
                          where del.case_id=cf.id and doc.case_id=cf.id and doc.doc_type='URGE_LETTER') as urged_at
-                from case_file cf join case_decision d on d.case_id=cf.id
+                from case_file cf join effective_decisions d on d.case_id=cf.id
                 left join sys_user su on su.username=cf.owner_user
                 where cf.status='DELIVERED' and cf.delivered_at is not null and d.decision_type='PUNISH'
                   and cf.court_enforce_applied=false
-                  and ((select coalesce(sum(e.amount),0) from case_execution e where e.case_id=cf.id and e.kind='FINE') < d.fine_amount
-                    or (select coalesce(sum(e.amount),0) from case_execution e where e.case_id=cf.id and e.kind='RECOUP') < d.recoup_amount
-                    or (select coalesce(sum(e.amount),0) from case_execution e where e.case_id=cf.id and e.kind='CONFISCATE') < d.confiscate_amount)
-                order by cf.delivered_at,cf.id""");
+                  and not exists(select 1 from case_court_round r
+                    join case_continuation_request a on a.id=r.request_id
+                    where r.case_id=cf.id and r.applied_at<=? and a.status='APPROVED'
+                      and a.reviewed_at<=clock_timestamp())
+                  and ((select coalesce(sum(e.amount),0) from effective_executions e where e.case_id=cf.id and e.kind='FINE') < d.fine_amount
+                    or (select coalesce(sum(e.amount),0) from effective_executions e where e.case_id=cf.id and e.kind='RECOUP') < d.recoup_amount
+                    or (select coalesce(sum(e.amount),0) from effective_executions e where e.case_id=cf.id and e.kind='CONFISCATE') < d.confiscate_amount)
+                order by cf.delivered_at,cf.id""",today,today,today);
         for (var row : rows) {
             CaseFile c = new CaseFile();
             c.setId(((Number)row.get("id")).longValue()); c.setDeliveredAt(date(row.get("delivered_at")));

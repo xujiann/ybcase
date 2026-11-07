@@ -49,10 +49,16 @@ public class DepartmentHandoffService {
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Map<String, Object> list(String username, String status, int page, int size) {
+        return list(username, status, page, size, null);
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public Map<String, Object> list(String username, String status, int page, int size, Long focusId) {
         var actor = materials.readActor(username);
         requireManager(actor);
         if (page < 1 || size < 1 || size > 100 || status != null && !STATES.contains(status))
             throw invalid("机构交接分页或状态无效");
+        if (focusId != null && focusId < 1) throw invalid("待办来源编号须为正整数");
         StringBuilder where = new StringBuilder(" where 1=1");
         var args = new ArrayList<>();
         if (actor.district()) {
@@ -60,7 +66,12 @@ public class DepartmentHandoffService {
             args.add(actor.deptId());
             args.add(actor.deptId());
         }
-        if (status != null) {
+        if (focusId != null) {
+            where.append(" and h.id=?");
+            args.add(focusId);
+            page = 1;
+            size = 1;
+        } else if (status != null) {
             where.append(" and h.status=?");
             args.add(status);
         }

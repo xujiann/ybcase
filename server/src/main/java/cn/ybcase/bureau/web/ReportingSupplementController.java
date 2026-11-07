@@ -48,6 +48,24 @@ public class ReportingSupplementController {
         return R.ok();
     }
 
+    @GetMapping("/cases/{caseId}/report-supplement-corrections")
+    public R<Map<String, Object>> correctionState(@PathVariable long caseId, Authentication auth) {
+        return R.ok(supplements.correctionState(caseId, auth.getName()));
+    }
+
+    @PostMapping("/cases/{caseId}/report-supplement-corrections")
+    @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
+    public R<Map<String, Long>> requestCorrection(@PathVariable long caseId,
+            @RequestBody byte[] body, Authentication auth) {
+        return R.ok(Map.of("id", supplements.requestCorrection(caseId, requestBody(body), auth.getName())));
+    }
+
+    @GetMapping("/report-supplement-corrections/pending")
+    public R<Map<String, Object>> pendingCorrections(@RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int size, Authentication auth) {
+        return R.ok(supplements.pendingCorrections(auth.getName(), page, size));
+    }
+
     @GetMapping("/report-supplements/pending")
     public R<Map<String, Object>> pending(@RequestParam(defaultValue = "1") int page,
                                          @RequestParam(defaultValue = "20") int size, Authentication auth) {

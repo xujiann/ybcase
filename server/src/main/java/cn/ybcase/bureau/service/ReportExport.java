@@ -6,10 +6,28 @@ import org.springframework.jdbc.core.RowCallbackHandler;
 
 import java.time.LocalDate;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 
 /** A completed report and the non-identifying facts persisted with its request audit. */
-public record ReportExport(byte[] workbook, Audit audit) {
+public record ReportExport(byte[] workbook, Audit audit, List<Line> lines) {
+    public ReportExport(byte[] workbook, Audit audit) {
+        this(workbook, audit, List.of());
+    }
+
+    public record Line(String key, String sourceType, long sourceId, String sourceNumber,
+                       int sheetIndex, int rowNumber, List<Object> cells) {
+        public Line {
+            cells = Collections.unmodifiableList(new ArrayList<>(cells));
+        }
+        static Line of(String sourceType, long sourceId, String sourceNumber, int sheetIndex, int rowNumber, Object[] cells) {
+            return new Line(sourceType + ":" + sourceId, sourceType, sourceId, sourceNumber,
+                    sheetIndex, rowNumber, Arrays.asList(cells));
+        }
+    }
     public static final String AUDIT_ATTRIBUTE = "ybcaseReportExport";
+    public static final java.util.concurrent.Semaphore GENERATION_SLOTS = new java.util.concurrent.Semaphore(2);
 
     public enum Kind { PENALTIES, ENFORCEMENT_WORK, INTERVIEWS }
 

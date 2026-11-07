@@ -10,6 +10,7 @@
         <el-button type="primary" @click="openRequest">发起交接</el-button>
       </div>
     </div>
+    <TaskFocusBanner :loading="pagination.loading" :failed="pagination.failed" :count="pagination.rows.length" label="机构交接单" @change="setTaskFocus" />
     <el-alert v-if="pagination.failed" :title="pagination.error" type="error" :closable="false" />
     <el-table :data="pagination.rows" v-loading="pagination.loading" border stripe>
       <el-table-column label="来源" min-width="175">
@@ -35,7 +36,7 @@
       </el-table-column>
     </el-table>
     <el-pagination class="handoff-pagination" :current-page="pagination.page" :page-size="pagination.size" :page-sizes="[20,50,100]"
-      :total="pagination.total" layout="total, sizes, prev, pager, next" @current-change="paging.changePage" @size-change="paging.changeSize" />
+      :total="pagination.total" :disabled="focusId !== undefined || pagination.loading" layout="total, sizes, prev, pager, next" @current-change="paging.changePage" @size-change="paging.changeSize" />
 
     <el-dialog v-model="requestVisible" title="发起机构交接" width="min(540px, 94vw)" :close-on-click-modal="!saving">
       <el-form label-width="100px">
@@ -81,6 +82,7 @@ import { ElMessage } from 'element-plus'
 import client from '../../api/client'
 import { createHistoryPagination, historyPageState } from '../../api/historyPagination'
 import { useAuthStore } from '../../stores/auth'
+import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
 
 const SOURCES = {
   CLUE: { label: '线索', path: 'clues', column: 'clue_no' },
@@ -99,9 +101,16 @@ interface SourceOption { id: number; number: string }
 const auth = useAuthStore()
 const endpoint = '/bureau/department-handoffs'
 const status = ref<Status>()
+const focusId = ref<number>()
+const readIdentity = () => JSON.stringify([auth.token, auth.user?.id, auth.user?.accountCategory, auth.user?.roles])
 const pagination = reactive(historyPageState<Handoff>())
-const paging = createHistoryPagination(pagination, async (params, { signal }) =>
-  (await client.get(endpoint, { params: { ...params, status: status.value || undefined }, signal })).data.data)
+const paging = createHistoryPagination(pagination, async (params, { signal }) => {
+  if (focusId.value === 0) return { rows: [], total: 0, page: 1, size: 20 }
+  const identity=readIdentity(),focused=focusId.value
+  const response=await client.get(endpoint, { params: { ...params, ...(focused === undefined ? { status: status.value || undefined } : { focusId: focused }) }, signal })
+  if(identity!==readIdentity() || focused!==focusId.value) throw new Error('List identity changed')
+  return response.data.data
+})
 const requestVisible = ref(false)
 const decisionVisible = ref(false)
 const saving = ref(false)
@@ -114,6 +123,14 @@ const request = reactive({ sourceType: 'CLUE' as SourceType, sourceId: undefined
 const decision = reactive({ id: 0, number: '', action: 'accept' as Action, opinion: '' })
 let sourceSearch: AbortController | undefined
 let disposed = false
+let mounted = false
+function setTaskFocus(value: number | undefined) {
+  if (value === focusId.value) return
+  focusId.value = value
+  decisionVisible.value = false
+  if (value === undefined) pagination.size = 20
+  if (mounted) void paging.firstPage()
+}
 
 function changeSourceType() {
   sourceSearch?.abort()
@@ -210,7 +227,10 @@ async function submit(path: string, body: object, visible: typeof requestVisible
 }
 
 watch(requestVisible, visible => { if (!visible) sourceSearch?.abort() })
-onMounted(paging.load)
+watch(readIdentity, () => {
+  pagination.rows=[]; pagination.total=0; requestVisible.value=false; decisionVisible.value=false; departments.value=[]; sources.value=[]; sourceSearch?.abort()
+}, { flush: 'sync' })
+onMounted(() => { mounted = true; void paging.load() })
 onUnmounted(() => {
   disposed = true
   sourceSearch?.abort()

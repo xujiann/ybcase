@@ -93,3 +93,9 @@ test('task pagination follows the last available page after other staff complete
   assert.equal(f.rows.value.length, 1)
   assert.equal(f.loading.value, false)
 })
+test('report and treasury tasks navigate only to their explicit scoped focus routes',async t=>{
+  const f=fixture(t),pending=f.refresh()
+  f.requests[0].resolve([task(8,'/case/stats?reportBatch=8'),task(9,'/system/integrations?treasuryItem=9')]);await pending
+  f.openTask(f.rows.value[0]);f.openTask(f.rows.value[1])
+  assert.deepEqual(f.routes,['/case/stats?reportBatch=8','/system/integrations?treasuryItem=9'])
+})

@@ -389,8 +389,13 @@ public class ProcedureService {
             throw new BizException(2054, "须填写签署电子送达确认书的当事人/受送达人");
         if (channel == null || channel.isBlank())
             throw new BizException(2054, "须填写当事人确认的电子送达地址（手机号/邮箱等）");
+        if (receiver.indexOf('\0') >= 0 || receiver.codePointCount(0, receiver.length()) > 64
+                || channel.indexOf('\0') >= 0 || channel.codePointCount(0, channel.length()) > 500
+                || docNo != null && (docNo.indexOf('\0') >= 0 || docNo.codePointCount(0, docNo.length()) > 64))
+            throw new BizException(2054, "受送达人限64字、同意地址限500字、确认书编号限64字，不能含空字符");
         c.setEDeliveryConsent(true);
         caseRepository.save(c);
+        jdbc.update("update case_file set e_delivery_receiver=?,e_delivery_channel=? where id=?", receiver, channel, caseId);
         jdbc.update("""
                 insert into case_document (case_id, doc_type, title, content, made_at, maker, signed)
                 values (?, 'E_DELIVERY_CONSENT', ?, ?, ?, ?, true)""",

@@ -3,6 +3,11 @@ spring:
     url: jdbc:postgresql://127.0.0.1:5432/ybcase_test
     username: hip
     password: hip123456
+    # Several cached Spring test contexts share one isolated PostgreSQL instance.
+    # Keep enough connections for concurrency checks without exhausting its 100-slot limit.
+    hikari:
+      maximum-pool-size: 6
+      minimum-idle: 1
   jpa:
     hibernate:
       ddl-auto: validate

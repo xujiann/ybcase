@@ -1,0 +1,85 @@
+<template>
+  <el-card>
+    <div class="toolbar"><h4>电子送达与回证</h4><el-button :loading="loading" :disabled="busy" @click="load">刷新回证</el-button></div>
+    <el-alert v-if="failed" type="warning" :closable="false" title="电子送达记录加载失败，请刷新重试。" />
+    <template v-if="data">
+      <p class="hint">由办案人员发起发送，供应商通过专用账号回传签收、拒收或失败事件；回证通过规则校验后进入对应文书和案卷。</p>
+      <el-alert v-if="!data.gatewayConfigured" type="info" :closable="false" title="电子送达网关尚未启用；发送前需管理员完成配置和业务联调验收。" />
+      <el-alert v-if="!hasAddress" type="warning" :closable="false" title="请先核实并登记电子送达确认书及当事人同意地址。历史自由文本不会自动推测地址。" />
+      <p v-else>受送达人：{{ data.e_delivery_receiver }}　同意地址：{{ data.e_delivery_channel }}</p>
+      <div v-if="canWrite" class="gap">
+        <el-select v-model="documentId" placeholder="选择本案允许送达的文书" style="width:330px" :disabled="busy">
+          <el-option v-for="doc in data.documents" :key="doc.id" :value="doc.id" :label="doc.title" />
+        </el-select>
+        <el-button :loading="busy" :disabled="!documentId || !hasAddress || !data.gatewayConfigured" @click="create">建立发送记录</el-button>
+        <el-button :disabled="busy" @click="expire">检查超时回执</el-button>
+      </div>
+      <el-table :data="data.deliveries" border size="small" class="gap">
+        <el-table-column prop="id" label="编号" width="70" /><el-table-column prop="title" label="文书" min-width="160" />
+        <el-table-column label="状态"><template #default="{row}">{{ labels[row.status] || row.status }}</template></el-table-column>
+        <el-table-column prop="provider_id" label="供应商编号" min-width="130" /><el-table-column prop="sent_at" label="首次发送时间" min-width="170" />
+        <el-table-column prop="deadline_at" label="回执截至时间" min-width="170" /><el-table-column prop="error_code" label="错误码" />
+        <el-table-column v-if="canWrite" label="操作" width="95"><template #default="{row}"><el-button v-if="['DRAFT','FAILED','TIMED_OUT'].includes(row.status)" link :disabled="busy || !data.gatewayConfigured" @click="send(row)">{{ row.attempts ? '重试发送' : '发送文书' }}</el-button></template></el-table-column>
+      </el-table>
+      <h4 class="gap">回执事件</h4>
+      <el-table :data="data.events" border size="small" class="gap">
+        <el-table-column prop="envelope_id" label="发送编号" width="90" /><el-table-column prop="event_key" label="事件编号" min-width="140" />
+        <el-table-column label="供应商结果"><template #default="{row}">{{ labels[row.status] || row.status }}</template></el-table-column>
+        <el-table-column prop="occurred_at" label="发生时间" min-width="170" /><el-table-column prop="receipt_no" label="回证编号" min-width="120" />
+        <el-table-column label="接收结果"><template #default="{row}">{{ row.outcome==='APPLIED' ? '已接收' : '拒绝写入案卷' }}</template></el-table-column>
+        <el-table-column prop="reason" label="原因" min-width="180" />
+      </el-table>
+    </template>
+  </el-card>
+</template>
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import client from '../api/client'
+import { useAuthStore } from '../stores/auth'
+import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../api/sessionExpiry'
+const props=defineProps<{caseId:number;writable:boolean;refreshKey?:unknown}>()
+const auth=useAuthStore(),data=ref<any>(null),loading=ref(false),failed=ref(false),busy=ref(false),documentId=ref<number>()
+const labels:Record<string,string>={DRAFT:'待发送',SENT:'已受理待回执',DELIVERED:'已签收',REJECTED:'拒收',TIMED_OUT:'回执超时',FAILED:'发送／处理失败'}
+const permitted=computed(()=>!auth.user?.roles.some(role=>['AGENCY','INTEGRATION'].includes(role))&&!!auth.user?.roles.some(role=>['HANDLER','LEGAL','LEADER','ADMIN'].includes(role)))
+const canWrite=computed(()=>!!data.value&&props.writable&&permitted.value&&!!auth.user?.roles.some(role=>['HANDLER','LEADER','ADMIN'].includes(role))&&data.value.archive_no==null&&data.value.status!=='CLOSED')
+const hasAddress=computed(()=>!!data.value?.e_delivery_consent&&!!data.value?.e_delivery_receiver&&!!data.value?.e_delivery_channel)
+let disposed=false,generation=0,requestKey=''
+const identity=()=>JSON.stringify([props.caseId,props.writable,auth.token,auth.user?.id,auth.user?.roles,auth.user?.accountCategory])
+function active(){return !disposed&&!!auth.token&&permitted.value&&Number.isSafeInteger(props.caseId)&&props.caseId>0&&!sessionExpiry.isExpired(sessionExpiry.capture(auth.token),auth.token)}
+function capture(){const who=identity(),gen=generation,stamp=sessionExpiry.capture(auth.token);return()=>active()&&who===identity()&&gen===generation&&sessionExpiry.isCurrent(stamp,auth.token)}
+function clear(){generation++;data.value=null;loading.value=false;failed.value=false;busy.value=false;documentId.value=undefined;requestKey=''}
+watch(identity,()=>{clear();if(active())void load()},{flush:'sync'})
+watch(()=>props.refreshKey,()=>{if(!busy.value)void load()})
+watch(documentId,()=>{requestKey=''},{flush:'sync'})
+async function load(){
+  if(!active()||busy.value)return
+  generation++;const current=capture();loading.value=true;failed.value=false;data.value=null;documentId.value=undefined
+  try{const response=await client.get(`/bureau/cases/${props.caseId}/electronic-deliveries`);if(current()){const result=response.data.data;if(!result||!Array.isArray(result.documents)||!Array.isArray(result.deliveries)||!Array.isArray(result.events))throw new Error('Invalid receipt list');data.value=result}}
+  catch{if(current()){failed.value=true;data.value=null}}finally{if(current())loading.value=false}
+}
+async function create(){
+  if(!active()||!canWrite.value||!hasAddress.value||busy.value||!data.value?.gatewayConfigured||!data.value.documents.some((doc:any)=>doc.id===documentId.value))return
+  const current=capture(),id=props.caseId,doc=documentId.value;requestKey ||= crypto.randomUUID();busy.value=true
+  try{await client.post(`/bureau/cases/${id}/electronic-deliveries`,{documentId:doc,requestKey});if(!current())return;busy.value=false;requestKey='';await load()}
+  catch{if(current())ElMessage.warning('未取得发送记录结果，请先刷新核对；相同文书不会重复建立记录。')}
+  finally{if(current())busy.value=false}
+}
+async function send(row:any){
+  if(!active()||!canWrite.value||busy.value||!data.value?.deliveries.includes(row)||!data.value.gatewayConfigured||!['DRAFT','FAILED','TIMED_OUT'].includes(row.status))return
+  const current=capture(),caseId=props.caseId;busy.value=true
+  try{await client.post(`/bureau/cases/${caseId}/electronic-deliveries/${row.id}/send`,{},{timeout:15000});if(!current())return;busy.value=false;await load()}
+  catch{if(current())ElMessage.warning('发送结果未确认，请刷新后核对；重试沿用原发送请求号。')}
+  finally{if(current())busy.value=false}
+}
+async function expire(){
+  if(!active()||!canWrite.value||busy.value)return
+  const current=capture();busy.value=true
+  try{await client.post(`/bureau/cases/${props.caseId}/electronic-deliveries/expire`,{});if(!current())return;busy.value=false;await load()}
+  catch{ /* API supplies the request error; keep the current evidence visible. */ }
+  finally{if(current())busy.value=false}
+}
+onMounted(()=>{window.addEventListener(SESSION_EXPIRED_EVENT,clear);void load()})
+onUnmounted(()=>{disposed=true;clear();window.removeEventListener(SESSION_EXPIRED_EVENT,clear)})
+</script>
+<style scoped>.toolbar{display:flex;align-items:center;justify-content:space-between}.toolbar h4{margin:0}.gap{margin-top:12px}.hint{font-size:12px;color:#666}</style>

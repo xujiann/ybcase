@@ -40,6 +40,11 @@ public class ExecutionService {
         // 进而被 fullyExecuted 判为"执行完毕"。
         CaseGuards.lock(jdbc, caseId);
         materialAccess.requireCurrentCaseWriter(caseId);
+        if (Boolean.TRUE.equals(jdbc.queryForObject("""
+                select exists(select 1 from case_decision_version where case_id=?
+                  union all select 1 from case_execution_continuation where case_id=?)
+                """,Boolean.class,caseId,caseId)))
+            throw new BizException(2193,"本案已有独立后续执行或决定版本，请通过执行续办提交并复核");
         CaseFile c = CaseGuards.get(caseRepository, caseId);
         if (!List.of("DECIDED", "DELIVERED").contains(c.getStatus()))
             throw new BizException(2042, "仅已决定/已送达的案件可登记执行");
@@ -57,6 +62,11 @@ public class ExecutionService {
         // 票据号空白归一为 null：前端表单默认发 receiptNo:""，而 uq_execution_receipt 只排除 null，
         // 空串会被当成有效票据号，全库第二条不填票据的执行记录就会撞唯一索引而入不了账
         String receiptNo = req.receiptNo() == null || req.receiptNo().isBlank() ? null : req.receiptNo().trim();
+        if (receiptNo != null) {
+            jdbc.queryForList("select pg_advisory_xact_lock(20261107,hashtext(?))",receiptNo);
+            if (Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from case_execution_continuation where receipt_no=?)",Boolean.class,receiptNo)))
+                throw new BizException(2193,"凭证号已在执行续办登记，不可重复入账");
+        }
         if (amount.signum() <= 0) throw new BizException(2042, "执行金额须为正数");
         // 第52条：当场收缴限额（国家100/辽宁20，参数化）
         BigDecimal onsiteLimit = config.decimal("onsite_collect_limit", "100");
@@ -130,6 +140,15 @@ public class ExecutionService {
 
     /** 加处罚款测算（第55条：每日3%，不超过罚款数额；基数按参数 FULL/UNPAID） */
     public Map<String, Object> lateFeeQuote(Long caseId) {
+        if (Boolean.TRUE.equals(jdbc.queryForObject("""
+                select exists(select 1 from case_effective_decisions(
+                    (current_timestamp at time zone 'Asia/Shanghai')::date,clock_timestamp())
+                  where case_id=? and version_id is not null
+                  union all select 1 from case_effective_executions(
+                    (current_timestamp at time zone 'Asia/Shanghai')::date,clock_timestamp())
+                  where case_id=? and source='CONTINUATION')
+                """,Boolean.class,caseId,caseId)))
+            throw new BizException(2193,"本案已有生效的后续决定或执行记录，请依据当前材料通过执行续办人工核定加处罚款，不再按原决定测算");
         CaseFile c = CaseGuards.get(caseRepository, caseId);
         CaseDecision d = decisionRepository.findByCaseId(caseId)
                 .orElseThrow(() -> new BizException(2042, "案件无处理决定"));

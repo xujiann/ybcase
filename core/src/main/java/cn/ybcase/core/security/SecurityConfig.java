@@ -35,13 +35,18 @@ public class SecurityConfig {
                         .requestMatchers("/api/auth/login", "/api/config/public", "/actuator/health",
                                 "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers("/api/auth/**").authenticated()
-                        .requestMatchers("/api/agency/**").hasRole("AGENCY")
+                        .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/integrations/delivery/receipts").hasRole("INTEGRATION")
+                        .requestMatchers("/api/agency/**").access(AuthorizationManagers.allOf(
+                                AuthorityAuthorizationManager.hasRole("AGENCY"),
+                                AuthorizationManagers.not(AuthorityAuthorizationManager.hasRole("INTEGRATION"))))
                         .requestMatchers("/api/bureau/**").access(AuthorizationManagers.allOf(
                                 AuthorityAuthorizationManager.hasAnyRole("HANDLER", "LEGAL", "LEADER", "ADMIN"),
-                                AuthorizationManagers.not(AuthorityAuthorizationManager.hasRole("AGENCY"))))
+                                AuthorizationManagers.not(AuthorityAuthorizationManager.hasRole("AGENCY")),
+                                AuthorizationManagers.not(AuthorityAuthorizationManager.hasRole("INTEGRATION"))))
                         .requestMatchers("/api/**").access(AuthorizationManagers.allOf(
                                 AuthenticatedAuthorizationManager.authenticated(),
-                                AuthorizationManagers.not(AuthorityAuthorizationManager.hasRole("AGENCY"))))
+                                AuthorizationManagers.not(AuthorityAuthorizationManager.hasRole("AGENCY")),
+                                AuthorizationManagers.not(AuthorityAuthorizationManager.hasRole("INTEGRATION"))))
                         .anyRequest().authenticated())
                 .exceptionHandling(eh -> eh.authenticationEntryPoint(
                         (req, res, e) -> res.sendError(HttpStatus.UNAUTHORIZED.value(), "未登录或登录已过期"))

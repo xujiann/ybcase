@@ -17,8 +17,8 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class PenaltyReportService {
     private static final String PENALTY_SOURCE = """
-             from case_decision d join case_file cf on cf.id = d.case_id
-             left join case_reporting_facts rf on rf.case_id = cf.id
+             from case_effective_decisions(?) d join case_file cf on cf.id = d.case_id
+             left join case_reporting_facts_at() rf on rf.case_id = cf.id
             """;
     private static final String PENALTY_POPULATION = """
             d.decision_type = 'PUNISH' and cf.party_type in ('PROVIDER', 'INDIVIDUAL')
@@ -26,6 +26,9 @@ public class PenaltyReportService {
             """;
     private static final String PARTY_CODE = """
             case when cf.party_type = 'INDIVIDUAL' then rf.party_credit_no else rf.institution_code end
+            """;
+    private static final String PENALTY_BASIS = """
+            case when coalesce(d.penalty_basis,'') ~ '[^[:space:]]' then d.penalty_basis else rf.penalty_basis end
             """;
     private static final String MISSING_PENALTIES = """
             with period as (select cast(? as date) as starts, cast(? as date) as ends),
@@ -38,11 +41,11 @@ public class PenaltyReportService {
                     case when rf.confirmed_violation_start is null or rf.confirmed_violation_end is null then '违法发生期间' end,
                     case when coalesce(rf.confirmed_violation_facts, '') !~ '[^[:space:]]' then '认定违法事实' end,
                     case when rf.confirmed_violation_amount is null then '认定违法违规金额' end,
-                    case when coalesce(rf.penalty_basis, '') !~ '[^[:space:]]' then '处罚依据' end
+                    case when coalesce((%s), '') !~ '[^[:space:]]' then '处罚依据' end
                 ], null) as missing_fields
                 %s cross join period t where %s
             )
-            """.formatted(PARTY_CODE, PENALTY_SOURCE, PENALTY_POPULATION);
+            """.formatted(PARTY_CODE, PENALTY_BASIS, PENALTY_SOURCE, PENALTY_POPULATION);
     private final JdbcTemplate jdbc;
     private final MaterialAccess materialAccess;
 
@@ -59,7 +62,7 @@ public class PenaltyReportService {
 
         String missingOnly = " from checked where cardinality(missing_fields) > 0 ";
         long total = jdbc.queryForObject(MISSING_PENALTIES + "select count(*)" + missingOnly,
-                Long.class, period.start(), period.end());
+                Long.class, period.start(), period.end(), period.cutoff());
         long offset = (page - 1L) * size;
         List<MissingPenalty> rows = offset >= total ? List.of() : jdbc.query(
                 MISSING_PENALTIES + "select case_no, party_name, decided_at, missing_fields" + missingOnly
@@ -72,7 +75,7 @@ public class PenaltyReportService {
                     } finally {
                         fields.free();
                     }
-                }, period.start(), period.end(), size, offset);
+                }, period.start(), period.end(), period.cutoff(), size, offset);
         return new MissingPenalties(rows, total, period.start(), period.end(), period.cutoff());
     }
 
@@ -95,20 +98,23 @@ public class PenaltyReportService {
         List<Object[]> current = new ArrayList<>();
         var budget = new ReportExport.Budget();
         var reconciliation = new Reconciliation();
+        List<ReportExport.Line> lines = new ArrayList<>();
         ReportExport.query(jdbc, """
                 with period as (select cast(? as date) as starts, cast(? as date) as ends, cast(? as date) as cutoff,
                                        cast(? as boolean) as current_state, cast(? as boolean) as legacy)
-                select d.decided_at, cf.filed_at, cf.party_name, coalesce(rf.has_approved_supplement, false) as supplemental,
+                select cf.id as report_case_id, cf.case_no, d.decided_at, cf.filed_at, cf.party_name, coalesce(rf.has_approved_supplement, false) as supplemental,
                        %s as party_code,
                        case rf.institution_ownership when 'PUBLIC' then '公立' when 'SOCIAL' then '社会办' end as ownership,
                        case rf.institution_grade when 'TERTIARY' then '三级' when 'SECONDARY' then '二级'
                             when 'PRIMARY' then '一级' when 'UNGRADED' then '未定级' end as grade,
                        rf.confirmed_violation_start, rf.confirmed_violation_end,
                        rf.confirmed_violation_facts, rf.confirmed_violation_amount,
-                       rf.penalty_basis, d.content, d.other_measures,
+                       %s as penalty_basis, d.content, d.other_measures,
                        d.fine_amount, d.recoup_amount, d.confiscate_amount,
                        coalesce(p.fine_paid, 0) as fine_paid, coalesce(p.recoup_paid, 0) as recoup_paid,
                        coalesce(p.late_fee_paid, 0) as late_fee_paid,
+                       coalesce(p.positive_collected,0) as positive_collected,
+                       coalesce(p.reversed_refunded,0) as reversed_refunded,
                        (t.current_state and cf.defer_approved) or exists (
                            select 1 from biz_approval a where a.case_id = cf.id and a.kind = 'DEFER'
                              and (t.legacy or (a.applied_at at time zone 'Asia/Shanghai')::date <= t.cutoff)
@@ -120,7 +126,12 @@ public class PenaltyReportService {
                            where del.case_id = cf.id and doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER'
                                  and del.delivered_at is not null and (t.legacy or del.delivered_at <= t.cutoff)
                        ) as urged,
-                       case when t.legacy then cf.court_enforce_applied
+                       case when exists (
+                                select 1 from case_court_round cr join case_continuation_request cq on cq.id=cr.request_id
+                                where cr.case_id=cf.id and cr.applied_at<=t.cutoff and cq.status='APPROVED'
+                                  and cq.reviewed_at<=least(current_timestamp,statement_timestamp())
+                            ) then true
+                            when t.legacy then cf.court_enforce_applied
                             when cf.court_applied_at is not null then cf.court_applied_at <= t.cutoff
                             when not cf.court_enforce_applied then false
                             when t.current_state then cf.court_enforce_applied end as enforced,
@@ -129,13 +140,15 @@ public class PenaltyReportService {
                 left join lateral (
                     select sum(amount) filter (where kind = 'FINE') as fine_paid,
                            sum(amount) filter (where kind = 'RECOUP') as recoup_paid,
-                           sum(amount) filter (where kind = 'LATE_FEE') as late_fee_paid
-                    from case_execution where case_id = cf.id and kind in ('FINE', 'RECOUP', 'LATE_FEE')
+                           sum(amount) filter (where kind = 'LATE_FEE') as late_fee_paid,
+                           sum(amount) filter (where amount>0) as positive_collected,
+                           -sum(amount) filter (where amount<0) as reversed_refunded
+                    from case_effective_executions(?) where case_id = cf.id and kind in ('FINE', 'RECOUP', 'LATE_FEE')
                          and paid_at <= t.cutoff
                 ) p on true
                 where %s
                 order by d.decided_at, cf.id
-                """.formatted(PARTY_CODE, PENALTY_SOURCE, PENALTY_POPULATION), rs -> {
+                """.formatted(PARTY_CODE, PENALTY_BASIS, PENALTY_SOURCE, PENALTY_POPULATION), rs -> {
             LocalDate decided = rs.getObject("decided_at", LocalDate.class);
             boolean includeFiling = annual || decided.getYear() == 2026;
             List<Object[]> sheet = includeFiling ? current : historical;
@@ -173,10 +186,14 @@ public class PenaltyReportService {
             cells.add(yesNo(expired));
             cells.add(yesNo(rs.getBoolean("urged")));
             cells.add(yesNo(enforced));
-            budget.add(sheet, cells.toArray());
+            Object[] row = cells.toArray();
+            budget.add(sheet, row);
+            lines.add(ReportExport.Line.of("CASE", rs.getLong("report_case_id"), rs.getString("case_no"),
+                    annual || !includeFiling ? 0 : 1, sheet.size() + 3, row));
             if (annual) reconciliation.record(fine, paid, unpaid, recoup, recoupPaid,
-                    rs.getBigDecimal("late_fee_paid"), partyCode, facts, rs.getBoolean("withdrawn"), rs.getBoolean("supplemental"));
-        }, period.start(), period.end(), period.cutoff(), period.cutoff().equals(today), !annual);
+                    rs.getBigDecimal("late_fee_paid"), rs.getBigDecimal("positive_collected"), rs.getBigDecimal("reversed_refunded"),
+                    partyCode, facts, rs.getBoolean("withdrawn"), rs.getBoolean("supplemental"));
+        }, period.start(), period.end(), period.cutoff(), period.cutoff().equals(today), !annual, period.cutoff(), period.cutoff());
 
         byte[] workbook = annual
                 ? PenaltyReportWorkbook.write("administrative-penalties-annual.xlsx",
@@ -185,7 +202,7 @@ public class PenaltyReportService {
                     reconciliation.rows(period, budget.rowCount()))
                 : PenaltyReportWorkbook.write(historical, current);
         return new ReportExport(workbook, new ReportExport.Audit(ReportExport.Kind.PENALTIES,
-                period.start(), period.end(), period.cutoff(), budget.rowCount()));
+                period.start(), period.end(), period.cutoff(), budget.rowCount()), lines);
     }
 
     private static String decisionText(String basis, String content, String measures, BigDecimal confiscated) {
@@ -204,16 +221,20 @@ public class PenaltyReportService {
     private static final class Reconciliation {
         private BigDecimal fine = BigDecimal.ZERO, finePaid = BigDecimal.ZERO, unpaid = BigDecimal.ZERO;
         private BigDecimal recoup = BigDecimal.ZERO, recoupPaid = BigDecimal.ZERO, lateFee = BigDecimal.ZERO;
+        private BigDecimal positiveCollected = BigDecimal.ZERO, reversedRefunded = BigDecimal.ZERO;
         private int missingCode, missingFacts, withdrawn, supplemented;
 
         void record(BigDecimal fine, BigDecimal finePaid, BigDecimal unpaid, BigDecimal recoup, BigDecimal recoupPaid,
-                    BigDecimal lateFee, String partyCode, String facts, boolean withdrawn, boolean supplemental) {
+                    BigDecimal lateFee, BigDecimal positiveCollected, BigDecimal reversedRefunded,
+                    String partyCode, String facts, boolean withdrawn, boolean supplemental) {
             this.fine = this.fine.add(fine);
             this.finePaid = this.finePaid.add(finePaid);
             this.unpaid = this.unpaid.add(unpaid);
             this.recoup = this.recoup.add(recoup);
             this.recoupPaid = this.recoupPaid.add(recoupPaid);
             this.lateFee = this.lateFee.add(lateFee);
+            this.positiveCollected = this.positiveCollected.add(positiveCollected);
+            this.reversedRefunded = this.reversedRefunded.add(reversedRefunded);
             if (partyCode == null || partyCode.isBlank()) missingCode++;
             if (facts == null || facts.isBlank()) missingFacts++;
             if (withdrawn) this.withdrawn++;
@@ -230,6 +251,9 @@ public class PenaltyReportService {
                     new Object[]{"已缴罚款本金（元）", finePaid},
                     new Object[]{"未缴罚款本金（元）", unpaid},
                     new Object[]{"已缴加处罚款（元）", lateFee},
+                    new Object[]{"本表三类款项正向收缴合计（元）", positiveCollected},
+                    new Object[]{"本表三类款项冲正／退付合计（元）", reversedRefunded},
+                    new Object[]{"本表三类款项净入账合计（元）", positiveCollected.subtract(reversedRefunded)},
                     new Object[]{"决定退回基金（元）", recoup},
                     new Object[]{"已退回基金（元）", recoupPaid},
                     new Object[]{"缺当事人编码记录数", missingCode},
@@ -240,7 +264,7 @@ public class PenaltyReportService {
                     new Object[]{"历史更正", "当事人、机构与决定字段按当前登记资料列示。"},
                     new Object[]{"有已审核补录台账的案件数", supplemented},
                     new Object[]{"报表补录", "历史缺项使用已批准的报表专用补录值，来源及审核记录见报表补录台账。"},
-                    new Object[]{"金额口径", "仅计入截至日内登记的付款，罚款本金、加处罚款和退回基金分别核算。"});
+                    new Object[]{"金额口径", "按业务日期与生成时已批准的信息取数。已缴金额为含已批准冲正、退付的净额，罚款本金、加处罚款与退回基金分别核算。"});
         }
     }
 }

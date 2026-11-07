@@ -13,6 +13,8 @@ import java.util.Map;
 
 @Service @RequiredArgsConstructor
 public class BusinessStatisticsService {
+    private static final String EFFECTIVE_DECISIONS = "case_effective_decisions((current_timestamp at time zone 'Asia/Shanghai')::date,current_timestamp)";
+    private static final String EFFECTIVE_EXECUTIONS = "case_effective_executions((current_timestamp at time zone 'Asia/Shanghai')::date,current_timestamp)";
     private final JdbcTemplate jdbc;
     private final SourceAttachmentAccess access;
     private final MaterialAccess materialAccess;
@@ -41,10 +43,10 @@ public class BusinessStatisticsService {
             out.put(item.getKey(), scalar("select count(*) from case_clue where " + clues.sql() + item.getValue(), clues));
         out.put("caseTotal",scalar("select count(*)"+cases,scope));
         out.put("caseByStatus",rows("select cf.status,count(*) as cnt"+cases+" group by cf.status order by cf.status",scope));
-        String decisions=" from case_decision d join case_file cf on cf.id=d.case_id where "+scope.sql();
+        String decisions=" from "+EFFECTIVE_DECISIONS+" d join case_file cf on cf.id=d.case_id where "+scope.sql();
         for(var item:Map.of("fineDecided","fine_amount","recoupDecided","recoup_amount","confiscateDecided","confiscate_amount").entrySet())
             out.put(item.getKey(),scalar("select coalesce(sum(d."+item.getValue()+"),0)"+decisions,scope));
-        String executions=" from case_execution e join case_file cf on cf.id=e.case_id where "+scope.sql();
+        String executions=" from "+EFFECTIVE_EXECUTIONS+" e join case_file cf on cf.id=e.case_id where "+scope.sql();
         out.put("fineCollected",scalar("select coalesce(sum(e.amount),0)"+executions+" and e.kind in ('FINE','LATE_FEE','CONFISCATE')",scope));
         out.put("recoupCollected",scalar("select coalesce(sum(e.amount),0)"+executions+" and e.kind='RECOUP'",scope));
         out.put("byPartyType",rows("select cf.party_type,count(*) as cnt"+cases+" group by cf.party_type order by cnt desc,cf.party_type",scope));
@@ -57,8 +59,8 @@ public class BusinessStatisticsService {
         if(year<1||year>9998)throw new BizException(2100,"统计年度须在1至9998年之间");
         var caseScope=access.caseReadPredicate("cf.id",user);
         String cte="with visible_cases as (select cf.* from case_file cf where "+caseScope.sql()+"),"
-                +" visible_decisions as (select d.* from case_decision d join visible_cases cf on cf.id=d.case_id),"
-                +" visible_executions as (select e.* from case_execution e join visible_cases cf on cf.id=e.case_id) ";
+                +" visible_decisions as (select d.* from "+EFFECTIVE_DECISIONS+" d join visible_cases cf on cf.id=d.case_id),"
+                +" visible_executions as (select e.* from "+EFFECTIVE_EXECUTIONS+" e join visible_cases cf on cf.id=e.case_id) ";
         String monthly="""
                 select m as month,
                 (select count(*) from visible_cases where extract(year from filed_at)=? and extract(month from filed_at)=m) as filed,

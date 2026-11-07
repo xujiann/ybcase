@@ -99,6 +99,7 @@ public class SysUserController {
         // Distinct administrators can both observe an absent username. Serialize that absent key
         // before actor locking, so the loser returns the existing 1101 without touching the winner.
         lockUsername(req.username());
+        lockDirectory();
         adminWrites.requireCurrentAdmin();
         String assignmentError = assignmentError(req, null);
         if (assignmentError != null) return R.fail(1106, assignmentError);
@@ -134,6 +135,7 @@ public class SysUserController {
                 .filter(name -> rosterText(name, 64)).distinct().sorted().toList();
         // Match single-account creation's absent-key lock, then lock department and user rows in ID order.
         names.forEach(this::lockUsername);
+        lockDirectory();
         var departments = rosterDepartments(rows, true);
         Long[] userIds = names.isEmpty() ? new Long[0] : jdbc.queryForList(
                 "select id from sys_user where username in (" + placeholders(names.size()) + ")",
@@ -282,6 +284,7 @@ public class SysUserController {
     @PutMapping("/{id}")
     @Transactional
     public R<UserDto> update(@PathVariable Long id, @RequestBody SaveUserRequest req) {
+        lockDirectory();
         adminWrites.requireCurrentAdmin(id);
         SysUser u = lockedUser(id);
         if (u == null) return R.fail(1103, "用户不存在");
@@ -397,6 +400,8 @@ public class SysUserController {
                 ? req.roleCodes() : existing.getRoles().stream().map(SysRole::getCode).toList();
         String roleError = roleAssignmentError(category, roles);
         if (roleError != null) return roleError;
+        if (roles != null && roles.contains("INTEGRATION") && req.deptId() != null)
+            return "外部回执服务账号不能归属业务机构";
         if (req.deptId() == null) {
             return category == null ? null : "请选择账号所属机构";
         }
@@ -413,6 +418,9 @@ public class SysUserController {
     }
 
     private String roleAssignmentError(String category, List<String> roles) {
+        if (roles != null && roles.contains("INTEGRATION")) {
+            return roles.size() == 1 && category == null ? null : "外部回执服务账号仅可配置专用服务角色且不设业务类别";
+        }
         boolean agencyRole = roles != null && roles.contains("AGENCY");
         if ("AGENCY".equals(category)) {
             if (!agencyRole || roles.stream().anyMatch(role -> !"AGENCY".equals(role)))
@@ -423,6 +431,10 @@ public class SysUserController {
         if ("DISTRICT".equals(category) && roles != null && roles.contains("ADMIN"))
             return "区市县账号不能配置系统管理员角色";
         return null;
+    }
+
+    private void lockDirectory() {
+        jdbc.queryForList("select pg_advisory_xact_lock(20261028,1201)");
     }
 
     private void applyFields(SysUser u, SaveUserRequest req) {

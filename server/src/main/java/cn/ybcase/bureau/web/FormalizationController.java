@@ -122,8 +122,8 @@ public class FormalizationController {
     }
 
     @GetMapping("/approvals/pending")
-    public R<List<Map<String, Object>>> pending(Authentication auth) {
-        return R.ok(approvalService.pendingFor(auth.getName()));
+    public R<List<Map<String, Object>>> pending(Authentication auth, @RequestParam(required = false) Long focusId) {
+        return R.ok(approvalService.pendingFor(auth.getName(), focusId));
     }
 
     @GetMapping("/cases/{caseId}/approvals")
@@ -204,12 +204,18 @@ public class FormalizationController {
         Integer caseExists = jdbc.queryForObject("select count(*) from case_file where id = ?", Integer.class, caseId);
         if (caseExists == null || caseExists == 0) throw new BizException(2043, "案件不存在");
         Long documentId = deliveryDocumentId(body.get("documentId"));
+        boolean decisionDocument = "DECISION".equals(body.get("docKind"));
         if (documentId != null) {
             Integer own = jdbc.queryForObject(
                     "select count(*) from case_document where id = ? and case_id = ?", Integer.class, documentId, caseId);
             if (own == null || own == 0) throw new BizException(2041, "所选文书不属于本案");
+            decisionDocument |= "DECISION".equals(jdbc.queryForObject(
+                    "select doc_type from case_document where id=? and case_id=?", String.class, documentId, caseId));
         }
         if ("ELECTRONIC".equals(method)) {
+            if (decisionDocument && !Boolean.TRUE.equals(jdbc.queryForObject(
+                    "select exists(select 1 from sys_config where cfg_key='delivery_electronic_decision_allowed' and cfg_value='true')", Boolean.class)))
+                throw new BizException(2049, "当前规则不允许电子送达处罚决定书");
             Boolean consent = jdbc.queryForObject(
                     "select e_delivery_consent from case_file where id = ?", Boolean.class, caseId);
             if (!Boolean.TRUE.equals(consent))

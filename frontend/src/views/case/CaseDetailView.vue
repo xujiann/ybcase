@@ -196,6 +196,9 @@
     <HistoricalReportSupplement v-if="caseReady && ['DECIDED', 'DELIVERED', 'CLOSED'].includes(c.status)
                                 && ['PROVIDER', 'INDIVIDUAL'].includes(c.partyType)"
                                 :key="id" :case-id="Number(id)" />
+    <SupplementCorrectionPanel v-if="caseReady && ['DECIDED','DELIVERED','CLOSED'].includes(c.status)" :key="`correction-${id}`" :case-id="Number(id)" />
+    <CaseContinuationPanel v-if="caseReady && ['DECIDED','DELIVERED','CLOSED'].includes(c.status)" :key="`continuation-${id}`" :case-id="Number(id)" />
+    <DeliveryReceiptsPanel v-if="caseReady" :case-id="Number(id)" :writable="canWriteCase" :refresh-key="detail" />
     <el-card>
       <el-tabs>
         <el-tab-pane :label="`办案人员(${detail.officers?.length || 0})`">
@@ -1060,6 +1063,9 @@ import EvidenceCatalog from '../../components/EvidenceCatalog.vue'
 import { evidenceCatalogHtml } from '../../api/evidenceCatalog'
 import JurisdictionForm from '../../components/JurisdictionForm.vue'
 import HistoricalReportSupplement from './HistoricalReportSupplement.vue'
+import CaseContinuationPanel from '../../components/CaseContinuationPanel.vue'
+import SupplementCorrectionPanel from '../../components/SupplementCorrectionPanel.vue'
+import DeliveryReceiptsPanel from '../../components/DeliveryReceiptsPanel.vue'
 import JurisdictionSummary from '../../components/JurisdictionSummary.vue'
 import { emptyJurisdiction, serializeJurisdiction, jurisdictionError, canEditJurisdiction } from '../../api/jurisdiction'
 import PreflightChecklist from '../../components/PreflightChecklist.vue'

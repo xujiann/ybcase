@@ -83,6 +83,14 @@ public class NextStepTaskService {
                     from agreement_action a join visible_cases c on c.id=a.case_id
                     where a.agency_status='RETURNED'
                     """);
+            if (!actor.privileged()) { arguments.add(username); arguments.add(actor.id()); }
+            parts.add("""
+                    select 'DELIVERY_EXCEPTION:' || e.id, 'DELIVERY_EXCEPTION', e.id, null::int, c.case_no,
+                           '核对电子送达失败或超时并按当前规则处理', '电子送达异常', null::date,
+                           '/case/detail/' || c.id
+                    from electronic_delivery e join visible_cases c on c.id=e.case_id
+                    where e.status in ('FAILED','TIMED_OUT') and c.archive_no is null and c.status<>'CLOSED' and
+                    """ + assignment);
         }
         if (actor.privileged()) {
             var approvalScope = sources.approvalDepartmentPredicate("a", username);
@@ -111,6 +119,37 @@ public class NextStepTaskService {
                                      where o.case_id=c.id and (o.user_id=? or e.user_id=?))
                     """);
         }
+        if (actor.roles().contains("LEGAL") || actor.roles().contains("LEADER")) {
+            arguments.add(actor.id());
+            parts.add("""
+                    select 'CONTINUATION:' || r.id, 'CONTINUATION', r.id, null::int, c.case_no,
+                           '复核救济、后续缴款或退款申请并保留原卷', '待后续事项复核', null::date,
+                           '/case/detail/' || c.id
+                    from case_continuation_request r join visible_cases c on c.id=r.case_id
+                    where r.status='PENDING' and r.requested_by<>?
+                    """);
+        }
+
+        var treasuryConditions = new ArrayList<String>();
+        if (actor.roles().stream().anyMatch(Set.of("LEGAL","LEADER","ADMIN")::contains))
+            treasuryConditions.add("i.review_status='OPEN'");
+        if (writer) {
+            treasuryConditions.add("(i.review_status='ASSIGNED' and i.assignee=?)");
+            arguments.add(username);
+        }
+        if (actor.roles().contains("LEGAL") || actor.roles().contains("LEADER")) {
+            treasuryConditions.add("(i.review_status='SUBMITTED' and i.investigated_by<>?)");
+            arguments.add(username);
+        }
+        if (!treasuryConditions.isEmpty()) parts.add("""
+                select 'TREASURY:' || i.id, 'TREASURY', i.id, null::int, c.case_no,
+                       case i.review_status when 'OPEN' then '分派财政票据差异核查'
+                         when 'ASSIGNED' then '核查财政票据差异并提交依据' else '复核财政票据差异核查结果' end,
+                       case i.review_status when 'OPEN' then '待分派差异' when 'ASSIGNED' then '待差异核查' else '待差异复核' end,
+                       null::date, '/system/integrations?treasuryItem=' || i.id
+                from treasury_batch_item i join visible_cases c on c.id=i.case_id
+                where i.result not in ('PENDING','MATCH') and (
+                """ + String.join(" or ", treasuryConditions) + ")");
         if (actor.roles().contains("LEADER") && actor.accountCategory() != null && actor.deptId() != null) {
             arguments.add(actor.deptId());
             parts.add("""
@@ -130,6 +169,15 @@ public class NextStepTaskService {
                            '/case/detail/' || c.id
                     from case_reporting_supplement_request r join visible_cases c on c.id=r.case_id
                     where r.status='PENDING' and r.requested_by<>?
+                      and exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
+                    """);
+            arguments.add(actor.id());
+            arguments.add(actor.deptId());
+            parts.add("""
+                    select 'REPORT_VERSION:' || b.id, 'REPORT_VERSION', b.id, null::int,
+                           '报表批次 #' || b.id, '核对冻结报表来源并确认版本', '待报表确认', null::date,
+                           '/case/stats?reportBatch=' || b.id
+                    from report_frozen_batch b where b.status='GENERATED' and b.generated_by<>?
                       and exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
                     """);
         }
@@ -180,7 +228,7 @@ public class NextStepTaskService {
             LocalDate due = rs.getObject("due_at", LocalDate.class);
             Integer late = due == null ? null : (int) java.time.temporal.ChronoUnit.DAYS.between(due, LocalDate.now());
             String sourceType = rs.getString("source_type");
-            String actionLabel = Set.of("CLUE", "APPROVAL", "HANDOFF").contains(sourceType) ? "查看列表" : "进入办理";
+            String actionLabel = "进入办理";
             return new TaskRow(rs.getString("task_key"), rs.getString("source_type"), rs.getLong("source_id"),
                     rs.getObject("cycle", Integer.class), rs.getString("source_no"), rs.getString("title"),
                     rs.getString("stage"), due, late == null ? null : Math.max(late, 0), actionLabel, rs.getString("link"));

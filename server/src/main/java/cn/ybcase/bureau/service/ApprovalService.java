@@ -215,7 +215,21 @@ public class ApprovalService {
         return pending(username, materialAccess.readActor(username).privileged());
     }
 
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public List<Map<String, Object>> pendingFor(String username, Long focusId) {
+        if (focusId != null && focusId < 1) throw new BizException(2071, "待办来源编号须为正整数");
+        var actor = materialAccess.readActor(username);
+        if (actor.roles().contains("AGENCY") || actor.roles().contains("INTEGRATION")
+                || actor.roles().stream().noneMatch(java.util.Set.of("HANDLER","LEGAL","LEADER","ADMIN")::contains))
+            throw new BizException(403, "当前岗位无权查看审批");
+        return pending(username, actor.privileged(), focusId);
+    }
+
     private List<Map<String, Object>> pending(String applicant, boolean canDecide) {
+        return pending(applicant, canDecide, null);
+    }
+
+    private List<Map<String, Object>> pending(String applicant, boolean canDecide, Long focusId) {
         String base = """
                 select a.*, cf.case_no, cf.name as case_name, c.clue_no
                 from biz_approval a
@@ -223,18 +237,22 @@ public class ApprovalService {
                 left join case_clue c on c.id = a.clue_id
                 where a.status = 'PENDING'""";
         if (applicant == null) return jdbc.queryForList(base + " order by a.id");
+        String focus = focusId == null ? "" : " and a.id=?";
         if (canDecide) {
             var scope = sourceAttachmentAccess.approvalDepartmentPredicate("a", applicant);
-            return jdbc.queryForList(base + " and " + scope.sql() + " order by a.id", scope.args().toArray());
+            var args = new java.util.ArrayList<Object>(scope.args());
+            if (focusId != null) args.add(focusId);
+            return jdbc.queryForList(base + " and " + scope.sql() + focus + " order by a.id", args.toArray());
         }
         var caseScope = sourceAttachmentAccess.caseReadPredicate("a.case_id", applicant);
         var clueScope = sourceAttachmentAccess.clueReadPredicate("a.clue_id", applicant);
         var args = new java.util.ArrayList<Object>(); args.add(applicant);
         var departmentScope = sourceAttachmentAccess.approvalDepartmentPredicate("a", applicant);
         args.addAll(caseScope.args()); args.addAll(clueScope.args()); args.addAll(departmentScope.args());
+        if (focusId != null) args.add(focusId);
         return jdbc.queryForList(base + " and a.applicant=? and (a.case_id is null or " + caseScope.sql()
                 + ") and (a.clue_id is null or " + clueScope.sql() + ") and "
-                + departmentScope.sql() + " order by a.id", args.toArray());
+                + departmentScope.sql() + focus + " order by a.id", args.toArray());
     }
 
     @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)

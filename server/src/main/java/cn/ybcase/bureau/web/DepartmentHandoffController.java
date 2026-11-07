@@ -18,9 +18,10 @@ public class DepartmentHandoffController {
 
     @GetMapping
     public R<Map<String, Object>> list(@RequestParam(required = false) String status,
+                                       @RequestParam(required = false) Long focusId,
                                        @RequestParam(defaultValue = "1") int page,
                                        @RequestParam(defaultValue = "20") int size, Authentication auth) {
-        return R.ok(handoffs.list(auth.getName(), status, page, size));
+        return R.ok(handoffs.list(auth.getName(), status, page, size, focusId));
     }
 
     @PostMapping

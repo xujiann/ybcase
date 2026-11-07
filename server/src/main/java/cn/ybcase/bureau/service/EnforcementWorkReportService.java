@@ -31,9 +31,10 @@ public class EnforcementWorkReportService {
 
         List<Object[]> rows = new ArrayList<>();
         var budget = new ReportExport.Budget();
+        List<ReportExport.Line> lines = new ArrayList<>();
         ReportExport.query(jdbc, """
                 with period as (select cast(? as date) as starts, cast(? as date) as ends)
-                select dept.name as department, officers.leads, c.party_name, officers.members,
+                select c.id as report_case_id, c.case_no, dept.name as department, officers.leads, c.party_name, officers.members,
                        case c.institution_kind when 'SINGLE_PHARMACY' then '单体药店'
                             when 'CHAIN_PHARMACY' then '连锁药店' when 'MEDICAL' then
                             case rf.institution_ownership when 'PUBLIC' then '公立医疗机构'
@@ -46,7 +47,7 @@ public class EnforcementWorkReportService {
                             when d.decision_type = 'NOT_ESTABLISHED' then false end as violation,
                        case when c.reported_at <= p.ends or d.id is not null then rf.confirmed_violation_facts end as facts,
                        case when d.decision_type = 'PUNISH' then concat_ws(E'\\n',
-                           d.decision_no, nullif(rf.penalty_basis,''), nullif(d.content,''),
+                           d.decision_no, case when coalesce(d.penalty_basis,'') ~ '[^[:space:]]' then d.penalty_basis else nullif(rf.penalty_basis,'') end, nullif(d.content,''),
                            '罚款 ' || d.fine_amount || ' 元，责令退回基金 ' || d.recoup_amount || ' 元',
                            nullif(d.other_measures,'')) end as penalty,
                        agreement.results, agreement.termination,
@@ -60,10 +61,10 @@ public class EnforcementWorkReportService {
                                  '日常检查：' || inspections.ordinary) as remarks,
                        inspections.national, inspections.provincial, inspections.municipal
                 from case_file c cross join period p
-                left join case_reporting_facts rf on rf.case_id = c.id
+                left join case_reporting_facts_at() rf on rf.case_id = c.id
                 left join sys_dept dept on dept.id = c.owner_dept_id
                 left join case_clue cl on cl.id = c.clue_id
-                left join case_decision d on d.case_id = c.id and d.decided_at <= p.ends
+                left join case_effective_decisions(?) d on d.case_id = c.id and d.decided_at <= p.ends
                 left join lateral (
                     select string_agg(name, '、' order by id) filter (where duty = 'LEAD') as leads,
                            string_agg(name, '、' order by id) filter (where duty <> 'LEAD') as members
@@ -131,10 +132,12 @@ public class EnforcementWorkReportService {
                     rs.getString("pending_state"), rs.getString("details"), rs.getString("termination"),
                     rs.getString("judgments"), rs.getString("national"), rs.getString("provincial"), rs.getString("municipal"),
                     rs.getString("remarks")});
-        }, start, end);
+            lines.add(ReportExport.Line.of("CASE", rs.getLong("report_case_id"), rs.getString("case_no"),
+                    0, rows.size() + 3, rows.getLast()));
+        }, start, end, end);
         int caseCount = rows.size();
         ReportExport.query(jdbc, """
-                select dept.name as department, i.object_name, i.officers, i.result, i.violation_found,
+                select i.id as report_inspection_id, dept.name as department, i.object_name, i.officers, i.result, i.violation_found,
                        i.insp_no, i.done_at, i.task_level
                 from inspection i
                 left join sys_dept dept on dept.id = i.owner_dept_id
@@ -153,6 +156,8 @@ public class EnforcementWorkReportService {
                     "NATIONAL".equals(level) ? activity : null, "PROVINCIAL".equals(level) ? activity : null,
                     crossCheck ? "市级交叉检查 " + activity : "MUNICIPAL".equals(level) ? activity : null,
                     "检查人员：" + rs.getString("officers")});
+            lines.add(ReportExport.Line.of("INSPECTION", rs.getLong("report_inspection_id"), rs.getString("insp_no"),
+                    0, rows.size() + 3, rows.getLast()));
         }, start, end, end);
         var sheet = new PenaltyReportWorkbook.Sheet(rows, 'U', Map.of(
                 "A2", "报送部门：" + config.str("org_name", "医疗保障局"),
@@ -172,7 +177,7 @@ public class EnforcementWorkReportService {
                 new Object[]{"历史口径", "状态、决定、协助和移送按已登记日期判断，部门名称和办案人员采用当前登记资料。"}
         ) : List.of();
         return new ReportExport(PenaltyReportWorkbook.write("enforcement-work.xlsx", List.of(sheet), notes),
-                new ReportExport.Audit(ReportExport.Kind.ENFORCEMENT_WORK, start, end, end, rows.size()));
+                new ReportExport.Audit(ReportExport.Kind.ENFORCEMENT_WORK, start, end, end, rows.size()), lines);
     }
 
     private static String clueSource(String source, String clueNo) {

@@ -4,6 +4,7 @@
       <h3>待办审批<span class="hint">（申请→负责人批准两步留痕；批准即执行对应动作。展开左侧箭头查看申请内容再裁决）</span></h3>
       <el-button @click="load">刷新</el-button>
     </div>
+    <TaskFocusBanner :loading="loading" :failed="approvalState.failed" :count="rows.length" label="审批单" @change="setTaskFocus" />
     <el-alert v-if="approvalState.failed" type="error" :closable="false" title="审批列表加载失败，请刷新后重试。" style="margin-bottom: 12px" />
     <el-table :data="rows" border stripe size="small" v-loading="loading" row-key="id">
       <!-- 批准即执行（立案会真的建案、延期会真的顺延期限），负责人必须先看得见申请内容 -->
@@ -77,11 +78,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '../../api/client'
 import { createResourceLoader, resourceState } from '../../api/loadableResource'
 import JurisdictionSummary from '../../components/JurisdictionSummary.vue'
+import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
 import { useAuthStore } from '../../stores/auth'
 import { INSTITUTION_GRADE } from '../../api/violationFinding'
 
@@ -128,9 +130,11 @@ const loading = computed(() => approvalState.loading)
 const isLeader = computed(() => auth.user?.roles?.some((r) => ['LEADER', 'ADMIN'].includes(r)))
 const deciding = ref<number | null>(null)
 let disposed = false
+let mounted = false
+const focusId = ref<number>()
 let listGeneration = 0
 const approvalLoader = createResourceLoader(approvalState, async () => {
-  const data = (await client.get('/bureau/approvals/pending')).data.data
+  const data = (await client.get('/bureau/approvals/pending', { params: focusId.value === undefined ? undefined : { focusId: focusId.value } })).data.data
   if (!Array.isArray(data)) throw new Error('Invalid approval list')
   return data.map((r: any) => ({ ...r, __pl: parsePayload(r.payload, r.kind) }))
 })
@@ -138,8 +142,17 @@ const approvalLoader = createResourceLoader(approvalState, async () => {
 async function load() {
   if (disposed) return false
   listGeneration++
+  if (focusId.value === 0) { approvalLoader.invalidate(); approvalState.data=[]; approvalState.ready=true; return false }
   return approvalLoader.load()
 }
+function setTaskFocus(value: number | undefined) {
+  if (value === focusId.value) return
+  focusId.value = value
+  if (mounted) void load()
+}
+watch(() => JSON.stringify([auth.token, auth.user?.id, auth.user?.accountCategory, auth.user?.roles]), () => {
+  listGeneration++; approvalLoader.invalidate(); approvalState.data=[]
+}, { flush: 'sync' })
 onUnmounted(() => {
   disposed = true
   listGeneration++
@@ -172,6 +185,7 @@ async function onDecide(row: any, approve: boolean) {
 }
 
 onMounted(async () => {
+  mounted = true
   // 案由 id → 名称：负责人看到的应是"重复收费"而不是一个数字主键
   try { const data = (await client.get('/bureau/causes')).data.data; if (!disposed) causes.value = data } catch { /* 不阻断审批列表 */ }
   await load()

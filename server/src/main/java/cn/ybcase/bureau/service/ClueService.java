@@ -169,6 +169,21 @@ public class ClueService {
         return clueRepository.findById(id).orElseThrow(() -> new BizException(2025, "线索不存在"));
     }
 
+    /** A task link uses one scoped SQL lookup, independent of list filters and capped legacy pages. */
+    @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public java.util.Map<String, Object> focus(String username, long focusId) {
+        if (focusId < 1) throw new BizException(2025, "待办来源编号须为正整数");
+        var actor = materialAccess.readActor(username);
+        if (actor.roles().contains("AGENCY") || actor.roles().contains("INTEGRATION")
+                || actor.roles().stream().noneMatch(java.util.Set.of("HANDLER","LEGAL","LEADER","ADMIN")::contains))
+            throw new BizException(403, "当前岗位无权查看线索");
+        var scope = sourceAccess.clueReadPredicate("case_clue.id", username);
+        var args = new java.util.ArrayList<Object>(scope.args());
+        args.add(focusId);
+        var rows = jdbc.queryForList("select * from case_clue where " + scope.sql() + " and id=?", args.toArray());
+        return java.util.Map.of("rows", rows, "total", rows.size(), "page", 1, "size", 1);
+    }
+
     /**
      * 分页+关键词检索（线索编号/嫌疑人/内容）+ 受理日期区间。与 CaseService.pageList 同模式
      * （count + limit/offset，JdbcTemplate 蛇形列名）；区市县账号按来源机构收窄。

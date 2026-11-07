@@ -82,6 +82,9 @@ public class ReportingSupplementService {
         result.put("eligible", source.eligible());
         result.put("canRequest", source.eligible() && writer(actor) && !missing.isEmpty() && !pending);
         result.put("canReview", reviewer(actor));
+        var correctable = correctable(source);
+        result.put("canCorrect", source.eligible() && writer(actor) && !correctable.isEmpty() && !pending);
+        result.put("correctableFields", correctable);
         result.put("missingFields", missing);
         result.put("original", source.original());
         result.put("effective", source.effective());
@@ -90,17 +93,31 @@ public class ReportingSupplementService {
     }
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public Map<String, Object> correctionState(long caseId, String username) {
+        return state(caseId, username);
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public Map<String, Object> pendingCorrections(String username, int page, int size) {
+        return pendingByKind(username, page, size, "CORRECT");
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Map<String, Object> pending(String username, int page, int size) {
+        return pendingByKind(username, page, size, "FILL");
+    }
+
+    private Map<String, Object> pendingByKind(String username, int page, int size, String kind) {
         var actor = materials.readActor(username);
         requireReviewer(actor);
         if (page < 1 || size < 1 || size > 100) throw invalid("页码须大于零，每页须为1至100条");
         Long total = jdbc.queryForObject(
-                "select count(*) from case_reporting_supplement_request where status='PENDING'", Long.class);
+                "select count(*) from case_reporting_supplement_request where status='PENDING' and request_kind=?", Long.class, kind);
         var rows = jdbc.queryForList("""
                 select r.*,c.case_no,c.party_name from case_reporting_supplement_request r
-                join case_file c on c.id=r.case_id where r.status='PENDING'
+                join case_file c on c.id=r.case_id where r.status='PENDING' and r.request_kind=?
                 order by r.id desc limit ? offset ?
-                """, size, (page - 1L) * size).stream().map(row -> history(row, actor)).toList();
+                """, kind, size, (page - 1L) * size).stream().map(row -> history(row, actor)).toList();
         return Map.of("rows", rows, "total", total, "page", page, "size", size);
     }
 
@@ -125,6 +142,33 @@ public class ReportingSupplementService {
                 values(?,?::jsonb,?::jsonb,?::jsonb,?::jsonb,?,?,?,?,?,?,?) returning id
                 """, Long.class, caseId, json(values), json(source.original()), json(source.effective()),
                 source.sourceSnapshot(), reason, sourceReference, actor.id(), actor.username(), realName(actor.id()),
+                actor.deptId(), actor.accountCategory());
+    }
+
+    @Transactional
+    public long requestCorrection(long caseId, Map<String, Object> body, String username) {
+        requireKeys(body, Set.of("reason", "sourceReference", "values"));
+        String reason = text(body.get("reason"), 512, "纠错原因");
+        String reference = text(body.get("sourceReference"), 1000, "纠错来源依据");
+        CaseGuards.lock(jdbc, caseId);
+        var actor = materials.requireCaseWriter(caseId, username);
+        Source source = source(caseId);
+        if (!source.eligible()) throw invalid("仅已决定、已送达或已结案的处罚案件可以申请报表补录纠错");
+        Map<String, Object> values = proposed(body.get("values"), source, true);
+        var approved = jdbc.queryForList("select approved_request_id from case_reporting_supplement_values where case_id=?",
+                Long.class, caseId);
+        if (approved.isEmpty()) throw invalid("本案没有已批准的报表补录");
+        if (Boolean.TRUE.equals(jdbc.queryForObject("""
+                select exists(select 1 from case_reporting_supplement_request where case_id=? and status='PENDING')
+                """, Boolean.class, caseId)))
+            throw invalid("本案已有待审核申请，请先处理");
+        return jdbc.queryForObject("""
+                insert into case_reporting_supplement_request(case_id,request_kind,base_request_id,requested_values,
+                    original_values,effective_values,source_snapshot,reason,source_reference,requested_by,
+                    requested_username,requested_name,requester_dept_id,requester_category)
+                values (?,'CORRECT',?,?::jsonb,?::jsonb,?::jsonb,?::jsonb,?,?,?,?,?,?,?) returning id
+                """, Long.class, caseId, approved.getFirst(), json(values), json(source.original()), json(source.effective()),
+                source.sourceSnapshot(), reason, reference, actor.id(), actor.username(), realName(actor.id()),
                 actor.deptId(), actor.accountCategory());
     }
 
@@ -157,11 +201,18 @@ public class ReportingSupplementService {
                     || !sameJson(current.sourceSnapshot(), request.get("source_snapshot"))
                     || !sameJson(json(current.effective()), request.get("effective_values")))
                 throw invalid("来源资料或申请人归属已变化，请驳回后重新申请");
-            Map<String, Object> values = proposed(object(request.get("requested_values")), current);
+            boolean correction = "CORRECT".equals(request.get("request_kind"));
+            if (correction) {
+                Long latest = jdbc.queryForObject("select approved_request_id from case_reporting_supplement_values where case_id=?",
+                        Long.class, caseId);
+                if (!Objects.equals(latest, number(request.get("base_request_id"))))
+                    throw invalid("纠错所依据的补录版本已变化，请驳回后重新申请");
+            }
+            Map<String, Object> values = proposed(object(request.get("requested_values")), current, correction);
             approved = new LinkedHashMap<>(current.effective());
             approved.putAll(values);
             finish(requestId, "APPROVED", actor, opinion, approved);
-            saveValues(caseId, requestId, values);
+            saveValues(caseId, requestId, values, correction);
         } else {
             finish(requestId, "REJECTED", actor, opinion, null);
         }
@@ -183,13 +234,19 @@ public class ReportingSupplementService {
     }
 
     private Map<String, Object> proposed(Object raw, Source source) {
+        return proposed(raw, source, false);
+    }
+
+    private Map<String, Object> proposed(Object raw, Source source, boolean correction) {
         if (!(raw instanceof Map<?, ?> input) || input.isEmpty()) throw invalid("请至少填写一项缺失字段");
         var values = new LinkedHashMap<String, Object>();
         for (var entry : input.entrySet()) {
             if (!(entry.getKey() instanceof String key)) throw invalid("补录字段无效");
             Field field = Field.of(key);
-            if (!field.applies(source.partyType()) || !absent(source.effective().get(key)))
-                throw invalid("只能补录本案尚缺失的适用字段");
+            if (!field.applies(source.partyType()) || (correction
+                    ? !absent(source.original().get(key)) || absent(source.effective().get(key))
+                    : !absent(source.effective().get(key))))
+                throw invalid(correction ? "只能纠错原业务值缺失且已有已批准补录的字段" : "只能补录本案尚缺失的适用字段");
             Object value = entry.getValue();
             switch (field) {
                 case VIOLATION_START, VIOLATION_END -> {
@@ -208,6 +265,13 @@ public class ReportingSupplementService {
                     values.put(key, Money.nonNegative(new BigDecimal(amount.toString()), "认定金额"));
                 }
                 default -> values.put(key, text(value, field.maxLength, field.key));
+            }
+            if (correction) {
+                Object normalized = values.get(key), current = source.effective().get(key);
+                boolean unchanged = normalized instanceof BigDecimal decimal && current instanceof Number number
+                        ? decimal.compareTo(new BigDecimal(number.toString())) == 0
+                        : Objects.equals(Objects.toString(normalized, null), Objects.toString(current, null));
+                if (unchanged) throw invalid("纠错值须与当前报表补录值不同");
             }
         }
         if (values.containsKey("institutionOwnership")
@@ -231,14 +295,16 @@ public class ReportingSupplementService {
     private Source source(long caseId) {
         String original = Arrays.stream(Field.values()).map(field -> "'" + field.key + "',"
                 + (field == Field.PENALTY_BASIS ? "d." : "c.") + field.column).collect(Collectors.joining(","));
-        String effective = Arrays.stream(Field.values()).map(field -> "'" + field.key + "',rf."
-                + field.column).collect(Collectors.joining(","));
+        String effective = Arrays.stream(Field.values()).map(field -> "'" + field.key + "',"
+                + (field == Field.PENALTY_BASIS
+                    ? "case when coalesce(d.penalty_basis,'') ~ '[^[:space:]]' then d.penalty_basis else rf.penalty_basis end"
+                    : "rf." + field.column)).collect(Collectors.joining(","));
         var rows = jdbc.queryForList("""
                 select c.status,c.party_type,d.decision_type,d.decided_at,
                        jsonb_build_object('caseFile',to_jsonb(c),'decision',to_jsonb(d))::text as source_snapshot,
                        jsonb_build_object(%s)::text as original_values,
                        jsonb_build_object(%s)::text as effective_values
-                from case_file c left join case_decision d on d.case_id=c.id
+                from case_file c left join case_effective_decisions(current_date) d on d.case_id=c.id
                 join case_reporting_facts rf on rf.case_id=c.id where c.id=?
                 """.formatted(original, effective), caseId);
         if (rows.isEmpty()) throw forbidden("案件不存在或不在当前范围内");
@@ -255,6 +321,8 @@ public class ReportingSupplementService {
         value.put("caseNo", row.get("case_no"));
         value.put("partyName", row.get("party_name"));
         value.put("status", row.get("status"));
+        value.put("requestKind", row.get("request_kind"));
+        value.put("baseRequestId", row.get("base_request_id"));
         value.put("reason", row.get("reason"));
         value.put("sourceReference", row.get("source_reference"));
         value.put("values", object(row.get("requested_values")));
@@ -275,10 +343,11 @@ public class ReportingSupplementService {
         return value;
     }
 
-    private void saveValues(long caseId, long requestId, Map<String, Object> values) {
+    private void saveValues(long caseId, long requestId, Map<String, Object> values, boolean correction) {
         String columns = Arrays.stream(Field.values()).map(field -> field.column).collect(Collectors.joining(","));
-        String updates = Arrays.stream(Field.values()).map(field -> field.column
-                + "=coalesce(case_reporting_supplement_values." + field.column + ",excluded." + field.column + ")")
+        String updates = Arrays.stream(Field.values()).map(field -> field.column + "=coalesce("
+                + (correction ? "excluded." + field.column + ",case_reporting_supplement_values."
+                : "case_reporting_supplement_values." + field.column + ",excluded.") + field.column + ")")
                 .collect(Collectors.joining(","));
         var args = new ArrayList<Object>();
         args.add(caseId);
@@ -308,6 +377,12 @@ public class ReportingSupplementService {
     private List<String> missing(Source source) {
         return Arrays.stream(Field.values()).filter(field -> field.applies(source.partyType())
                 && absent(source.effective().get(field.key))).map(field -> field.key).toList();
+    }
+
+    private List<String> correctable(Source source) {
+        return Arrays.stream(Field.values()).filter(field -> field.applies(source.partyType())
+                && absent(source.original().get(field.key)) && !absent(source.effective().get(field.key)))
+                .map(field -> field.key).toList();
     }
 
     private boolean reviewer(WorkflowUserAccess.User actor) {

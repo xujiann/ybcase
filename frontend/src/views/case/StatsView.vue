@@ -35,6 +35,9 @@
       <span>{{ lastReportExport.filename }} · 请求号 <code>{{ lastReportExport.requestId }}</code></span>
     </el-alert>
     <HistoricalReportSupplement v-if="canReviewReportSupplements" />
+    <SupplementCorrectionPanel v-if="canReviewReportSupplements" />
+    <TaskFocusBanner v-if="canExportPenalties" param-key="reportBatch" label="报表批次" @change="reportBatchFocus = $event" />
+    <ReportingVersionsPanel v-if="canExportPenalties && reportBatchFocus !== 0" :focus-batch-id="reportBatchFocus" />
     <el-row :gutter="12" class="mb">
       <el-col :span="4" v-for="card in cards" :key="card.label">
         <el-card>
@@ -119,6 +122,9 @@ import { sessionExpiry } from '../../api/sessionExpiry'
 import { localDate } from '../../api/dates'
 import PenaltyMissingFields from './PenaltyMissingFields.vue'
 import HistoricalReportSupplement from './HistoricalReportSupplement.vue'
+import ReportingVersionsPanel from '../../components/ReportingVersionsPanel.vue'
+import SupplementCorrectionPanel from '../../components/SupplementCorrectionPanel.vue'
+import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
 
 const auth = useAuthStore()
 const canExportPenalties = computed(() => auth.user?.accountCategory === 'BUREAU'
@@ -126,6 +132,7 @@ const canExportPenalties = computed(() => auth.user?.accountCategory === 'BUREAU
 const canReviewReportSupplements = computed(() => auth.user?.accountCategory === 'BUREAU'
   && auth.user?.roles.some(role => ['LEADER', 'LEGAL'].includes(role)))
 const penaltyExporting = ref(false)
+const reportBatchFocus = ref<number>()
 const lastReportExport = ref<{ filename: string; requestId: string }>()
 watch(() => [auth.token, auth.user?.id, canExportPenalties.value], () => {
   lastReportExport.value = undefined

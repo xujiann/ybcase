@@ -15,7 +15,7 @@ const state = (marker = 'old') => ({ eligible: true, canRequest: true, canReview
 
 function fixture(t, ...caseIds) {
   const caseId = caseIds.length ? caseIds[0] : 101
-  const props = Vue.reactive({ caseId })
+  const props = Vue.reactive({ caseId, correction: false })
   const auth = Vue.reactive({ token: 'one', user: { id: 1, accountCategory: 'BUREAU', roles: ['LEGAL'] } })
   const reads = [], writes = [], successes = [], warnings = [], teardown = [], listeners = new Map()
   const sessionExpiry = createSessionExpiry()
@@ -106,4 +106,23 @@ test('report supplement expiry and unmount clear sensitive history and prevent l
     assert.equal(f.state.value, undefined)
     assert.equal(f.rows.value.length, 0)
   }
+})
+
+test('correction mode uses separate queue and submits only approved supplemental fields', async t => {
+  const f = fixture(t)
+  f.props.correction = true
+  await ready(f, { ...state(), canRequest: false, canCorrect: true,
+    correctableFields: ['institutionCode'], effective: { institutionCode: 'OLD', confirmedViolationAmount: 0 } })
+  f.openRequest()
+  f.selectedFields.value = ['institutionCode']
+  f.draft.institutionCode = 'NEW'
+  f.reason.value = '已批准补录值有误'
+  f.sourceReference.value = '原始机构名册第8行'
+  const pending = f.submitRequest()
+  assert.equal(f.writes.length, 1)
+  assert.equal(f.writes[0].url, '/bureau/cases/101/report-supplement-corrections')
+  assert.deepEqual(f.writes[0].body.values, { institutionCode: 'NEW' })
+  f.writes[0].reject(new Error('offline'))
+  await pending
+  assert.equal(f.draft.institutionCode, 'NEW')
 })

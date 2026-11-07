@@ -95,17 +95,27 @@ public class DepartmentInterviewService {
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public ReportExport export(int year, LocalDate start, LocalDate cutoff, boolean reconcile, String username) {
+        return export(year, start, null, cutoff, reconcile, username);
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public ReportExport export(int year, LocalDate start, LocalDate end, LocalDate cutoff, boolean reconcile, String username) {
         var actor = materialAccess.readActor(username);
         if (!isBureauSupervisor(actor, category(actor.id())))
             throw new BizException(403, "全局约谈台账由局机关授权岗位导出");
-        var period = ReportExport.AnnualPeriod.of(year, start, cutoff, LocalDate.now());
+        var period = ReportExport.AnnualPeriod.of(year, start, end, cutoff, LocalDate.now());
         List<Object[]> rows = new ArrayList<>();
         var budget = new ReportExport.Budget();
+        List<ReportExport.Line> lines = new ArrayList<>();
         ReportExport.query(jdbc, SELECT + ORDER,
-                rs -> budget.add(rows, new Object[]{rows.size() + 1, rs.getString("department_name"),
-                        rs.getString("institution_code"), rs.getString("institution_name"),
-                        rs.getString("interview_type"), rs.getString("reason"), rs.getString("content"),
-                        rs.getString("participants"), rs.getObject("interview_date", LocalDate.class)}),
+                rs -> {
+                    budget.add(rows, new Object[]{rows.size() + 1, rs.getString("department_name"),
+                            rs.getString("institution_code"), rs.getString("institution_name"),
+                            rs.getString("interview_type"), rs.getString("reason"), rs.getString("content"),
+                            rs.getString("participants"), rs.getObject("interview_date", LocalDate.class)});
+                    lines.add(ReportExport.Line.of("INTERVIEW", rs.getLong("id"), rs.getString("institution_code"),
+                            0, rows.size() + 3, rows.getLast()));
+                },
                 period.start(), period.end().plusDays(1));
         var sheet = new PenaltyReportWorkbook.Sheet(rows, 'I', Map.of("A1", year + "年医保部门约谈定点医药机构台账"));
         List<Object[]> notes = reconcile || start != null || cutoff != null ? List.of(
@@ -116,7 +126,7 @@ public class DepartmentInterviewService {
                 new Object[]{"取数来源", "按约谈台账登记的实际约谈日期筛选，采用已登记的部门名称和当前修订内容。"}
         ) : List.of();
         return new ReportExport(PenaltyReportWorkbook.write("department-interviews.xlsx", List.of(sheet), notes),
-                new ReportExport.Audit(ReportExport.Kind.INTERVIEWS, period.start(), period.end(), period.cutoff(), rows.size()));
+                new ReportExport.Audit(ReportExport.Kind.INTERVIEWS, period.start(), period.end(), period.cutoff(), rows.size()), lines);
     }
 
     private static LocalDate listPeriodStart(int year) {

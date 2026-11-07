@@ -1068,6 +1068,17 @@ public class CaseService {
     }
 
     private boolean courtAccepted(CaseFile c) {
+        var continuations = jdbc.queryForList("""
+                select p.status,p.received_at,p.receipt_no from case_court_round r
+                join case_continuation_request a on a.id=r.request_id and a.status='APPROVED'
+                left join case_court_receipt p on p.round_id=r.id
+                where r.case_id=? order by r.round_no desc limit 1
+                """,c.getId());
+        if (!continuations.isEmpty()) {
+            var receipt=continuations.getFirst();
+            return "ACCEPTED".equals(receipt.get("status")) && receipt.get("received_at")!=null
+                    && receipt.get("receipt_no") instanceof String number && !number.isBlank();
+        }
         return "ACCEPTED".equals(c.getCourtEnforceStatus()) && c.getCourtReceivedAt() != null
                 && c.getCourtReceiptNo() != null && !c.getCourtReceiptNo().isBlank();
     }
@@ -1080,12 +1091,21 @@ public class CaseService {
                 terminated ? "本案已立卷归档（案卷号 " + c.getArchiveNo() + "）" : "案件状态不满足结案条件", "LEADER");
         out.check("exclusions_closed", "期限扣除事由已登记结束日期", exclusionsClosed(c.getId()),
                 2032, "仍有未结束的期限扣除事由或专家评审，请先登记结束日期再归档", "HANDLER");
+        boolean outstandingContinuation=Boolean.TRUE.equals(jdbc.queryForObject("""
+                select exists(select 1 from case_continuation_request where case_id=? and status='PENDING'
+                  union all select 1 from case_remedy m where m.case_id=? and not exists(
+                    select 1 from case_continuation_request r where r.case_id=m.case_id
+                     and r.request_type='REMEDY_RESULT' and r.status='APPROVED' and (r.payload->>'remedyId')::bigint=m.id))
+                """,Boolean.class,c.getId(),c.getId()));
+        out.check("continuation_review", "救济结果及后续申请已完成复核", !outstandingContinuation,2193,
+                "尚有待复核后续申请或未办结救济结果，请先办理后再确认结案", "LEGAL");
         if (!terminated) {
             CaseDecision d = decisionRepository.findByCaseId(c.getId()).orElse(null);
             out.check("decision", "已有处理决定", d != null, 2011, "无处理决定，不能结案", "LEADER");
             out.check("close_status", "已决定或已送达阶段", List.of("DECIDED", "DELIVERED").contains(c.getStatus()),
                     2011, "案件状态不满足结案条件", "HANDLER");
-            if (d != null && "PUNISH".equals(d.getDecisionType())) {
+            var effective=effectiveCloseDecision(c.getId());
+            if (d != null && "PUNISH".equals(effective.get("decision_type"))) {
                 out.check("delivery", "处罚决定书已送达", "DELIVERED".equals(c.getStatus()),
                         2011, "处罚决定书未送达，不能结案（第59条）", "HANDLER");
                 out.check("execution_or_court", "款项执行完毕或法院正式受理", courtAccepted(c) || fullyExecuted(c.getId(), d),
@@ -1213,6 +1233,8 @@ public class CaseService {
     public CaseDecision publish(Long caseId) {
         CaseGuards.lock(jdbc, caseId);
         materialAccess.requireCurrentCaseWriter(caseId);
+        if (effectiveCloseDecision(caseId).get("version_id") != null)
+            throw new BizException(2193,"本案已有当前生效的独立决定版本，不得继续公开原决定；请人工核对结果版本及既有公示");
         entityManager.flush();
         CaseFile cf = get(caseId);
         entityManager.refresh(cf);
@@ -1287,7 +1309,7 @@ public class CaseService {
         checks.requireReady();
         if ("TERMINATED".equals(c.getStatus())) return archiveTerminated(c, closeReport, maker);
         CaseDecision d = decisionRepository.findByCaseId(caseId).orElseThrow();
-        String closeReason = !"PUNISH".equals(d.getDecisionType()) ? "NO_NEED"
+        String closeReason = !"PUNISH".equals(effectiveCloseDecision(caseId).get("decision_type")) ? "NO_NEED"
                 : courtAccepted(c) ? "COURT" : "EXECUTED";
         addDocument(caseId, new DocumentReq("CLOSE_REPORT", c.getCaseNo() + " 结案报告",
                 closeReport, LocalDate.now(), maker, false, null, null));
@@ -1583,9 +1605,23 @@ public class CaseService {
     }
 
     private boolean fullyExecuted(Long caseId, CaseDecision d) {
-        return executionService.sum(caseId, "FINE").compareTo(d.getFineAmount()) >= 0
-                && executionService.sum(caseId, "RECOUP").compareTo(d.getRecoupAmount()) >= 0
-                && executionService.sum(caseId, "CONFISCATE").compareTo(d.getConfiscateAmount()) >= 0;
+        var effective=effectiveCloseDecision(caseId);
+        for (String kind:List.of("FINE","RECOUP","CONFISCATE")) {
+            String column=switch(kind){case "FINE"->"fine_amount";case "RECOUP"->"recoup_amount";default->"confiscate_amount";};
+            BigDecimal paid=jdbc.queryForObject("""
+                    select coalesce(sum(amount),0) from case_effective_executions(
+                      (current_timestamp at time zone 'Asia/Shanghai')::date,clock_timestamp()) where case_id=? and kind=?
+                    """,BigDecimal.class,caseId,kind);
+            if (effective.isEmpty() || paid.compareTo((BigDecimal)effective.get(column))<0) return false;
+        }
+        return true;
+    }
+
+    private Map<String,Object> effectiveCloseDecision(Long caseId) {
+        var rows=jdbc.queryForList("""
+                select * from case_effective_decisions((current_timestamp at time zone 'Asia/Shanghai')::date,clock_timestamp()) where case_id=?
+                """,caseId);
+        return rows.isEmpty()?Map.of():rows.getFirst();
     }
 
     private String cfg(String key, String def) {

@@ -128,6 +128,51 @@ class NextStepTaskIntegrationTest {
         assertFalse(has(tasks.bureau(admin.name(), 1, 100), "REPORT_SUPPLEMENT", request));
     }
 
+    @Test void archivedContinuationUsesCurrentScopeAndAnotherActualReviewRole() {
+        var owner=actor("DISTRICT","HANDLER");var reviewer=actor("BUREAU","LEGAL");var admin=actor("BUREAU","ADMIN");var foreign=actor("DISTRICT","LEADER");
+        long c=caseFile(owner,"CLOSED");
+        long id=jdbc.queryForObject("insert into case_continuation_request(case_id,request_key,request_type,payload,source_snapshot,reason,source_reference,requested_by,requested_username) values(?,?,'EXECUTION','{}','{}','后续到账','合成凭据',?,?) returning id",Long.class,c,unique(),owner.id(),owner.name());
+        assertTrue(has(tasks.bureau(reviewer.name(),1,100),"CONTINUATION",id));
+        assertFalse(has(tasks.bureau(admin.name(),1,100),"CONTINUATION",id));assertFalse(has(tasks.bureau(foreign.name(),1,100),"CONTINUATION",id));
+        long selfCase=caseFile(reviewer,"CLOSED");
+        long selfRequest=jdbc.queryForObject("insert into case_continuation_request(case_id,request_key,request_type,payload,source_snapshot,reason,source_reference,requested_by,requested_username) values(?,?,'EXECUTION','{}','{}','本人历史申请','合成凭据',?,?) returning id",Long.class,selfCase,unique(),reviewer.id(),reviewer.name());
+        assertFalse(has(tasks.bureau(reviewer.name(),1,100),"CONTINUATION",selfRequest));
+    }
+
+    @Test void generatedReportTaskRequiresAnotherFormalBureauReviewer() {
+        var generator=actor("BUREAU","LEADER");var reviewer=actor("BUREAU","LEGAL");var district=actor("DISTRICT","LEADER");var admin=actor("BUREAU","ADMIN");
+        long id=jdbc.queryForObject("""
+            insert into report_frozen_batch(request_key,report_type,period_start,period_end,business_cutoff,known_at,criteria,
+                template_version,template_sha256,rule_version,filename,workbook,file_sha256,row_count,generated_by,generated_username)
+            values(?::uuid,'PENALTIES',current_date,current_date,current_date,current_timestamp,'{}','test',?,'test','合成.xlsx',decode('00','hex'),?,0,?,?) returning id
+            """,Long.class,UUID.randomUUID().toString(),"a".repeat(64),"b".repeat(64),generator.id(),generator.name());
+        var task=tasks.bureau(reviewer.name(),1,100).rows().stream().filter(row->row.sourceType().equals("REPORT_VERSION")&&row.sourceId()==id).findFirst().orElseThrow();
+        assertEquals("/case/stats?reportBatch="+id,task.link());
+        assertFalse(has(tasks.bureau(generator.name(),1,100),"REPORT_VERSION",id));assertFalse(has(tasks.bureau(district.name(),1,100),"REPORT_VERSION",id));assertFalse(has(tasks.bureau(admin.name(),1,100),"REPORT_VERSION",id));
+    }
+
+    @Test void treasuryTasksTrackAssignmentAndIndependentReviewWithoutLeakingAnotherDistrict() {
+        var owner=actor("DISTRICT","HANDLER");var reviewer=actor("BUREAU","LEGAL");var foreign=actor("DISTRICT","LEADER");long c=caseFile(owner,"CLOSED");
+        long batch=jdbc.queryForObject("insert into treasury_batch(request_key,request_hash,created_by) values(?,?,?) returning id",Long.class,unique(),"a".repeat(64),owner.name());
+        long item=jdbc.queryForObject("insert into treasury_batch_item(batch_id,source,source_id,case_id,kind,amount,paid_at,result) values(?,'ORIGINAL',1,?,'FINE',1,current_date,'DIFFERENT') returning id",Long.class,batch,c);
+        assertTrue(has(tasks.bureau(reviewer.name(),1,100),"TREASURY",item));assertFalse(has(tasks.bureau(owner.name(),1,100),"TREASURY",item));assertFalse(has(tasks.bureau(foreign.name(),1,100),"TREASURY",item));
+        jdbc.update("update treasury_batch_item set review_status='ASSIGNED',assignee=? where id=?",owner.name(),item);
+        assertTrue(has(tasks.bureau(owner.name(),1,100),"TREASURY",item));assertFalse(has(tasks.bureau(reviewer.name(),1,100),"TREASURY",item));
+        jdbc.update("update treasury_batch_item set review_status='SUBMITTED',investigated_by=? where id=?",owner.name(),item);
+        assertTrue(has(tasks.bureau(reviewer.name(),1,100),"TREASURY",item));
+        jdbc.update("update treasury_batch_item set review_status='RESOLVED' where id=?",item);assertFalse(has(tasks.bureau(reviewer.name(),1,100),"TREASURY",item));
+    }
+
+    @Test void retryableDeliveryExceptionsDisappearAfterSendOrArchiveAndRejectionIsOnlyEvidence() {
+        var owner=actor("DISTRICT","HANDLER");long c=caseFile(owner,"DECIDED");
+        long doc=jdbc.queryForObject("insert into case_document(case_id,doc_type,title,content,made_at) values(?,'DECISION','合成决定','合成正文',current_date) returning id",Long.class,c);
+        long id=jdbc.queryForObject("insert into electronic_delivery(case_id,document_id,request_key,document_hash,receiver,channel,status,created_by) values(?,?,?,'hash','受送达人','fixture@example.invalid','FAILED',?) returning id",Long.class,c,doc,unique(),owner.name());
+        assertTrue(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",id));
+        jdbc.update("update electronic_delivery set status='SENT' where id=?",id);assertFalse(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",id));
+        jdbc.update("update electronic_delivery set status='REJECTED' where id=?",id);assertFalse(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",id));
+        jdbc.update("update electronic_delivery set status='TIMED_OUT' where id=?",id);jdbc.update("update case_file set archive_no=? where id=?",unique(),c);assertFalse(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",id));
+    }
+
     private Actor actor(String category, String role) {
         String code = unique();
         long dept = jdbc.queryForObject("insert into sys_dept(name,code,type,org_kind) values(?,?,'ADMIN',?) returning id",

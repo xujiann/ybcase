@@ -24,6 +24,35 @@ public class IntegrationGateway {
         return "true".equalsIgnoreCase(property(target, "enabled")) && !property(target, "url").isBlank();
     }
 
+    /** Deliberately returns no address or credential material. A configured gateway is not a verified live integration. */
+    public Map<String, Boolean> readiness(String target) {
+        boolean addressValid;
+        try { endpoint(target, "health/check"); addressValid = true; }
+        catch (BizException e) { addressValid = false; }
+        String token = property(target, "token");
+        return Map.of("enabled", "true".equalsIgnoreCase(property(target,"enabled")),
+                "addressConfigured", !property(target,"url").isBlank(), "addressValid", addressValid,
+                "credentialConfigured", !token.isBlank() && token.codePoints().noneMatch(Character::isISOControl));
+    }
+
+    public boolean callbackAccount(String username) {
+        String expected = property("delivery", "callback-username");
+        return !expected.isBlank() && expected.equals(username);
+    }
+
+    public boolean callbackConfigured() { return !property("delivery", "callback-username").isBlank(); }
+
+    public boolean timeoutScanEnabled() { return "true".equalsIgnoreCase(property("delivery","timeout-scan-enabled")); }
+
+    public int receiptTimeoutHours() {
+        String configured=property("delivery","receipt-timeout-hours");
+        try {
+            int hours=configured.isBlank()?168:Integer.parseInt(configured);
+            if(hours<1 || hours>720) throw new IllegalArgumentException();
+            return hours;
+        } catch(IllegalArgumentException ex) { throw new BizException(2160,"电子回执等待小时数须为1至720"); }
+    }
+
     public JsonNode post(String target, String path, Map<String, ?> body, String requestKey) {
         if (!configured(target)) throw new BizException(2160, "外部网关未启用或未配置");
         URI url = endpoint(target, path);

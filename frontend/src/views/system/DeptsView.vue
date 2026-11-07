@@ -36,15 +36,18 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="170">
+      <el-table-column label="操作" width="250">
         <template #default="{ row }">
           <el-button v-if="isAdmin" link type="primary" @click="openEdit(row)">编辑</el-button>
+          <el-button v-if="isAdmin && !row.orgKind" link type="warning" :disabled="loading || saving" @click="classificationId = row.id">核对归类</el-button>
           <el-button v-if="isAdmin" link :type="row.enabled ? 'danger' : 'success'" @click="toggleEnabled(row)">
             {{ row.enabled ? '停用' : '启用' }}
           </el-button>
         </template>
       </el-table-column>
     </el-table>
+    <DepartmentClassificationDialog v-if="isAdmin && classificationId" :dept-id="classificationId"
+                                    @close="classificationId = null" @completed="load" />
 
     <el-dialog v-model="dialogVisible" :title="form.id ? '编辑机构' : '新增机构'" width="420px"
                :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
@@ -81,6 +84,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import client from '../../api/client'
+import DepartmentClassificationDialog from '../../components/DepartmentClassificationDialog.vue'
 import { useAuthStore } from '../../stores/auth'
 import { adminOperationAccess } from '../../api/caseWriteAccess'
 import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../../api/sessionExpiry'
@@ -145,6 +149,7 @@ const failed = ref(false)
 const saving = ref(false)
 const rowAction = ref<number | null>(null)
 const dialogVisible = ref(false)
+const classificationId = ref<number | null>(null)
 const form = reactive<DeptRow>({ id: null, parentId: null, name: '', code: '', type: 'ADMIN', sortNo: 0, enabled: true, orgKind: null, responsibility: null })
 let disposed = false, loadGeneration = 0, saveGeneration = 0, actionGeneration = 0
 
@@ -163,6 +168,7 @@ function resetForm() {
   Object.assign(form, { id: null, parentId: null, name: '', code: '', type: 'ADMIN', sortNo: 0, enabled: true, orgKind: null, responsibility: null })
 }
 function invalidate(clearDraft = true) {
+  classificationId.value = null
   loadGeneration++; saveGeneration++; actionGeneration++
   records.value = []; loading.value = false; failed.value = false; saving.value = false; rowAction.value = null
   if (clearDraft) { dialogVisible.value = false; resetForm(); categoryFilter.value = 'ALL'; search.value = '' }

@@ -153,6 +153,11 @@ public class OversightController {
                 join case_file cf on cf.id = d.case_id
                 join case_cause cc on cc.id = cf.cause_id
                 where d.published = true and d.publish_withdrawn = false
+                  and not exists (
+                      select 1 from case_effective_decisions(
+                          (current_timestamp at time zone 'Asia/Shanghai')::date,current_timestamp) effective
+                      where effective.case_id=d.case_id and effective.version_id is not null
+                  )
                 order by d.published_at desc limit 2000""");
         for (var r : rows) {
             if ("INDIVIDUAL".equals(r.get("party_type"))) {

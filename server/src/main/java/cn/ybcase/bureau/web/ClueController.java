@@ -32,7 +32,9 @@ public class ClueController {
                      @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
                      @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
                      @RequestParam(required = false) Integer page,
+                     @RequestParam(required = false) Long focusId,
                      @RequestParam(defaultValue = "20") int size, Authentication auth) {
+        if (focusId != null) return R.ok(clueService.focus(auth.getName(), focusId));
         if (materialAccess.departmentScope(auth.getName()).district()) {
             var result = clueService.pageList(status, source, q, from, to,
                     page == null ? 1 : page, page == null ? 200 : Math.min(Math.max(size, 1), 100), auth.getName());

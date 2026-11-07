@@ -33,9 +33,10 @@ class DalianOrganizationIntegrationTest {
 
     @Test
     void directorySeparatesEnforcementAndAgencyAccounts() throws Exception {
-        assertEquals(10, jdbc.queryForObject("select count(*) from sys_dept where org_kind='BUREAU'", Integer.class));
-        assertEquals(12, jdbc.queryForObject("select count(*) from sys_dept where org_kind='DISTRICT'", Integer.class));
-        assertEquals(3, jdbc.queryForObject("select count(*) from sys_dept where org_kind='AGENCY'", Integer.class));
+        // Verify the PPT's seeded directory, independently of departments created by other committed HTTP tests.
+        assertEquals(10, jdbc.queryForObject("select count(*) from sys_dept where org_kind='BUREAU' and parent_id=(select id from sys_dept where code='DL_YB_OFFICES')", Integer.class));
+        assertEquals(12, jdbc.queryForObject("select count(*) from sys_dept where org_kind='DISTRICT' and parent_id in(select id from sys_dept where code in('DL_YB_BRANCHES','DL_YB_URBAN'))", Integer.class));
+        assertEquals(3, jdbc.queryForObject("select count(*) from sys_dept where org_kind='AGENCY' and parent_id=(select id from sys_dept where code='DL_YB_CENTER')", Integer.class));
         assertEquals(7, jdbc.queryForObject("""
                 select count(*) from sys_dept child join sys_dept parent on child.parent_id=parent.id
                 where parent.code='DL_YB_BRANCHES'

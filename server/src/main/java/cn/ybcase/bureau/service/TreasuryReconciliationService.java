@@ -20,7 +20,12 @@ public class TreasuryReconciliationService {
     private final MaterialAccess access;
     private final IntegrationGateway gateway;
 
-    public record Result(String status, boolean amountMatches, boolean dateMatches, boolean paid) {}
+    public record Result(String status, boolean amountMatches, boolean dateMatches, boolean paid,
+                         BigDecimal externalAmount,LocalDate externalPaidAt) {
+        public Result(String status,boolean amountMatches,boolean dateMatches,boolean paid) {
+            this(status,amountMatches,dateMatches,paid,null,null);
+        }
+    }
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Result reconcile(long caseId, long executionId) {
@@ -31,6 +36,10 @@ public class TreasuryReconciliationService {
         if (rows.isEmpty()) throw new BizException(2043, "案件执行记录不存在");
         var row = rows.getFirst();
         String receipt = (String) row.get("receipt_no");
+        return lookup(receipt, (BigDecimal) row.get("amount"), ((java.sql.Date) row.get("paid_at")).toLocalDate());
+    }
+
+    public Result lookup(String receipt, BigDecimal amount, LocalDate paidAt) {
         if (receipt == null || receipt.isBlank()) return new Result("MISSING_RECEIPT", false, false, false);
         if (!gateway.configured("treasury")) return new Result("UNCONFIGURED", false, false, false);
 
@@ -46,9 +55,13 @@ public class TreasuryReconciliationService {
         } catch (DateTimeParseException e) {
             throw IntegrationGateway.invalidResponse();
         }
-        boolean matchesAmount = ((BigDecimal) row.get("amount")).compareTo(response.path("amount").decimalValue()) == 0;
-        boolean matchesDate = ((java.sql.Date) row.get("paid_at")).toLocalDate().equals(date);
+        BigDecimal externalAmount=response.path("amount").decimalValue();
+        if(externalAmount.signum()<0 || externalAmount.precision()>38 || externalAmount.scale()>24 || externalAmount.scale() < -24)
+            throw IntegrationGateway.invalidResponse();
+        boolean matchesAmount = amount.compareTo(externalAmount) == 0;
+        boolean matchesDate = paidAt.equals(date);
         boolean paid = response.path("paid").booleanValue();
-        return new Result(matchesAmount && matchesDate && paid ? "MATCH" : "DIFFERENT", matchesAmount, matchesDate, paid);
+        return new Result(matchesAmount && matchesDate && paid ? "MATCH" : "DIFFERENT", matchesAmount, matchesDate, paid,
+                externalAmount,date);
     }
 }
