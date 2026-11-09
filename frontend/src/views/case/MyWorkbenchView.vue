@@ -1,5 +1,6 @@
 <template>
   <div v-loading="loading">
+    <WorkdayCoverageNotice />
     <el-alert v-if="failed" type="error" :closable="false" title="工作台加载失败，请重新进入本页重试。" class="mb" />
     <el-row :gutter="12" class="mb">
       <el-col :span="6">
@@ -64,6 +65,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import client from '../../api/client'
 import NextStepTasks from '../../components/NextStepTasks.vue'
+import WorkdayCoverageNotice from '../../components/WorkdayCoverageNotice.vue'
 import { useAuthStore } from '../../stores/auth'
 import { CASE_STATUS, EXECUTION_DEADLINE_STATE } from './labels'
 import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../../api/sessionExpiry'

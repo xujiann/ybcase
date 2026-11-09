@@ -2,6 +2,7 @@ package cn.ybcase.bureau.service;
 
 import cn.ybcase.bureau.common.BizException;
 import cn.ybcase.bureau.common.Money;
+import cn.ybcase.bureau.repository.CaseFileRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -27,7 +28,10 @@ public class CaseContinuationService {
     private final WorkflowUserAccess users;
     private final CaseFactService factHistory;
     private final SupplementBundleService materialBundles;
-    private static final Set<String> TYPES = Set.of("EXECUTION", "REVERSAL", "REFUND", "COURT_APPLY", "COURT_RECEIPT", "REMEDY_RESULT", "FACT_CORRECTION");
+    private final CaseFileRepository caseRepository;
+    private final ExecutionDeadlines executionDeadlines;
+    private static final Set<String> TYPES = Set.of("EXECUTION", "REVERSAL", "REFUND", "COURT_APPLY", "COURT_RECEIPT",
+            "REMEDY_RESULT", "REMEDY_VOID", "FACT_CORRECTION");
     private static final Set<String> FACT_FIELDS=Set.of("institutionCode","institutionOwnership","institutionGrade","institutionKind",
             "confirmedViolationStart","confirmedViolationEnd","confirmedViolationFacts","confirmedViolationAmount");
     private static final Set<String> KINDS = Set.of("FINE", "RECOUP", "CONFISCATE", "LATE_FEE");
@@ -57,11 +61,13 @@ public class CaseContinuationService {
         result.put("executions", jdbc.queryForList("select * from case_effective_executions(?) where case_id=? order by paid_at,source,id", cutoff, caseId));
         result.put("balances", balances(caseId, cutoff));
         result.put("courtRounds", courtRounds(caseId));
-        result.put("remedies", jdbc.queryForList("""
-                select m.*,case when exists(select 1 from case_continuation_request r where r.case_id=m.case_id
-                   and r.request_type='REMEDY_RESULT' and (r.payload->>'remedyId')::bigint=m.id and r.status='APPROVED')
-                   then 'COMPLETED' else 'OPEN' end as status from case_remedy m where m.case_id=? order by m.id desc
-                """, caseId));
+        result.put("remedies", jdbc.queryForList("select * from case_remedy_status where case_id=? order by id desc",caseId));
+        var current = executionDeadlines.summary(CaseGuards.get(caseRepository,caseId),today());
+        result.put("executionDeadline",current);
+        result.put("canRegisterExecutionBasis",reviewer(actor) && !pending && current.get("decisionVersionId") != null
+                && "PUNISH".equals(current.get("decisionType")) && current.get("deliveryId") != null
+                && (current.get("courtStatus") == null || "RETURNED".equals(current.get("courtStatus"))));
+        result.put("canRegisterVersionDefer",actor.roles().contains("LEADER"));
         result.put("requests", requests);
         return result;
     }
@@ -97,6 +103,52 @@ public class CaseContinuationService {
     }
 
     @Transactional
+    public long registerExecutionBasis(long caseId,Map<String,Object> body,String username) {
+        allowedKeys(body,Set.of("decisionVersionId","deliveryId","reliefDeadline","reliefPending","basis"),Set.of("deferUntil"));
+        long versionId = positiveId(body.get("decisionVersionId"));
+        long deliveryId = positiveId(body.get("deliveryId"));
+        LocalDate relief = deadlineDate(body.get("reliefDeadline"),"救济期限届满日");
+        LocalDate defer = body.get("deferUntil") == null ? null : deadlineDate(body.get("deferUntil"),"暂缓或分期届满日");
+        if (!(body.get("reliefPending") instanceof Boolean pending)) throw invalid("请选择救济是否尚未办结");
+        String basis = text(body.get("basis"),2000,"期限及批准材料依据");
+        CaseGuards.lock(jdbc,caseId);
+        var actor = access.lockActor(username,false);
+        requireReviewer(actor);
+        access.assertCaseScope(caseId,actor);
+        if (defer != null && !actor.roles().contains("LEADER")) throw forbidden("暂缓或分期期限须由负责人核定");
+        var c = CaseGuards.get(caseRepository,caseId);
+        LocalDate today = today();
+        var decision = executionDeadlines.effectiveDecision(caseId,today);
+        if (!"PUNISH".equals(decision.get("decision_type")) || !Objects.equals(versionId,ExecutionDeadlines.version(decision)))
+            throw invalid("请选择当前有效的处罚决定版本");
+        var delivery = executionDeadlines.effectiveDelivery(c,decision,today);
+        if (delivery == null || !Objects.equals(deliveryId,delivery.id()))
+            throw invalid("当前决定版本的有效送达记录已变化，请重新核实");
+        var rows = jdbc.queryForList("""
+                select id,delivery_id,relief_deadline,relief_pending,basis,defer_until,recorded_by
+                from case_version_execution_basis where decision_version_id=? order by id desc limit 1
+                """,versionId);
+        if (!rows.isEmpty()) {
+            var row = rows.getFirst();
+            if (defer == null) defer = date(row.get("defer_until"));
+            if (Objects.equals(deliveryId,number(row.get("delivery_id"))) && relief.equals(date(row.get("relief_deadline")))
+                    && pending.equals(row.get("relief_pending")) && basis.equals(row.get("basis"))
+                    && Objects.equals(defer,date(row.get("defer_until"))) && username.equals(row.get("recorded_by")))
+                return number(row.get("id"));
+        }
+        if (relief.isBefore(delivery.date()) || defer != null && defer.isBefore(delivery.date()))
+            throw invalid("期限届满日不得早于当前决定送达日");
+        noPending(caseId);
+        var round = executionDeadlines.currentCourtRound(c,decision,today);
+        if (round != null && !"RETURNED".equals(round.status()))
+            throw invalid("当前决定已登记法院申请，须有退回补正回执方可重新核定期限");
+        return jdbc.queryForObject("""
+                insert into case_version_execution_basis(case_id,decision_version_id,delivery_id,relief_deadline,
+                    relief_pending,basis,defer_until,recorded_by) values(?,?,?,?,?,?,?,?) returning id
+                """,Long.class,caseId,versionId,deliveryId,relief,pending,basis,defer,username);
+    }
+
+    @Transactional
     public long request(long caseId, Map<String,Object> body, String username) {
         allowedKeys(body,Set.of("type","requestKey","reason","sourceReference","payload"),Set.of("materialBundleId"));
         String type=choice(body.get("type"),TYPES,"续办类型");
@@ -127,7 +179,7 @@ public class CaseContinuationService {
                 insert into case_continuation_request(case_id,request_key,request_type,payload,source_snapshot,reason,
                    source_reference,requested_by,requested_username,requester_dept_id,requester_category)
                 values(?,?,?,?::jsonb,?::jsonb,?,?,?,?,?,?) returning id
-                """,Long.class,caseId,key,type,json(payload),snapshot(caseId),reason,evidence,actor.id(),username,actor.deptId(),actor.accountCategory());
+                """,Long.class,caseId,key,type,json(payload),snapshot(caseId,type,payload),reason,evidence,actor.id(),username,actor.deptId(),actor.accountCategory());
         materialBundles.attachToRequest(caseId,requestId,bundleId,username);
         return requestId;
     }
@@ -159,12 +211,12 @@ public class CaseContinuationService {
             var applicant=users.requireFiling(actors.get(request.get("requested_username")));
             requireWriter(applicant);
             access.assertCaseScope(caseId,applicant);
-            if (!Objects.equals(applicant.deptId(),number(request.get("requester_dept_id")))
-                    || !Objects.equals(applicant.accountCategory(),request.get("requester_category"))
-                    || !same(object(snapshot(caseId)),request.get("source_snapshot")))
-                throw invalid("来源资料或申请人归属已变化，请驳回后重新申请");
             var payload=object(request.get("payload"));
             String type=(String)request.get("request_type");
+            if (!Objects.equals(applicant.deptId(),number(request.get("requester_dept_id")))
+                    || !Objects.equals(applicant.accountCategory(),request.get("requester_category"))
+                    || !same(object(snapshot(caseId,type,payload)),request.get("source_snapshot")))
+                throw invalid("来源资料或申请人归属已变化，请驳回后重新申请");
             validate(caseId,type,payload);
             materialBundles.assertRequestMaterials(caseId,id);
             finish(id,"APPROVED",actor,opinion);
@@ -210,8 +262,9 @@ public class CaseContinuationService {
                 if ("LATE_FEE".equals(kind)) {
                     BigDecimal assessed=money(p.get("assessedLateFeeAmount"),true);
                     text(p.get("assessmentReference"),2000,"人工核定文号及按日核算依据");
-                    Date delivered=jdbc.queryForObject("select delivered_at from case_file where id=?",Date.class,caseId);
-                    if (delivered==null || !paid.isAfter(delivered.toLocalDate())) throw invalid("加处罚款续记须已有送达事实并核实实际缴款日期");
+                    var delivered = executionDeadlines.effectiveDelivery(CaseGuards.get(caseRepository,caseId),decision,paid);
+                    if (delivered == null || !paid.isAfter(delivered.date()))
+                        throw invalid("加处罚款续记须有到账当日有效决定的送达事实并核实实际缴款日期");
                     if (assessed.compareTo(cap)>0 || total(caseId,kind).add(amount).compareTo(assessed)>0)
                         throw invalid("加处罚款累计净额不得超过人工核定总额及当前有效罚款本金");
                 }
@@ -235,24 +288,23 @@ public class CaseContinuationService {
             }
             case "COURT_APPLY" -> {
                 keys(p,Set.of("appliedAt","applicationReference","eligibilityBasis"));
-                LocalDate applied=day(p.get("appliedAt"),"重新申请日期");
+                LocalDate applied=day(p.get("appliedAt"),"实际申请日期");
                 text(p.get("applicationReference"),128,"申请文号");
-                text(p.get("eligibilityBasis"),2000,"补正及再次申请依据");
-                var rounds=courtRounds(caseId);
-                if (rounds.isEmpty()) {
-                    if (!exists("select exists(select 1 from case_decision_version where case_id=? union all select 1 from case_execution_continuation where case_id=?)",caseId,caseId))
+                text(p.get("eligibilityBasis"),2000,"本轮申请材料依据");
+                LocalDate today = today();
+                var c = CaseGuards.get(caseRepository,caseId);
+                var decision = executionDeadlines.effectiveDecision(caseId,today);
+                var round = executionDeadlines.currentCourtRound(c,decision,today);
+                if (round == null) {
+                    if (ExecutionDeadlines.version(decision) == null
+                            && !exists("select exists(select 1 from case_execution_continuation where case_id=?)",caseId))
                         throw invalid("首次法院申请请使用原执行流程；有独立后续义务时可在此登记");
-                    var delivered=jdbc.queryForObject("select delivered_at from case_file where id=?",Date.class,caseId);
-                    if (delivered==null || applied.isBefore(delivered.toLocalDate())) throw invalid("申请日期不得早于原决定送达日期");
                 } else {
-                    if (!"RETURNED".equals(rounds.getFirst().get("status"))) throw invalid("仅法院退回补正后可以登记新申请轮次");
-                    LocalDate received=date(rounds.getFirst().get("received_at"));
-                    if (received==null || applied.isBefore(received)) throw invalid("再次申请日期不得早于退回回执");
+                    if (!"RETURNED".equals(round.status())) throw invalid("仅法院退回补正后可以登记当前决定的新轮次");
+                    if (round.receivedAt() == null || applied.isBefore(round.receivedAt()))
+                        throw invalid("再次申请日期不得早于退回回执");
                 }
-                if (openRemedy(caseId)) throw invalid("尚有未完成复核的救济事项，请先核实办理结果");
-                var d=effectiveDecision(caseId,applied);
-                if (!"PUNISH".equals(d.get("decision_type")) || KINDS.stream().filter(k->!"LATE_FEE".equals(k))
-                        .noneMatch(k->cap(d,k).compareTo(total(caseId,k))>0)) throw invalid("没有尚待执行的有效处罚款项");
+                executionDeadlines.requireCourtApplication(c,decision,applied,today,true);
             }
             case "COURT_RECEIPT" -> {
                 keys(p,Set.of("roundId","status","receivedAt","receiptNo"));
@@ -264,6 +316,10 @@ public class CaseContinuationService {
                 text(p.get("receiptNo"),128,"法院回执文号");
             }
             case "REMEDY_RESULT" -> validateRemedy(caseId,p);
+            case "REMEDY_VOID" -> {
+                keys(p,Set.of("remedyId"));
+                openRemedyRecord(caseId,positiveId(p.get("remedyId")));
+            }
             case "FACT_CORRECTION" -> {
                 allowedKeys(p,Set.of("effectiveAt"),FACT_FIELDS);
                 LocalDate effective=day(p.get("effectiveAt"),"事实更正生效日期");
@@ -284,11 +340,9 @@ public class CaseContinuationService {
         }
         allowedKeys(p,fields,optionalFields);
         long remedy=positiveId(p.get("remedyId"));
-        var rows=jdbc.queryForList("select * from case_remedy where id=? and case_id=?",remedy,caseId);
-        if (rows.isEmpty() || exists("select exists(select 1 from case_continuation_request where case_id="+caseId
-                +" and request_type='REMEDY_RESULT' and status='APPROVED' and (payload->>'remedyId')::bigint=?)",remedy)) throw invalid("受理记录不存在或已有批准结果");
+        var record = openRemedyRecord(caseId,remedy);
         LocalDate effective=day(p.get("effectiveAt"),"结果生效日期");
-        if (effective.isBefore(date(rows.getFirst().get("accepted_at")))) throw invalid("结果生效日期不得早于受理日期");
+        if (effective.isBefore(date(record.get("accepted_at")))) throw invalid("结果生效日期不得早于受理日期");
         text(p.get("resultReference"),128,"结果文号");
         text(p.get("resultContent"),12000,"结果材料及人工确认结论");
         if ("MAINTAIN".equals(outcome)) return;
@@ -307,6 +361,12 @@ public class CaseContinuationService {
         text(p.get("penaltyBasis"),4000,"决定依据");
         text(p.get("content"),16000,"有效决定正文");
         optional(p.get("otherMeasures"),512,"其他措施");
+    }
+
+    private Map<String,Object> openRemedyRecord(long caseId,long remedyId) {
+        var rows = jdbc.queryForList("select * from case_remedy_status where id=? and case_id=? and status='OPEN'",remedyId,caseId);
+        if (rows.isEmpty()) throw invalid("受理记录不存在、已作废或已有批准结果");
+        return rows.getFirst();
     }
 
     private void apply(long caseId,long requestId,String type,Map<String,Object> p,String reason,String reference,String username) {
@@ -332,10 +392,11 @@ public class CaseContinuationService {
                         "ORIGINAL".equals(p.get("source"))?positiveId(p.get("sourceId")):null,"CONTINUATION".equals(p.get("source"))?positiveId(p.get("sourceId")):null);
             }
             case "COURT_APPLY" -> jdbc.update("""
-                insert into case_court_round(case_id,request_id,round_no,applied_at,application_reference,eligibility_basis)
+                insert into case_court_round(case_id,request_id,round_no,applied_at,application_reference,eligibility_basis,decision_version_id)
                 values(?,?,coalesce((select max(round_no)+1 from case_court_round where case_id=?),
-                  case when (select court_enforce_applied from case_file where id=?) then 2 else 1 end),?,?,?)
-                """,caseId,requestId,caseId,caseId,day(p.get("appliedAt"),"重新申请日期"),p.get("applicationReference"),p.get("eligibilityBasis"));
+                  case when (select court_enforce_applied from case_file where id=?) then 2 else 1 end),?,?,?,?)
+                """,caseId,requestId,caseId,caseId,day(p.get("appliedAt"),"实际申请日期"),p.get("applicationReference"),
+                    p.get("eligibilityBasis"),ExecutionDeadlines.version(effectiveDecision(caseId,today())));
             case "COURT_RECEIPT" -> jdbc.update("""
                 insert into case_court_receipt(case_id,request_id,round_id,status,received_at,receipt_no) values(?,?,?,?,?,?)
                 """,caseId,requestId,positiveId(p.get("roundId")),p.get("status"),day(p.get("receivedAt"),"回执日期"),p.get("receiptNo"));
@@ -349,6 +410,7 @@ public class CaseContinuationService {
                 var facts=normalizedFacts(caseId,p);
                 if(!facts.isEmpty()) recordApprovedFacts(caseId,requestId,"APPROVED_RESULT",p,facts,reason,reference,username);
             }
+            case "REMEDY_VOID" -> { /* The approved request is the immutable void event. */ }
             case "FACT_CORRECTION" -> recordApprovedFacts(caseId,requestId,"APPROVED_FACT_CORRECTION",p,normalizedFacts(caseId,p),reason,reference,username);
             default -> throw invalid("不支持的续办类型");
         }
@@ -412,8 +474,7 @@ public class CaseContinuationService {
     }
     private boolean eligible(Map<String,Object> source) { return source.get("decided_at")!=null && Set.of("DECIDED","DELIVERED","CLOSED","TERMINATED").contains(source.get("status")); }
     private Map<String,Object> effectiveDecision(long caseId,LocalDate cutoff) {
-        var rows=jdbc.queryForList("select * from case_effective_decisions(?,clock_timestamp()) where case_id=?",cutoff,caseId);
-        return rows.isEmpty()?Map.of():rows.getFirst();
+        return executionDeadlines.effectiveDecision(caseId,cutoff);
     }
     private Map<String,Object> balances(long id,LocalDate cutoff) {
         var d=effectiveDecision(id,cutoff);
@@ -445,21 +506,36 @@ public class CaseContinuationService {
     private BigDecimal total(long id,String kind) { return jdbc.queryForObject("select coalesce(sum(amount),0) from case_effective_executions(?,clock_timestamp()) where case_id=? and kind=?",BigDecimal.class,today(),id,kind); }
     private List<Map<String,Object>> courtRounds(long id) {
         var rows=new ArrayList<>(jdbc.queryForList("""
-                select r.id,r.round_no,r.applied_at,r.application_reference,coalesce(p.status,'APPLIED') as status,p.received_at,p.receipt_no
+                select r.id,r.round_no,r.applied_at,r.application_reference,coalesce(p.status,'APPLIED') as status,p.received_at,p.receipt_no,
+                       r.decision_version_id
                 from case_court_round r left join case_court_receipt p on p.round_id=r.id where r.case_id=? order by r.round_no desc
                 """,id));
         rows.addAll(jdbc.queryForList("""
                 select null::bigint as id,1 as round_no,court_applied_at as applied_at,null::text as application_reference,
-                 court_enforce_status as status,court_received_at as received_at,court_receipt_no as receipt_no
+                 court_enforce_status as status,court_received_at as received_at,court_receipt_no as receipt_no,null::bigint as decision_version_id
                 from case_file where id=? and court_enforce_applied
                 """,id));
         return rows;
     }
-    private boolean openRemedy(long id) {
-        return exists("""
-                select exists(select 1 from case_remedy m where m.case_id=? and not exists(select 1 from case_continuation_request r
-                 where r.case_id=m.case_id and r.request_type='REMEDY_RESULT' and r.status='APPROVED' and (r.payload->>'remedyId')::bigint=m.id))
-                """,id);
+    private String snapshot(long caseId,String type,Map<String,Object> payload) {
+        String original = snapshot(caseId);
+        if (!"COURT_APPLY".equals(type)) return original;
+        var source = object(original);
+        var c = CaseGuards.get(caseRepository,caseId);
+        LocalDate today = today();
+        var decision = effectiveDecision(caseId,today);
+        var window = executionDeadlines.window(c,decision,today);
+        var proof = new LinkedHashMap<String,Object>();
+        var delivery = window.delivery();
+        proof.put("deliveryId",delivery == null ? null : delivery.id());
+        proof.put("deliveredAt",delivery == null ? null : delivery.date());
+        proof.put("basisId",window.basisId());
+        proof.put("start",window.start());
+        proof.put("end",window.end());
+        proof.put("urgedAt",delivery == null ? null : executionDeadlines.urgedAt(caseId,ExecutionDeadlines.version(decision),
+                delivery.date(),day(payload.get("appliedAt"),"实际申请日期")));
+        source.put("courtEligibility",proof);
+        return json(source);
     }
     private String snapshot(long id) {
         return jdbc.queryForObject("""
@@ -524,6 +600,16 @@ public class CaseContinuationService {
     private static long positiveId(Object value) { try { if (!(value instanceof Number n)) throw new IllegalArgumentException();return new BigDecimal(n.toString()).toBigIntegerExact().longValueExact()>0?new BigDecimal(n.toString()).longValueExact():failId(); } catch (ArithmeticException|IllegalArgumentException e) { throw invalid("编号须为正整数"); } }
     private static long failId() { throw invalid("编号须为正整数"); }
     private static LocalDate today() { return LocalDate.now(ZoneId.of("Asia/Shanghai")); }
+    private static LocalDate deadlineDate(Object value,String label) {
+        try {
+            String input = text(value,10,label);
+            if (input.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}")) {
+                LocalDate parsed = LocalDate.parse(input);
+                if (parsed.getYear() > 0) return parsed;
+            }
+        } catch (java.time.DateTimeException ignored) { }
+        throw invalid(label+"须为有效日期");
+    }
     private static LocalDate day(Object value,String label) { try { String s=text(value,10,label);if (!s.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}")) throw new IllegalArgumentException();LocalDate d=LocalDate.parse(s);if (d.getYear()<1 || d.isAfter(today())) throw new IllegalArgumentException();return d; } catch (java.time.DateTimeException|IllegalArgumentException e) { throw invalid(label+"须为不晚于今天的有效日期"); } }
     private static LocalDate date(Object value) { return value instanceof Date d?d.toLocalDate():value instanceof LocalDate d?d:null; }
     private static BigDecimal money(Object value,boolean positive) { if (!(value instanceof Number n)) throw invalid("金额须为精确数字");BigDecimal amount;try {amount=new BigDecimal(n.toString());}catch(NumberFormatException e){throw invalid("金额无效");}return positive?Money.positive(amount,"续办金额"):Money.nonNegative(amount,"决定金额"); }

@@ -156,8 +156,7 @@ public class CaseService {
         }
     }
 
-    @Transactional
-    public CaseFile create(CaseCreateReq req, String username) {
+    private CaseCause validateFilingBasics(CaseCreateReq req) {
         // 按执法证号去重计数：重复填同一人不算两人（第16条）
         if (req.officers() == null
                 || req.officers().stream().anyMatch(o -> o == null || o.name() == null || o.name().isBlank()
@@ -166,7 +165,23 @@ public class CaseService {
             throw new BizException(2002, "执法人员不得少于两人（第16条），且须为不同执法证号");
         if (req.procedureType() != null && !List.of("NORMAL", "SUMMARY").contains(req.procedureType()))
             throw new BizException(2026, "程序类型须为普通程序或简易程序");
-        CaseCause cause = requireCauseMatch(req.causeId(), req.partyType());
+        return requireCauseMatch(req.causeId(), req.partyType());
+    }
+
+    void preflightFilingApplication(CaseCreateReq req, WorkflowUserAccess.User applicant) {
+        if (req.partyName() == null || req.partyName().isBlank())
+            throw new BizException(2026, "请填写当事人");
+        validateFilingBasics(req);
+        requireInstitutionForFiling(req, applicant, normalizeInstitution(req.partyType(), req.institution()));
+        if (req.clueId() != null) requireFilingClueDepartment(req.clueId(), applicant);
+        validateFilingDate(req, LocalDate.now());
+        cn.ybcase.bureau.common.Money.nonNegative(req.amountInvolved(), "涉案金额");
+        procedureService.validateAndResolveEnforcers(req.officers());
+    }
+
+    @Transactional
+    public CaseFile create(CaseCreateReq req, String username) {
+        CaseCause cause = validateFilingBasics(req);
         JurisdictionReq jurisdiction = normalizeJurisdiction(req.jurisdiction());
         InstitutionReq institution = normalizeInstitution(req.partyType(), req.institution());
         // Source before actors: the same order is used by approval and existing case transfers.
@@ -187,23 +202,14 @@ public class CaseService {
         // Recheck scope after any actor-lock wait: previous roles must not grant current access.
         if (req.clueId() != null) {
             sourceAttachmentAccess.clueForFiling(req.clueId(), username, false);
-            var sourceDept = jdbc.queryForObject("select owner_dept_id from case_clue where id=?", Long.class, req.clueId());
-            if (sourceDept != null && owner.accountCategory() != null && !sourceDept.equals(owner.deptId()))
-                throw new BizException(2080, "跨机构线索请完成机构交接后再立案");
+            requireFilingClueDepartment(req.clueId(), owner);
         }
 
         CaseFile c = new CaseFile();
         applyJurisdiction(c, jurisdiction);
         LocalDate today = LocalDate.now();
-        // 第6条：追责时效——违法行为终了起2年（涉生命健康且有危害后果5年）未被发现不再处罚
-        // 不填终了日即完全绕过时效检查，故提供强制开关（默认开启，历史数据迁移期可关）
-        if (req.violationEndDate() == null && config.bool("violation_end_date_required", false))
-            throw new BizException(2051, "须填写违法行为终了日期，用于追责时效判定（第6条）；确无法确定的，请由管理员关闭该校验开关");
+        validateFilingDate(req, today);
         if (req.violationEndDate() != null) {
-            int years = Boolean.TRUE.equals(req.healthHarm())
-                    ? config.intVal("liability_years_health", 5) : config.intVal("liability_years", 2);
-            if (req.violationEndDate().plusYears(years).isBefore(today))
-                throw new BizException(2051, "违法行为终了已超过" + years + "年追责时效，不再给予行政处罚（第6条）；如有中断事由请核实终了日期");
             c.setViolationEndDate(req.violationEndDate());
             c.setHealthHarm(Boolean.TRUE.equals(req.healthHarm()));
         }
@@ -233,11 +239,7 @@ public class CaseService {
         c.setCreatedBy(username);
         c.setOwnerUser(username);  // 承办人=立案申请人（可移交）
         c.setOwnerDeptId(owner.deptId());
-        boolean reportingRequired = Boolean.TRUE.equals(req.reportingDetailsRequired())
-                || owner.accountCategory() != null;
-        if (reportingRequired && "PROVIDER".equals(c.getPartyType()) && institution == null)
-            throw new BizException(2026, "请填写机构编码、性质和等级");
-        c.setReportingDetailsRequired(reportingRequired);
+        c.setReportingDetailsRequired(requireInstitutionForFiling(req, owner, institution));
         var officerUsers = procedureService.validateAndResolveEnforcers(req.officers());
         caseRepository.save(c);
 
@@ -251,6 +253,31 @@ public class CaseService {
             sourceAttachmentAccess.adoptClue(req.clueId(), c.getId());
         }
         return c;
+    }
+
+    private void requireFilingClueDepartment(Long clueId, WorkflowUserAccess.User applicant) {
+        var department = jdbc.queryForObject("select owner_dept_id from case_clue where id=?", Long.class, clueId);
+        if (department != null && applicant.accountCategory() != null && !department.equals(applicant.deptId()))
+            throw new BizException(2080, "跨机构线索请完成机构交接后再立案");
+    }
+
+    private static boolean requireInstitutionForFiling(CaseCreateReq req, WorkflowUserAccess.User applicant,
+                                                       InstitutionReq institution) {
+        boolean required = Boolean.TRUE.equals(req.reportingDetailsRequired()) || applicant.accountCategory() != null;
+        if (required && "PROVIDER".equals(req.partyType()) && institution == null)
+            throw new BizException(2026, "请填写机构编码、性质和等级");
+        return required;
+    }
+
+    private void validateFilingDate(CaseCreateReq req, LocalDate today) {
+        if (req.violationEndDate() == null && config.bool("violation_end_date_required", false))
+            throw new BizException(2051, "须填写违法行为终了日期，用于追责时效判定（第6条）；确无法确定的，请由管理员关闭该校验开关");
+        if (req.violationEndDate() != null) {
+            int years = Boolean.TRUE.equals(req.healthHarm())
+                    ? config.intVal("liability_years_health", 5) : config.intVal("liability_years", 2);
+            if (req.violationEndDate().plusYears(years).isBefore(today))
+                throw new BizException(2051, "违法行为终了已超过" + years + "年追责时效，不再给予行政处罚（第6条）；如有中断事由请核实终了日期");
+        }
     }
 
     /** 案由主体与当事人类别一致性（2001）：立案与案由更正共用同一口径 */
@@ -855,7 +882,12 @@ public class CaseService {
     }
 
     public record NoticeReq(String content, BigDecimal proposedFine, BigDecimal proposedRecoup, BigDecimal proposedConfiscate,
-                            String changeReason) {}
+                            String changeReason, Boolean requireDelivery, Long previousNoticeId) {
+        public NoticeReq(String content, BigDecimal proposedFine, BigDecimal proposedRecoup, BigDecimal proposedConfiscate,
+                         String changeReason) {
+            this(content, proposedFine, proposedRecoup, proposedConfiscate, changeReason, null, null);
+        }
+    }
 
     @Transactional
     public CaseNotice notify(Long caseId, NoticeReq req) {
@@ -865,8 +897,14 @@ public class CaseService {
         // REPORTED 首次告知；NOTIFIED 允许再次告知（辽52条：改变原认定的事实/证据/依据须重新履行告知程序）
         if (!List.of("REPORTED", "NOTIFIED").contains(c.getStatus()))
             throw new BizException(2004, "调查终结后方可作出处罚告知（第36/41条）");
+        if (req == null || req.content() == null || req.content().isBlank())
+            throw new BizException(2006, "请填写处罚告知内容");
         // 再次告知且金额高于此前：须载明改变原认定事实/证据/依据的理由，避免借重新告知规避"不得因申辩加重"
         CaseNotice prev = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+        if ((Boolean.TRUE.equals(req.requireDelivery()) || req.previousNoticeId() != null
+                || prev != null && prev.isDeliveryRequired())
+                && !java.util.Objects.equals(req.previousNoticeId(), prev == null ? null : prev.getId()))
+            throw new BizException(2194, "告知版本已变化，请刷新后重新核对");
         if (prev != null
                 && (nz(req.proposedFine()).compareTo(nz(prev.getProposedFine())) > 0
                     || nz(req.proposedRecoup()).compareTo(nz(prev.getProposedRecoup())) > 0
@@ -875,21 +913,24 @@ public class CaseService {
             throw new BizException(2077, "再次告知的拟处罚金额高于前次，须载明改变原认定事实、证据或依据的理由（辽52条）；"
                     + "不得因当事人陈述申辩而加重处罚（第41条）");
         CaseNotice n = new CaseNotice();
-        // 听证申请随案而非随单：再次告知不得清空前次的听证申请，
-        // 否则当事人申请听证后只要以同额再告知一次，2075 守卫即失效
-        if (prev != null && Boolean.TRUE.equals(prev.getHearingRequested())) {
-            n.setHearingRequested(true);
-            n.setHearingHeldAt(procedureService.heldHearingDate(caseId));
-        }
+        // 再告知保留已提出的申请，听证笔录仍归属举行时的告知版本。
+        if (prev != null && Boolean.TRUE.equals(prev.getHearingRequested())) n.setHearingRequested(true);
         n.setChangeReason(req.changeReason());
         n.setCaseId(caseId);
         n.setNotifiedAt(LocalDate.now());
         n.setContent(req.content());
         n.setProposedFine(cn.ybcase.bureau.common.Money.nonNegative(req.proposedFine(), "拟罚款"));
         n.setProposedRecoup(cn.ybcase.bureau.common.Money.nonNegative(req.proposedRecoup(), "拟追回金额"));
-        // 陈述申辩期限（辽44条：告知须载明期限与逾期后果；0=不启用）
-        int stmtDays = config.intVal("statement_deadline_days", 3);
-        if (stmtDays > 0) n.setStatementDeadline(LocalDate.now().plusDays(stmtDays));
+        int stmtDays = Math.max(0, config.intVal("statement_deadline_days", 3));
+        boolean tracked = Boolean.TRUE.equals(req.requireDelivery()) || prev != null && prev.isDeliveryRequired()
+                || config.bool("notice_delivery_required", false);
+        n.setDeliveryRequired(tracked);
+        if (tracked) {
+            n.setStatementPeriodDays(stmtDays);
+            n.setHearingPeriodDays(Math.max(0, config.intVal("hearing_request_days", 3)));
+        } else if (stmtDays > 0) {
+            n.setStatementDeadline(n.getNotifiedAt().plusDays(stmtDays));
+        }
         // 拟罚款达到听证标准（按当事人类型分档，辽46条）：告知听证权利
         n.setProposedConfiscate(cn.ybcase.bureau.common.Money.nonNegative(req.proposedConfiscate(), "拟没收金额"));
         n.setHearingEntitled(punitiveAmount(nz(req.proposedFine()), nz(req.proposedConfiscate()))
@@ -902,39 +943,127 @@ public class CaseService {
     }
 
     public record StatementReq(String statement, String statementReview,
-                               Boolean hearingRequested, LocalDate hearingHeldAt,
-                               Boolean statementWaived) {}
+                               Boolean hearingRequested, LocalDate hearingHeldAt, Boolean statementWaived,
+                               Long noticeId, LocalDate statementReceivedAt, LocalDate hearingRequestedAt,
+                               String hearingWithdrawalReference, String statementWaiverReference) {
+        public StatementReq(String statement, String statementReview, Boolean hearingRequested,
+                            LocalDate hearingHeldAt, Boolean statementWaived) {
+            this(statement, statementReview, hearingRequested, hearingHeldAt, statementWaived, null, null, null, null, null);
+        }
+    }
+
+    @Transactional
+    public void recordNoticeDelivery(Long caseId, Long noticeId, String method, LocalDate deliveredAt, String receiver,
+                                     String receiptNo, LocalDate signedAt, String note) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        CaseNotice notice = currentNotice(caseId);
+        if (!notice.isDeliveryRequired() || !"NOTIFIED".equals(get(caseId).getStatus()))
+            throw new BizException(2041, "本案当前告知不支持登记版本送达");
+        ProcedureService.requireNoticeVersion(notice, noticeId);
+        if (receiptNo == null || receiptNo.isBlank() || receiver == null || receiver.isBlank())
+            throw new BizException(2041, "受送达人和实际回证编号必填");
+        if (deliveredAt == null || deliveredAt.isBefore(notice.getNotifiedAt()) || deliveredAt.isAfter(LocalDate.now())
+                || signedAt != null && (signedAt.isBefore(notice.getNotifiedAt()) || signedAt.isAfter(LocalDate.now())))
+            throw new BizException(2041, "实际送达日期及回证签收日期须在告知登记日至今天之间");
+        var existing = jdbc.queryForList("""
+                select method, delivered_at, receiver, receipt_no, receipt_signed_at, note
+                from case_delivery where notice_id=?""", noticeId);
+        if (!existing.isEmpty()) {
+            var receipt = existing.getFirst();
+            if (java.util.Objects.equals(method, receipt.get("method"))
+                    && java.util.Objects.equals(java.sql.Date.valueOf(deliveredAt), receipt.get("delivered_at"))
+                    && java.util.Objects.equals(receiver, receipt.get("receiver"))
+                    && java.util.Objects.equals(receiptNo, receipt.get("receipt_no"))
+                    && java.util.Objects.equals(signedAt == null ? null : java.sql.Date.valueOf(signedAt), receipt.get("receipt_signed_at"))
+                    && java.util.Objects.equals(note, receipt.get("note"))) return;
+            throw new BizException(2041, "本版本已有实际回证，请核对原记录");
+        }
+        jdbc.update("""
+                insert into case_delivery(case_id, method, delivered_at, receiver, note, receipt_no,
+                                          receipt_signed_at, doc_kind, notice_id)
+                values (?,?,?,?,?,?,?,'NOTICE',?)""", caseId, method, deliveredAt, receiver, note, receiptNo, signedAt, noticeId);
+        notice.setStatementDeadline(procedureDeadline(deliveredAt, notice.getStatementPeriodDays()));
+        notice.setHearingRequestDeadline(procedureDeadline(deliveredAt, notice.getHearingPeriodDays()));
+        noticeRepository.save(notice);
+    }
+
+    private LocalDate procedureDeadline(LocalDate effectiveDate, Integer periodDays) {
+        return periodDays == null || periodDays == 0 ? null : effectiveDate.plusDays(periodDays);
+    }
+
+    private CaseNotice currentNotice(Long caseId) {
+        return noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
+                .orElseThrow(() -> new BizException(2006, "尚未作出处罚告知"));
+    }
 
     @Transactional
     public CaseNotice recordStatement(Long caseId, StatementReq req) {
         CaseGuards.lockWritable(jdbc, caseId);
         materialAccess.requireCurrentCaseWriter(caseId);
-        CaseGuards.requireNotArchived(get(caseId));
-        CaseNotice n = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
-                .orElseThrow(() -> new BizException(2006, "尚未作出处罚告知"));
-        // 辽44条：期限内未行使陈述权、申辩权的，视为放弃
+        CaseFile c = get(caseId);
+        CaseGuards.requireNotArchived(c);
+        CaseNotice n = currentNotice(caseId);
+        ProcedureService.requireNoticeVersion(n, req.noticeId());
+        LocalDate deliveredAt = null;
+        if (n.isDeliveryRequired()) {
+            if (!"NOTIFIED".equals(c.getStatus())) throw new BizException(2194, "当前阶段不能更改告知程序记录");
+            deliveredAt = procedureService.requireNoticeDelivery(n);
+        }
+        if (req.statement() != null && req.statement().isBlank())
+            throw new BizException(2100, "陈述申辩内容不能为空白");
+        LocalDate statementDate = n.isDeliveryRequired() && req.statement() != null
+                ? actualResponseDate(req.statementReceivedAt(), deliveredAt, "陈述申辩收到日期") : LocalDate.now();
         if (req.statement() != null && n.getStatementDeadline() != null
-                && LocalDate.now().isAfter(n.getStatementDeadline()))
+                && statementDate.isAfter(n.getStatementDeadline()))
             throw new BizException(2046, "已超过陈述申辩期限（" + n.getStatementDeadline()
                     + "），依法视为放弃陈述申辩权（辽44条）；如需继续，请按放弃留痕处理");
-        if (req.statement() != null) n.setStatement(req.statement());
+        if (req.statement() != null) {
+            n.setStatement(req.statement());
+            if (n.isDeliveryRequired()) n.setStatementReceivedAt(statementDate);
+        }
         if (req.statementReview() != null) n.setStatementReview(req.statementReview());
         // 当事人明确放弃陈述申辩：留痕后方可在期限届满前决定（第41条）
-        if (Boolean.TRUE.equals(req.statementWaived())) n.setStatementWaived(true);
+        if (Boolean.TRUE.equals(req.statementWaived()) && !Boolean.TRUE.equals(n.getStatementWaived())) {
+            if (n.isDeliveryRequired()) recordNoticeEvent(n, "STATEMENT_WAIVER", req.statementWaiverReference(), "陈述申辩放弃凭据");
+            n.setStatementWaived(true);
+        }
         if (req.hearingRequested() != null) {
             if (Boolean.TRUE.equals(req.hearingRequested()) && !Boolean.TRUE.equals(n.getHearingEntitled()))
                 throw new BizException(2039, "该案未达听证标准，无听证权利告知记录");
-            // 辽46条：听证申请应当自告知之日起3日内提出（参数化）
-            int reqDays = config.intVal("hearing_request_days", 3);
-            if (Boolean.TRUE.equals(req.hearingRequested()) && reqDays > 0
-                    && LocalDate.now().isAfter(n.getNotifiedAt().plusDays(reqDays)))
-                throw new BizException(2046, "听证申请已超过期限（告知起" + reqDays + "日内）");
+            if (Boolean.TRUE.equals(req.hearingRequested()) && !Boolean.TRUE.equals(n.getHearingRequested())) {
+                LocalDate requestDate = n.isDeliveryRequired()
+                        ? actualResponseDate(req.hearingRequestedAt(), deliveredAt, "听证申请收到日期") : LocalDate.now();
+                LocalDate deadline = n.isDeliveryRequired() ? n.getHearingRequestDeadline()
+                        : procedureDeadline(n.getNotifiedAt(), Math.max(0, config.intVal("hearing_request_days", 3)));
+                if (deadline != null && requestDate.isAfter(deadline))
+                    throw new BizException(2046, "听证申请已超过期限（" + deadline + "）");
+                if (n.isDeliveryRequired()) n.setHearingRequestedAt(requestDate);
+            }
+            if (n.isDeliveryRequired() && !req.hearingRequested() && Boolean.TRUE.equals(n.getHearingRequested()))
+                recordNoticeEvent(n, "HEARING_WITHDRAWAL", req.hearingWithdrawalReference(), "听证申请撤回凭据");
             n.setHearingRequested(req.hearingRequested());
         }
         if (req.hearingHeldAt() != null) {
             throw new BizException(2141, "听证举行日期须通过听证流程登记，不能在陈述申辩中直接填写");
         }
         return noticeRepository.save(n);
+    }
+
+    private LocalDate actualResponseDate(LocalDate date, LocalDate deliveredAt, String label) {
+        if (date == null || date.isBefore(deliveredAt) || date.isAfter(LocalDate.now()))
+            throw new BizException(2046, label + "须在本次告知实际送达日至今天之间");
+        return date;
+    }
+
+    private void recordNoticeEvent(CaseNotice notice, String type, String reference, String label) {
+        if (reference == null || reference.isBlank() || reference.length() > 500 || reference.indexOf('\0') >= 0)
+            throw new BizException(2100, "请填写" + label + "，最多500字");
+        var auth = org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication();
+        jdbc.update("""
+                insert into case_notice_procedure_event(case_id,notice_id,event_type,reference,recorded_by)
+                values (?,?,?,?,?)""", notice.getCaseId(), notice.getId(), type, reference.trim(),
+                auth == null ? null : auth.getName());
     }
 
     // ---------- 集体讨论（第44条） ----------
@@ -1079,8 +1208,11 @@ public class CaseService {
                 out.check("reinvestigation_notice","补查后重新告知",notice!=null && (prior==null || notice.getId()>((Number)prior).longValue()),
                         2194,"补查后须重新履行告知程序，不能沿用补查前告知", "HANDLER");
             }
-            LocalDate heldHearing = procedureService.heldHearingDate(caseId);
+            LocalDate heldHearing = notice == null ? null : procedureService.heldHearingDate(notice);
             if (notice != null) {
+                out.check("notice_delivery", "本次处罚告知已实际送达",
+                        !notice.isDeliveryRequired() || procedureService.noticeDeliveredAt(notice) != null,
+                        2006, "请先登记当前告知版本的实际送达回证", "HANDLER");
                 List<CaseNotice> notices = noticeRepository.findByCaseIdOrderByIdDesc(caseId);
                 BigDecimal minFine = notices.stream().map(CaseNotice::getProposedFine).filter(java.util.Objects::nonNull)
                         .min(BigDecimal::compareTo).orElse(nz(notice.getProposedFine()));
@@ -1101,7 +1233,8 @@ public class CaseService {
             if (notice != null) {
                 boolean waiting = "PUNISH".equals(req.decisionType()) && config.bool("statement_wait_required", true)
                         && notice.getStatementDeadline() != null && !LocalDate.now().isAfter(notice.getStatementDeadline())
-                        && notice.getStatement() == null && !Boolean.TRUE.equals(notice.getStatementWaived()) && heldHearing == null;
+                        && (notice.getStatement() == null || notice.getStatement().isBlank())
+                        && !Boolean.TRUE.equals(notice.getStatementWaived()) && heldHearing == null;
                 out.check("statement_period", "陈述申辩期限或已行使/放弃权利", !waiting, 2076,
                         "陈述申辩期至 " + notice.getStatementDeadline()
                                 + " 届满前不得作出处罚决定（第41条）；当事人已陈述申辩或明确放弃的，请先录入陈述申辩记录", "HANDLER");
@@ -1138,36 +1271,22 @@ public class CaseService {
         return new DecisionChecks(out, fine, recoup, conf);
     }
 
-    private boolean courtAccepted(CaseFile c) {
-        var continuations = jdbc.queryForList("""
-                select p.status,p.received_at,p.receipt_no from case_court_round r
-                join case_continuation_request a on a.id=r.request_id and a.status='APPROVED'
-                left join case_court_receipt p on p.round_id=r.id
-                where r.case_id=? order by r.round_no desc limit 1
-                """,c.getId());
-        if (!continuations.isEmpty()) {
-            var receipt=continuations.getFirst();
-            return "ACCEPTED".equals(receipt.get("status")) && receipt.get("received_at")!=null
-                    && receipt.get("receipt_no") instanceof String number && !number.isBlank();
-        }
-        return "ACCEPTED".equals(c.getCourtEnforceStatus()) && c.getCourtReceivedAt() != null
-                && c.getCourtReceiptNo() != null && !c.getCourtReceiptNo().isBlank();
-    }
-
     private Checklist closeChecks(CaseFile c, CloseReq req) {
         Checklist out = new Checklist();
         boolean terminated = "TERMINATED".equals(c.getStatus());
         boolean report = req != null && req.closeReport() != null && !req.closeReport().isBlank();
+        LocalDate today = ExecutionDeadlines.today();
+        var effective = terminated ? Map.<String,Object>of() : executionDeadlines.effectiveDecision(c.getId(),today);
+        var executionWindow = executionDeadlines.window(c,effective,today);
+        var delivery = executionWindow.delivery();
         out.check("writable", "尚未立卷归档", c.getArchiveNo() == null && !"CLOSED".equals(c.getStatus()), 2011,
                 terminated ? "本案已立卷归档（案卷号 " + c.getArchiveNo() + "）" : "案件状态不满足结案条件", "LEADER");
         out.check("exclusions_closed", "期限扣除事由已登记结束日期", exclusionsClosed(c.getId()),
                 2032, "仍有未结束的期限扣除事由或专家评审，请先登记结束日期再归档", "HANDLER");
-        boolean outstandingContinuation=Boolean.TRUE.equals(jdbc.queryForObject("""
-                select exists(select 1 from case_continuation_request where case_id=? and status='PENDING'
-                  union all select 1 from case_remedy m where m.case_id=? and not exists(
-                    select 1 from case_continuation_request r where r.case_id=m.case_id
-                     and r.request_type='REMEDY_RESULT' and r.status='APPROVED' and (r.payload->>'remedyId')::bigint=m.id))
-                """,Boolean.class,c.getId(),c.getId()));
+        boolean outstandingContinuation = executionWindow.reliefPending()
+                || Boolean.TRUE.equals(jdbc.queryForObject(
+                        "select exists(select 1 from case_continuation_request where case_id=? and status='PENDING')",
+                        Boolean.class,c.getId()));
         out.check("continuation_review", "救济结果及后续申请已完成复核", !outstandingContinuation,2193,
                 "尚有待复核后续申请或未办结救济结果，请先办理后再确认结案", "LEGAL");
         if (!terminated) {
@@ -1175,12 +1294,13 @@ public class CaseService {
             out.check("decision", "已有处理决定", d != null, 2011, "无处理决定，不能结案", "LEADER");
             out.check("close_status", "已决定或已送达阶段", List.of("DECIDED", "DELIVERED").contains(c.getStatus()),
                     2011, "案件状态不满足结案条件", "HANDLER");
-            var effective=effectiveCloseDecision(c.getId());
             if (d != null && "PUNISH".equals(effective.get("decision_type"))) {
-                out.check("delivery", "处罚决定书已送达", "DELIVERED".equals(c.getStatus()),
-                        2011, "处罚决定书未送达，不能结案（第59条）", "HANDLER");
-                out.check("execution_or_court", "款项执行完毕或法院正式受理", courtAccepted(c) || fullyExecuted(c.getId(), d),
-                        2011, "罚没款项/退回基金未执行完毕，且未申请法院强制执行，不能结案（第56条）", "HANDLER");
+                out.check("delivery", "当前有效处罚决定已送达", delivery != null,
+                        2011, "当前有效处罚决定尚无生效送达记录，不能结案", "HANDLER");
+                out.check("execution_or_court", "款项执行完毕或法院正式受理",
+                        executionDeadlines.courtAccepted(c,effective,today)
+                                || executionDeadlines.fullyExecuted(c.getId(),effective,today),
+                        2011, "当前决定款项未执行完毕，且无对应法院正式受理回执，不能结案", "HANDLER");
             }
         }
         out.check("close_report", terminated ? "终止调查/移送归档报告" : "行政处罚结案报告", report, 2011,
@@ -1188,6 +1308,7 @@ public class CaseService {
                         : "须填写行政处罚结案报告并经负责人批准（第56条）", "LEADER");
         if (config.bool("archive_completeness_required", false)) {
             List<String> missing = documentService.missingRequiredDocs(c.getId()).stream()
+                    .filter(type -> !"DELIVERY_RECEIPT".equals(type) || delivery == null || delivery.id() == null)
                     .filter(type -> !report || !"CLOSE_REPORT".equals(type)).toList();
             String originalFailure = "案卷必备文书缺失：" + String.join("、", missing) + "（第57条文书齐全要求）";
             for (String type : missing) {
@@ -1381,9 +1502,10 @@ public class CaseService {
         Checklist checks = closeChecks(c, new CloseReq(closeReport));
         checks.requireReady();
         if ("TERMINATED".equals(c.getStatus())) return archiveTerminated(c, closeReport, maker);
-        CaseDecision d = decisionRepository.findByCaseId(caseId).orElseThrow();
-        String closeReason = !"PUNISH".equals(effectiveCloseDecision(caseId).get("decision_type")) ? "NO_NEED"
-                : courtAccepted(c) ? "COURT" : "EXECUTED";
+        LocalDate today = ExecutionDeadlines.today();
+        var effective = executionDeadlines.effectiveDecision(caseId,today);
+        String closeReason = !"PUNISH".equals(effective.get("decision_type")) ? "NO_NEED"
+                : executionDeadlines.courtAccepted(c,effective,today) ? "COURT" : "EXECUTED";
         addDocument(caseId, new DocumentReq("CLOSE_REPORT", c.getCaseNo() + " 结案报告",
                 closeReport, LocalDate.now(), maker, false, null, null));
 
@@ -1677,24 +1799,8 @@ public class CaseService {
                   and coalesce(btrim(conclusion), '') <> ''""", caseId).isEmpty();
     }
 
-    private boolean fullyExecuted(Long caseId, CaseDecision d) {
-        var effective=effectiveCloseDecision(caseId);
-        for (String kind:List.of("FINE","RECOUP","CONFISCATE")) {
-            String column=switch(kind){case "FINE"->"fine_amount";case "RECOUP"->"recoup_amount";default->"confiscate_amount";};
-            BigDecimal paid=jdbc.queryForObject("""
-                    select coalesce(sum(amount),0) from case_effective_executions(
-                      (current_timestamp at time zone 'Asia/Shanghai')::date,clock_timestamp()) where case_id=? and kind=?
-                    """,BigDecimal.class,caseId,kind);
-            if (effective.isEmpty() || paid.compareTo((BigDecimal)effective.get(column))<0) return false;
-        }
-        return true;
-    }
-
     private Map<String,Object> effectiveCloseDecision(Long caseId) {
-        var rows=jdbc.queryForList("""
-                select * from case_effective_decisions((current_timestamp at time zone 'Asia/Shanghai')::date,clock_timestamp()) where case_id=?
-                """,caseId);
-        return rows.isEmpty()?Map.of():rows.getFirst();
+        return executionDeadlines.effectiveDecision(caseId,ExecutionDeadlines.today());
     }
 
     private String cfg(String key, String def) {

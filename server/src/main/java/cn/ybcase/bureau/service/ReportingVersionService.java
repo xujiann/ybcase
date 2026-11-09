@@ -27,6 +27,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ReportingVersionService {
     private static final String RULE_VERSION = "V48_BUSINESS_DATE_APPROVED_KNOWN_AT";
+    private static final String PENALTY_RULE_VERSION = "PENALTIES_EFFECTIVE_DECISION_EXECUTION_V1";
     private static final String METADATA = """
             select b.id,b.report_type,b.status,b.period_start,b.period_end,b.business_cutoff,b.known_at,
                    b.criteria,b.template_version,b.template_sha256,b.rule_version,b.filename,b.file_sha256,
@@ -102,6 +103,7 @@ public class ReportingVersionService {
             throw new IllegalStateException("报表模板不可读", failure);
         }
         String filename = report.audit().start() + "至" + report.audit().end() + "-" + request.type().name() + ".xlsx";
+        String ruleVersion = request.type() == ReportExport.Kind.PENALTIES ? PENALTY_RULE_VERSION : RULE_VERSION;
         long id = jdbc.queryForObject("""
                 insert into report_frozen_batch(request_key,report_type,period_start,period_end,business_cutoff,
                     known_at,criteria,template_version,template_sha256,rule_version,filename,workbook,file_sha256,
@@ -109,7 +111,7 @@ public class ReportingVersionService {
                 values (?,?,?,?,?,?,?::jsonb,?,?,?,?,?,?,?,?,?,?,?) returning id
                 """, Long.class, request.requestKey(), request.type().name(), report.audit().start(), report.audit().end(),
                 report.audit().cutoff(), knownAt, json(criteria(request)), templateVersion(request.type()), templateHash,
-                RULE_VERSION, filename, report.workbook(), sha(report.workbook()), report.audit().rowCount(),
+                ruleVersion, filename, report.workbook(), sha(report.workbook()), report.audit().rowCount(),
                 request.parentBatchId(), actor.id(), actor.username(), actor.deptId());
         long textBytes = 0;
         for (var line : report.lines()) {

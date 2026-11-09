@@ -3,6 +3,7 @@ package cn.ybcase.bureau.service;
 import cn.ybcase.bureau.common.BizException;
 import cn.ybcase.bureau.entity.CaseClue;
 import cn.ybcase.bureau.entity.CaseFile;
+import cn.ybcase.bureau.entity.CaseNotice;
 import cn.ybcase.bureau.repository.CaseClueRepository;
 import cn.ybcase.bureau.repository.CaseFileRepository;
 import cn.ybcase.bureau.repository.CaseNoticeRepository;
@@ -122,16 +123,44 @@ public class ProcedureService {
 
     // ---------- 听证子流程（辽46-50条） ----------
 
-    public LocalDate heldHearingDate(Long caseId) {
+    public LocalDate heldHearingDate(CaseNotice notice) {
         var date = jdbc.queryForObject("""
                 select max(held_at) from case_hearing where case_id = ?
                 and status in ('HELD','OPINION_DONE') and held_at <= current_date
-                and coalesce(btrim(record),'') <> ''""", java.sql.Date.class, caseId);
+                and coalesce(btrim(record),'') <> ''
+                and (notice_id=? or (
+                    not ? and notice_id is null and held_at>=?
+                    and (select count(*) from case_notice where case_id=?)=1
+                ))""", java.sql.Date.class, notice.getCaseId(), notice.getId(),
+                notice.isDeliveryRequired(), notice.getNotifiedAt(), notice.getCaseId());
         return date == null ? null : date.toLocalDate();
     }
 
+    LocalDate noticeDeliveredAt(CaseNotice notice) {
+        var delivered = jdbc.queryForObject("""
+                select (select delivered_at from case_delivery where notice_id=? and delivered_at<=current_date)
+                """, java.sql.Date.class, notice.getId());
+        return delivered == null ? null : delivered.toLocalDate();
+    }
+
+    LocalDate requireNoticeDelivery(CaseNotice notice) {
+        LocalDate deliveredAt = noticeDeliveredAt(notice);
+        if (deliveredAt == null) throw new BizException(2006, "请先登记当前告知版本的实际送达回证");
+        return deliveredAt;
+    }
+
+    static void requireNoticeVersion(CaseNotice notice, Long noticeId) {
+        if ((notice.isDeliveryRequired() || noticeId != null) && !notice.getId().equals(noticeId))
+            throw new BizException(2194, "告知版本已变化，请刷新后重新核对");
+    }
+
     public record HearingScheduleReq(LocalDate announcedAt, LocalDate noticeSentAt, LocalDate scheduledAt,
-                                     String host, String hostDept, String recorder) {}
+                                     String host, String hostDept, String recorder, Long noticeId) {
+        public HearingScheduleReq(LocalDate announcedAt, LocalDate noticeSentAt, LocalDate scheduledAt,
+                                  String host, String hostDept, String recorder) {
+            this(announcedAt, noticeSentAt, scheduledAt, host, hostDept, recorder, null);
+        }
+    }
 
     @Transactional
     public void scheduleHearing(Long caseId, HearingScheduleReq req) {
@@ -142,6 +171,7 @@ public class ProcedureService {
         CaseFile c = caseFile(caseId);
         var notice = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
                 .orElseThrow(() -> new BizException(2039, "尚未作出处罚告知"));
+        requireNoticeVersion(notice, req.noticeId());
         if (!Boolean.TRUE.equals(notice.getHearingRequested()))
             throw new BizException(2039, "当事人未申请听证");
         // 辽48条：听证主持人与办案人员应属于不同部门（不得为本案办案人员）
@@ -159,13 +189,20 @@ public class ProcedureService {
         // 辽47条：举行听证7日前书面通知当事人（参数化）
         int ahead = config.intVal("hearing_notice_ahead_days", 7);
         LocalDate noticeSent = req.noticeSentAt() != null ? req.noticeSentAt() : LocalDate.now();
+        if (notice.isDeliveryRequired()) {
+            if (!"NOTIFIED".equals(c.getStatus())) throw new BizException(2057, "当前阶段不能安排听证");
+            LocalDate deliveredAt = requireNoticeDelivery(notice);
+            LocalDate earliest = notice.getHearingRequestedAt() == null ? deliveredAt : notice.getHearingRequestedAt();
+            if (req.noticeSentAt() == null || noticeSent.isBefore(earliest) || noticeSent.isAfter(LocalDate.now()))
+                throw new BizException(2057, "请填写当前告知版本听证申请后已实际送达通知的日期");
+        }
         if (ChronoUnit.DAYS.between(noticeSent, req.scheduledAt()) < ahead)
             throw new BizException(2057, "听证应在通知送达后至少 " + ahead + " 日举行（辽47条）");
         jdbc.update("""
-                insert into case_hearing (case_id, announced_at, notice_sent_at, scheduled_at, host, host_dept, recorder)
-                values (?,?,?,?,?,?,?)""",
+                insert into case_hearing (case_id, announced_at, notice_sent_at, scheduled_at, host, host_dept, recorder, notice_id)
+                values (?,?,?,?,?,?,?,?)""",
                 caseId, req.announcedAt(), noticeSent, req.scheduledAt(),
-                req.host(), req.hostDept(), req.recorder());
+                req.host(), req.hostDept(), req.recorder(), notice.getId());
     }
 
     /**
@@ -195,9 +232,19 @@ public class ProcedureService {
         if (record == null || record.isBlank()) throw new BizException(2057, "须制作听证笔录（辽50条）");
         // 实际举行日同样受"通知后满 N 日"约束：此前只校验计划日，当天举行也能通过
         var hr = jdbc.queryForList(
-                "select scheduled_at, notice_sent_at from case_hearing where id = ? and case_id = ?",
+                "select scheduled_at, notice_sent_at, notice_id from case_hearing where id = ? and case_id = ?",
                 hearingId, caseId);
         if (hr.isEmpty()) throw new BizException(2057, "听证不存在");
+        CaseNotice notice = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+        Object hearingNoticeId = hr.getFirst().get("notice_id");
+        if (notice != null && (hearingNoticeId == null
+                ? notice.isDeliveryRequired() || noticeRepository.findByCaseIdOrderByIdDesc(caseId).size() != 1
+                : !notice.getId().equals(((Number) hearingNoticeId).longValue())))
+            throw new BizException(2057, "该排期不属于当前告知版本，请核查后撤销旧排期并重新安排");
+        if (notice != null && notice.isDeliveryRequired()) {
+            if (!"NOTIFIED".equals(caseFile(caseId).getStatus())) throw new BizException(2057, "当前阶段不能登记听证举行");
+            requireNoticeDelivery(notice);
+        }
         LocalDate today = LocalDate.now();
         Object schedRaw = hr.get(0).get("scheduled_at");
         if (schedRaw != null && today.isBefore(((java.sql.Date) schedRaw).toLocalDate()))
@@ -212,10 +259,10 @@ public class ProcedureService {
                 LocalDate.now(), record, hearingId, caseId);
         if (n == 0) throw new BizException(2057, "听证不存在或状态不允许");
         // 同步告知记录（听证已举行→决定前审查材料含听证报告）
-        noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).ifPresent(no -> {
-            no.setHearingHeldAt(LocalDate.now());
-            noticeRepository.save(no);
-        });
+        if (notice != null) {
+            notice.setHearingHeldAt(today);
+            noticeRepository.save(notice);
+        }
     }
 
     @Transactional

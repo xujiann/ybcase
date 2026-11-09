@@ -93,13 +93,44 @@ public class SourceAttachmentAccess {
         var department = materials.departmentScope(username);
         if (privileged && !department.district()) return new ReadPredicate("true", List.of());
         ReadPredicate clue = clueReadPredicate(inspectionAlias + ".clue_id", username);
-        var source = sourceDepartmentPredicate(inspectionAlias + ".owner_dept_id", department);
+        var source = inspectionOwnerPredicate(inspectionAlias, username, privileged, department);
         var args = new java.util.ArrayList<Object>(source.args());
-        if (!privileged) args.add(username);
         args.addAll(clue.args());
         return new ReadPredicate("((" + inspectionAlias + ".clue_id is null and " + inspectionAlias
-                + ".id is not null and " + source.sql() + (privileged ? "" : " and " + inspectionAlias + ".created_by=?")
+                + ".id is not null and " + source.sql()
                 + ") or (" + inspectionAlias + ".clue_id is not null and " + clue.sql() + "))", List.copyOf(args));
+    }
+
+    private ReadPredicate inspectionOwnerPredicate(String alias, String username, boolean privileged,
+                                                   MaterialAccess.DepartmentScope department) {
+        var organization = sourceDepartmentPredicate(alias + ".owner_dept_id", department);
+        if (privileged) return organization;
+        var args = new java.util.ArrayList<Object>(organization.args());
+        args.add(username);
+        args.add(username);
+        String ownership = """
+                %1$s and ((%2$s.assigned_user_id is null and %2$s.created_by=?
+                    and not exists (select 1 from department_handoff h
+                                    where h.inspection_id=%2$s.id and h.status='ACCEPTED'))
+                    or exists (select 1 from sys_user u join sys_dept d on d.id=u.dept_id
+                               join sys_user_role ur on ur.user_id=u.id join sys_role r on r.id=ur.role_id
+                               where u.id=%2$s.assigned_user_id and u.username=? and u.enabled and d.enabled
+                                 and d.id=%2$s.owner_dept_id and d.org_kind=u.account_category
+                                 and r.code='HANDLER'))
+                """.formatted(organization.sql(), alias);
+        return new ReadPredicate(ownership, List.copyOf(args));
+    }
+
+    private void assertInspectionOwner(Long id, String username, boolean allowLegal) {
+        boolean privileged = allowLegal ? hasRole(username, "LEADER", "ADMIN", "LEGAL") : hasRole(username, "LEADER", "ADMIN");
+        var scope = inspectionOwnerPredicate("i", username, privileged, materials.departmentScope(username));
+        var args = new java.util.ArrayList<Object>();
+        args.add(id);
+        args.addAll(scope.args());
+        if (!Boolean.TRUE.equals(jdbc.queryForObject(
+                "select exists (select 1 from inspection i where i.id=? and " + scope.sql() + ")",
+                Boolean.class, args.toArray())))
+            throw new BizException(2080, "该检查材料不在您的办理范围内");
     }
 
     private ReadPredicate sourceDepartmentPredicate(String ownerDeptExpression, MaterialAccess.DepartmentScope department) {
@@ -140,6 +171,7 @@ public class SourceAttachmentAccess {
         }
         Long caseId = "CLUE".equals(source) ? caseForClue(id) : null;
         if (caseId != null) assertCaseScope(caseId, username);
+        else if ("INSPECTION".equals(source)) assertInspectionOwner(id, username, true);
         else assertOwn(r, username, true);
     }
 
@@ -150,18 +182,21 @@ public class SourceAttachmentAccess {
     }
 
     private void assertWritable(String source, Long id, Map<String, Object> r, String username) {
-        assertOwn(r, username, false);
         if ("CLUE".equals(source)) {
+            assertOwn(r, username, false);
             if (!"PENDING".equals(r.get("status")) || caseForClue(id) != null)
                 throw new BizException(2146, "线索已办结或已立案，请在对应案件办理附件");
-        } else if (r.get("clue_id") != null)
-            throw new BizException(2146, "检查已转线索，请在对应线索或案件办理附件");
+        } else {
+            assertInspectionOwner(id, username, false);
+            if (r.get("clue_id") != null)
+                throw new BizException(2146, "检查已转线索，请在对应线索或案件办理附件");
+        }
     }
 
     public void lockInspectionForTransition(Long id, String username) {
         Map<String, Object> inspection = row("INSPECTION", id, true);
         materials.lockActor(username, true);
-        assertOwn(inspection, username, false);
+        assertInspectionOwner(id, username, false);
         if (inspection.get("clue_id") != null) throw new BizException(2063, "该检查已转线索");
     }
 

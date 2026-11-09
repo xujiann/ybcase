@@ -17,19 +17,36 @@ function fixture() {
     get:url=>new Promise((resolve,reject)=>reads.push({url,resolve:data=>resolve({data:{data}}),reject})),
     post:(url,body)=>new Promise((resolve,reject)=>writes.push({url,body,resolve,reject})),
   }
-  const auth=Vue.reactive({user:{roles:['ADMIN']}})
+  const auth=Vue.reactive({user:{roles:['ADMIN']}}),route=Vue.reactive({query:{}})
   const context={...Vue,client,resourceState,createResourceLoader,useAuthStore:()=>auth,
+    useRoute:()=>route,useRouter:()=>({push(){}}),caseOperationAccess:()=>true,
     onMounted(){},onUnmounted:fn=>unmount.push(fn),
     ElMessage:{success:msg=>successes.push(msg)},
     ElMessageBox:{prompt:()=>new Promise((resolve,reject)=>prompts.push({resolve,reject}))}}
   const script=source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const output=vm.runInNewContext(stripTypeScriptTypes(script.replace(/^import .+\r?\n/gm,''))+
     '\n;({load,rows,loading,approvalState,deciding,onDecide,parsePayload,pl,officerNames})',context)
-  return {...output,auth,reads,writes,prompts,successes,unmount:()=>unmount.forEach(fn=>fn())}
+  return {...output,auth,route,reads,writes,prompts,successes,unmount:()=>unmount.forEach(fn=>fn())}
 }
 async function seed(f,rows=[{id:1,kind:'EXTEND',payload:'{"days":3}'}]) {
   const pending=f.load();f.reads.at(-1).resolve(rows);await pending
 }
+test('personal application history loads its own endpoint and offers no decision action',async()=>{
+  const f=fixture()
+  f.route.query.mine='1'
+  await seed(f,[{id:1,kind:'EXTEND',status:'REJECTED',opinion:'补材料',payload:'{}'}])
+  assert.equal(f.reads[0].url,'/bureau/approvals/mine')
+  await f.onDecide(f.rows.value[0],true)
+  assert.equal(f.prompts.length,0)
+  assert.equal(f.writes.length,0)
+})
+test('a rejected filing with usable historical JSON can be corrected even if personnel are missing',()=>{
+  const f=fixture()
+  const historical=f.parsePayload('{"partyName":"原当事人"}','FILE_CASE')
+  assert.equal(historical.__invalid,true)
+  assert.equal(historical.__resumable,true)
+  assert.equal(f.parsePayload('[]','FILE_CASE').__resumable,undefined)
+})
 test('approval refresh ignores older responses and does not restore decided rows',async()=>{
   const f=fixture(),first=f.load(),second=f.load()
   f.reads[1].resolve([]);await second;f.reads[0].resolve([{id:1}]);await first

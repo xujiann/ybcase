@@ -19,6 +19,7 @@
         <el-button v-if="canOperate" type="primary" @click="createVisible = true">登记线索</el-button>
       </div>
     </div>
+    <WorkdayCoverageNotice />
     <TaskFocusBanner :loading="loading" :failed="failed" :count="records.length" label="线索" @change="setTaskFocus" />
     <el-alert v-if="failed" type="error" :closable="false" title="线索列表加载失败，请重新搜索或筛选重试。" />
     <el-table :data="records" v-loading="loading" border stripe :empty-text="failed ? '加载失败' : '暂无数据'">
@@ -106,6 +107,7 @@ import { useAuthStore } from '../../stores/auth'
 import { caseOperationAccess } from '../../api/caseWriteAccess'
 import PrecaseAttachments from '../../components/PrecaseAttachments.vue'
 import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
+import WorkdayCoverageNotice from '../../components/WorkdayCoverageNotice.vue'
 import { canWritePrecase, type PrecaseSource } from '../../api/precaseAttachments'
 import { CLUE_STATUS, PARTY_TYPE, SOURCE } from './labels'
 

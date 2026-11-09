@@ -90,12 +90,18 @@ class ExecutionContinuationCompatibilityIntegrationTest {
     }
 
     @Test void approvedIndependentCourtApplicationStopsOriginalApplicationRemindersWithoutChangingLegacyFlag()throws Exception{
-        var owner=actor("HANDLER");var reviewer=actor("LEGAL");long id=caseFile(owner,"DELIVERED");String original=source(id);
+        var owner=actor("HANDLER");var reviewer=actor("LEGAL");long id=caseFile(owner,"DELIVERED");
+        jdbc.update("update case_file set relief_deadline=current_date-14,relief_basis='原决定救济期限核定材料' where id=?",id);
+        long urge=jdbc.queryForObject("insert into case_document(case_id,doc_type,title,content,made_at,maker) values(?,'URGE_LETTER','催告书','催告正文',current_date-12,?) returning id",Long.class,id,owner.name());
+        jdbc.update("insert into case_delivery(case_id,method,delivered_at,doc_kind,document_id) values(?,'DIRECT',current_date-12,'URGE_LETTER',?)",id,urge);
+        String original=source(id);
         assertNotNull(alert(id));
         approve(owner,reviewer,id,"EXECUTION",Map.of("kind","FINE","amount",10,"paidAt",LocalDate.now().toString(),"method","BANK","receiptNo","exc-partial-"+UUID.randomUUID()));
         assertNotNull(alert(id));
         approve(owner,reviewer,id,"COURT_APPLY",Map.of("appliedAt",LocalDate.now().toString(),"applicationReference","后续法院申请001","eligibilityBasis","人工核实当前材料及申请期限依据"));
         assertNull(alert(id));
+        post(reviewer,"/bureau/cases/"+id+"/relief-deadline",Map.of(
+                "deadline",LocalDate.now().toString(),"pending",false,"basis","不得覆盖已用的期限依据"),2142);
         assertEquals(false,jdbc.queryForObject("select court_enforce_applied from case_file where id=?",Boolean.class,id));
         assertEquals(1,jdbc.queryForObject("select count(*) from case_court_round where case_id=?",Integer.class,id));
         assertEquals(original,source(id));

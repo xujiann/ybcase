@@ -147,6 +147,61 @@ class ReportingVersionsIntegrationTest {
         assertTrue(workbook.contains("本表三类款项正向收缴合计"));
     }
 
+    @Test void penaltyEnforcementColumnsFollowTheEffectiveDecisionVersionAndPreserveFrozenBytes() throws Exception {
+        var handler = actor("DISTRICT", "HANDLER");
+        var bureau = actor("BUREAU", "LEADER");
+        var reviewer = actor("BUREAU", "LEGAL");
+        LocalDate originalDate = LocalDate.of(2015, 6, 15);
+        long caseId = caseFile(handler, originalDate);
+        long unrelatedCase = caseFile(handler, originalDate.minusYears(1));
+        LocalDate oldApplicationDate = originalDate.plusDays(2);
+        long originalDocument = jdbc.queryForObject("""
+                insert into case_document(case_id,doc_type,title,content,made_at,maker)
+                values(?,'URGE_LETTER','原卷催告','原卷催告全文',?,?) returning id
+                """, Long.class, caseId, originalDate, handler.name());
+        jdbc.update("""
+                insert into case_delivery(case_id,document_id,doc_kind,method,delivered_at,receiver,receipt_no)
+                values(?,?,'URGE_LETTER','DIRECT',?,'当事人','原卷催告送达回证')
+                """, caseId, originalDocument, originalDate.plusDays(1));
+        jdbc.update("update case_file set court_enforce_applied=true,court_applied_at=? where id=?", oldApplicationDate, caseId);
+        courtRound(caseId, null, handler, reviewer, 1, oldApplicationDate, "APPROVED", false);
+
+        long original = penaltyBatch(bureau, originalDate, originalDate.plusDays(4));
+        assertEnforcement(bureau, original, caseId, 100, "是", "是");
+        byte[] frozen = download(bureau, original);
+
+        LocalDate firstEffective = originalDate.plusDays(5);
+        LocalDate nextEffective = originalDate.plusDays(10);
+        long firstVersion = decisionVersion(caseId, handler, reviewer, firstEffective, 200);
+        long nextVersion = decisionVersion(caseId, handler, reviewer, nextEffective, 300);
+        supplementUrge(caseId, caseId, firstVersion, handler, "APPROVED", false, firstEffective, firstEffective.plusDays(2));
+        courtRound(caseId, firstVersion, handler, reviewer, 2, firstEffective.plusDays(3), "APPROVED", false);
+
+        // Even on the same business date the wrong case, unreviewed bundle and future review cannot count.
+        supplementUrge(caseId, unrelatedCase, nextVersion, handler, "APPROVED", false, nextEffective, nextEffective);
+        supplementUrge(unrelatedCase, caseId, nextVersion, handler, "APPROVED", false, nextEffective, nextEffective);
+        supplementUrge(caseId, caseId, nextVersion, handler, "PENDING", false, nextEffective, nextEffective);
+        supplementUrge(caseId, caseId, nextVersion, handler, "APPROVED", true, nextEffective, nextEffective);
+        supplementUrge(caseId, caseId, nextVersion, handler, "APPROVED", false, nextEffective, null);
+        supplementUrge(caseId, caseId, nextVersion, handler, "APPROVED", false, nextEffective.minusDays(1), nextEffective.minusDays(1));
+        courtRound(caseId, nextVersion, handler, reviewer, 3, nextEffective, "PENDING", false);
+        courtRound(caseId, nextVersion, handler, reviewer, 4, nextEffective, "APPROVED", true);
+        courtRound(caseId, nextVersion, handler, reviewer, 5, nextEffective.minusDays(1), "APPROVED", false);
+        LocalDate currentDelivery = nextEffective.plusDays(3);
+        LocalDate currentApplication = nextEffective.plusDays(4);
+        supplementUrge(caseId, caseId, nextVersion, handler, "APPROVED", false, nextEffective, currentDelivery);
+        courtRound(caseId, nextVersion, handler, reviewer, 6, currentApplication, "APPROVED", false);
+
+        assertEnforcement(bureau, penaltyBatch(bureau, originalDate, oldApplicationDate), caseId, 100, "是", "是");
+        assertEnforcement(bureau, penaltyBatch(bureau, originalDate, firstEffective), caseId, 200, "否", "否");
+        assertEnforcement(bureau, penaltyBatch(bureau, originalDate, firstEffective.plusDays(3)), caseId, 200, "是", "是");
+        assertEnforcement(bureau, penaltyBatch(bureau, originalDate, nextEffective), caseId, 300, "否", "否");
+        assertEnforcement(bureau, penaltyBatch(bureau, originalDate, currentDelivery), caseId, 300, "是", "否");
+        assertEnforcement(bureau, penaltyBatch(bureau, originalDate, currentApplication), caseId, 300, "是", "是");
+        assertEnforcement(bureau, original, caseId, 100, "是", "是");
+        assertArrayEquals(frozen, download(bureau, original));
+    }
+
     @Test void allThreeVersionsExposeBoundedSourceLinkedPreviewsAndRealExcelFiles() throws Exception {
         var handler = actor("DISTRICT", "HANDLER");
         var bureau = actor("BUREAU", "LEGAL");
@@ -164,6 +219,8 @@ class ReportingVersionsIntegrationTest {
         for (String type : new String[]{"PENALTIES", "ENFORCEMENT_WORK", "INTERVIEWS"}) {
             long id = api(bureau, post("/report-versions/batches"), criteria(type, date), 0).path("id").asLong();
             String route = "/report-versions/batches/" + id;
+            assertEquals("PENALTIES".equals(type) ? "PENALTIES_EFFECTIVE_DECISION_EXECUTION_V1" : "V48_BUSINESS_DATE_APPROVED_KNOWN_AT",
+                    api(bureau, get(route), null, 0).path("rule_version").asText());
             var preview = api(bureau, get(route + "/rows?page=1&size=1"), null, 0);
             assertEquals(1, preview.path("rows").size());
             assertTrue(preview.path("rows").get(0).path("link").asText().startsWith("/case/"));
@@ -226,10 +283,65 @@ class ReportingVersionsIntegrationTest {
                 amount < 0 ? "REVERSAL" : "EXECUTION", reversed, null);
     }
 
-    private long moneyEntry(long caseId, Actor owner, Actor reviewer, int amount, LocalDate paidAt,
-                       String status, boolean futureApproval, String type, Long reversed, Long refundEntry) {
-        String key = UUID.randomUUID().toString();
-        long request = jdbc.queryForObject("""
+    private long penaltyBatch(Actor bureau, LocalDate start, LocalDate cutoff) throws Exception {
+        var request = criteria("PENALTIES", cutoff);
+        request.put("start", start.toString());
+        return api(bureau, post("/report-versions/batches"), request, 0).path("id").asLong();
+    }
+
+    private void assertEnforcement(Actor bureau, long batch, long caseId, int fine, String urged, String enforced) throws Exception {
+        var line = find(api(bureau, get("/report-versions/batches/" + batch + "/rows"), null, 0).path("rows"),
+                "row_key", "CASE:" + caseId).path("cells");
+        assertEquals(fine, line.get(11).asInt(), "The expected decision version must be effective");
+        assertEquals(urged, line.get(17).asText(), "催告送达");
+        assertEquals(enforced, line.get(18).asText(), "申请法院强制执行");
+    }
+
+    private long decisionVersion(long caseId, Actor owner, Actor reviewer, LocalDate effective, int fine) {
+        long remedy = jdbc.queryForObject("""
+                insert into case_remedy(case_id,request_key,remedy_type,accepted_at,reference,reason,source_reference,
+                                       registered_by,registered_username)
+                values(?,?,'CORRECTION',?,'测试受理号','复核原卷','测试受理件',?,?) returning id
+                """, Long.class, caseId, UUID.randomUUID().toString(), effective.minusDays(1), owner.id(), owner.name());
+        long request = continuation(caseId, owner, reviewer, "REMEDY_RESULT", "APPROVED", false);
+        return jdbc.queryForObject("""
+                insert into case_decision_version(case_id,request_id,remedy_id,outcome,effective_at,decision_type,
+                  decision_no,fine_amount,recoup_amount,confiscate_amount,penalty_basis,content)
+                values(?,?,?,'CHANGE',?,'PUNISH',?,?,0,0,'本版处罚依据','本版处罚决定') returning id
+                """, Long.class, caseId, request, remedy, effective, "VERSION-" + UUID.randomUUID(), fine);
+    }
+
+    private void courtRound(long caseId, Long version, Actor owner, Actor reviewer, int round, LocalDate applied,
+                            String status, boolean futureApproval) {
+        long request = continuation(caseId, owner, reviewer, "COURT_APPLY", status, futureApproval);
+        jdbc.update("""
+                insert into case_court_round(case_id,request_id,decision_version_id,round_no,applied_at,application_reference,eligibility_basis)
+                values(?,?,?,?,?,'合成法院申请文号','已核对合成申请条件')
+                """, caseId, request, version, round, applied);
+    }
+
+    private void supplementUrge(long documentCase, long bundleCase, long version, Actor owner, String status,
+                                boolean futureApproval, LocalDate madeAt, LocalDate deliveredAt) {
+        long bundle = jdbc.queryForObject("""
+                insert into case_supplement_bundle(case_id,request_key,title,source_reference,status,created_by,
+                    applicant_id,source_snapshot,reviewed_at)
+                values(?,?,'催告材料','测试原件',?,?,?,'{}'::jsonb,
+                    case when ?='APPROVED' then current_timestamp + (? * interval '1 day') end) returning id
+                """, Long.class, bundleCase, UUID.randomUUID().toString(), status, owner.name(), owner.id(), status,
+                futureApproval ? 1 : 0);
+        long document = jdbc.queryForObject("""
+                insert into case_supplement_document(case_id,bundle_id,decision_version_id,request_key,doc_type,
+                    title,content,content_sha256,made_at,created_by)
+                values(?,?,?,?,'URGE_LETTER','独立版本催告','催告全文',?,?,?) returning id
+                """, Long.class, documentCase, bundle, version, UUID.randomUUID().toString(), "0".repeat(64), madeAt, owner.name());
+        if (deliveredAt != null) jdbc.update("""
+                insert into case_supplement_delivery(document_id,method,delivered_at,receiver,receipt_no,source_reference,recorded_by)
+                values(?,'DIRECT',?,'当事人',?,'测试回证原件',?)
+                """, document, deliveredAt, "URGE-" + UUID.randomUUID(), owner.name());
+    }
+
+    private long continuation(long caseId, Actor owner, Actor reviewer, String type, String status, boolean futureApproval) {
+        return jdbc.queryForObject("""
                 insert into case_continuation_request(case_id,request_key,request_type,payload,source_snapshot,
                   reason,source_reference,requested_by,requested_username,requester_dept_id,requester_category,
                   status,reviewed_by,reviewed_username,reviewed_at,opinion)
@@ -237,8 +349,14 @@ class ReportingVersionsIntegrationTest {
                   case when ?='APPROVED' then ?::bigint end,case when ?='APPROVED' then ? end,
                   case when ?='APPROVED' then current_timestamp + (? * interval '1 day') end,
                   case when ?='APPROVED' then '复核' end) returning id
-                """, Long.class, caseId, key, type, owner.id(), owner.name(),
+                """, Long.class, caseId, UUID.randomUUID().toString(), type, owner.id(), owner.name(),
                 owner.department(), status, status, reviewer.id(), status, reviewer.name(), status, futureApproval ? 1 : 0, status);
+    }
+
+    private long moneyEntry(long caseId, Actor owner, Actor reviewer, int amount, LocalDate paidAt,
+                       String status, boolean futureApproval, String type, Long reversed, Long refundEntry) {
+        String key = UUID.randomUUID().toString();
+        long request = continuation(caseId, owner, reviewer, type, status, futureApproval);
         return jdbc.queryForObject("""
                 insert into case_execution_continuation(case_id,request_id,kind,amount,paid_at,receipt_no,method,note,
                   reverses_execution_id,refunds_entry_id)

@@ -42,4 +42,16 @@ public class DepartmentHandoffController {
         handoffs.cancel(id, cancellation, auth.getName());
         return R.ok();
     }
+
+    @GetMapping("/{id}/inspection-assignees")
+    public R<Map<String, Object>> inspectionAssignees(@PathVariable long id, Authentication auth) {
+        return R.ok(handoffs.inspectionAssignees(id, auth.getName()));
+    }
+
+    @PostMapping("/{id}/inspection-assignment")
+    public R<Void> assignInspection(@PathVariable long id, @RequestBody DepartmentHandoffService.InspectionAssignment assignment,
+                                    Authentication auth) {
+        handoffs.assignInspection(id, assignment, auth.getName());
+        return R.ok();
+    }
 }

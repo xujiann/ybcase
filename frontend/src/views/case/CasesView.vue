@@ -44,7 +44,9 @@
                    layout="total, prev, pager, next" :total="total" :page-size="pageSize"
                    :current-page="page" @current-change="changePage" />
 
-    <el-dialog v-model="createVisible" @closed="form.institution = { code: '', ownership: '', grade: '', kind: null }" :title="isLeader ? '立案（执法人员不得少于两人）' : '立案申请（提交负责人批准后建案，第17条）'" width="760px" style="max-width: 95vw">
+    <el-dialog v-model="createVisible" :title="previousApproval ? '续填立案申请' : isLeader ? '立案（执法人员不得少于两人）' : '立案申请（提交负责人批准后建案，第17条）'" width="760px" style="max-width: 95vw">
+      <el-alert v-if="previousApproval" :title="`原申请 #${previousApproval.id} 已驳回`"
+                :description="previousApproval.opinion" type="info" :closable="false" style="margin-bottom: 12px" />
       <el-form :model="form" label-width="110px">
         <el-form-item label="当事人名称">
           <el-input v-model="form.partyName" />
@@ -139,7 +141,7 @@
       </el-form>
       <template #footer>
         <el-button @click="createVisible = false">取消</el-button>
-        <el-button v-if="canOperate" type="primary" @click="onCreate" :loading="submitting">{{ isLeader ? '立案' : '提交申请' }}</el-button>
+        <el-button v-if="canOperate" type="primary" @click="onCreate" :loading="submitting">{{ isLeader && !previousApproval ? '立案' : '提交申请' }}</el-button>
       </template>
     </el-dialog>
 
@@ -178,6 +180,7 @@ import JurisdictionForm from '../../components/JurisdictionForm.vue'
 import { emptyJurisdiction, jurisdictionError, serializeJurisdiction } from '../../api/jurisdiction'
 import { CASE_STATUS, CASE_STATUS_TAG, PARTY_TYPE } from './labels'
 import { useAuthStore } from '../../stores/auth'
+import { parseTaskFocus } from '../../api/taskFocus'
 
 const route = useRoute()
 const router = useRouter()
@@ -247,6 +250,9 @@ let disposed = false
 onUnmounted(() => { disposed = true; loadGeneration++; loading.value = false })
 const statusFilter = ref('')
 const createVisible = ref(false)
+const previousApproval = ref<{ id: number; opinion: string } | null>(null)
+let lastFilingSubmission: { fingerprint: string; key: string } | undefined
+let filingDraftGeneration = 0
 const submitting = ref(false)
 const q = ref('')
 const page = ref(1)
@@ -257,8 +263,8 @@ const emptyOfficers = () => [
   { name: '', certNo: '', duty: 'LEAD' },
   { name: '', certNo: '', duty: 'MEMBER' },
 ]
-const form = reactive<any>({
-  clueId: null, causeId: null, procedureType: 'NORMAL',
+const newFilingForm = () => ({
+  clueId: null, clueVerifyResult: null, causeId: null, procedureType: 'NORMAL',
   partyName: '', partyType: 'PROVIDER', partyCreditNo: '', partyAddress: '',
   partyLegalRep: '', partyContact: '', summary: '', amountInvolved: 0,
   enforceItemId: null, violationEndDate: null, healthHarm: false,
@@ -266,6 +272,7 @@ const form = reactive<any>({
   officers: emptyOfficers(),
   institution: { code: '', ownership: '', grade: '', kind: null },
 })
+const form = reactive<Record<string, any>>(newFilingForm())
 const enforceItems = ref<any[]>([])
 
 async function load() {
@@ -301,22 +308,79 @@ function changePage(value: number) {
   return load()
 }
 
-function openCreate(fromClue = false) {
+function resetFilingDraft() {
+  filingDraftGeneration++
+  createVisible.value = false
+  previousApproval.value = null
+  lastFilingSubmission = undefined
+  Object.assign(form, newFilingForm())
+}
+
+function openCreate(prefill?: { clueId: number; partyName: string; partyType: string }) {
   if (!canOperate.value) return
-  form.jurisdiction = emptyJurisdiction()
-  form.officers = emptyOfficers()
-  // 从线索跳转以外的入口必须清掉线索关联，否则新案会把上次那条线索标记为已立案
-  if (!fromClue) {
-    form.clueId = null
-    form.clueVerifyResult = null
-  }
+  resetFilingDraft()
+  if (prefill) Object.assign(form, prefill)
   createVisible.value = true
 }
 
+async function resumeFiling(rawId: unknown) {
+  const id = parseTaskFocus(rawId)
+  if (!id) { ElMessage.warning('立案申请编号无效'); return }
+  const token = auth.token, generation = ++filingDraftGeneration
+  const current = () => !disposed && generation === filingDraftGeneration
+    && route.query.fromApproval === rawId && auth.token === token && canOperate.value
+  try {
+    const data = (await client.get('/bureau/approvals/mine', { params: { focusId: id } })).data.data
+    if (!current()) return
+    const row = Array.isArray(data) && data.find((entry: any) => entry.id === id)
+    if (!row || row.kind !== 'FILE_CASE' || row.status !== 'REJECTED' || row.resubmitted) {
+      ElMessage.warning('此立案申请已续填或不在当前办理范围')
+      return
+    }
+    const snapshot = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      ElMessage.warning('原立案申请材料无法读取')
+      return
+    }
+    const draft: Record<string, any> = newFilingForm()
+    for (const key of Object.keys(draft)) if (snapshot[key] != null) draft[key] = snapshot[key]
+    draft.clueId = row.clue_id ?? snapshot.clueId ?? null
+    draft.jurisdiction = serializeJurisdiction(snapshot.jurisdiction)
+    draft.institution = {
+      code: String(snapshot.institution?.code ?? ''), ownership: snapshot.institution?.ownership ?? '',
+      grade: snapshot.institution?.grade ?? '', kind: snapshot.institution?.kind ?? null,
+    }
+    draft.officers = Array.isArray(snapshot.officers)
+      ? snapshot.officers.map((officer: any, index: number) => ({
+        name: typeof officer?.name === 'string' ? officer.name : '',
+        certNo: typeof officer?.certNo === 'string' ? officer.certNo : '',
+        duty: ['LEAD', 'MEMBER'].includes(officer?.duty) ? officer.duty : (index === 0 ? 'LEAD' : 'MEMBER'),
+      }))
+      : emptyOfficers()
+    if (draft.officers.length < 2) draft.officers.push(...emptyOfficers().slice(draft.officers.length))
+    Object.assign(form, draft)
+    previousApproval.value = { id, opinion: row.opinion || '' }
+    createVisible.value = true
+  } catch {
+    if (current()) ElMessage.warning('暂无法打开原立案申请，请从我的申请重试')
+  }
+}
+
+function filingRequestKey(body: object) {
+  const fingerprint = JSON.stringify(body)
+  if (lastFilingSubmission?.fingerprint === fingerprint) return lastFilingSubmission.key
+  const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
+  lastFilingSubmission = { fingerprint, key }
+  return key
+}
+
 async function onCreate() {
-  if (!canOperate.value) return
+  if (!canOperate.value || !createVisible.value) return
   // 防重：连点或 15s 超时后的重试会生成两条连号且无法删除的记录
   if (submitting.value) return
+  const token = auth.token, generation = filingDraftGeneration
+  const current = () => !disposed && generation === filingDraftGeneration
+    && auth.token === token && canOperate.value && createVisible.value
   submitting.value = true
   try {
     if (!form.partyName || !form.causeId) {
@@ -335,18 +399,21 @@ async function onCreate() {
       return
     }
     const payload = { ...form, institution, reportingDetailsRequired: true, jurisdiction: serializeJurisdiction(form.jurisdiction) }
-    if (!isLeader.value) {
+    if (!isLeader.value || previousApproval.value) {
       // 办案人员：提交 FILE_CASE 审批单，负责人批准时才真正建案（ApprovalService.execute）
-      await client.post('/bureau/approvals', {
+      const body = {
         kind: 'FILE_CASE', clueId: form.clueId || null,
-        payload, reason: `立案申请：${form.partyName}`,
-      })
+        payload, reason: `立案申请：${form.partyName}`, previousApprovalId: previousApproval.value?.id,
+      }
+      const response = await client.post('/bureau/approvals', { ...body, requestKey: filingRequestKey(body) })
+      if (!current()) return
       ElMessage.success('立案申请已提交，待负责人批准后自动建案')
       createVisible.value = false
-      router.push('/case/approvals')
+      router.push({ path: '/case/approvals', query: { mine: '1', focus: response.data.data.id } })
       return
     }
     const resp = await client.post('/bureau/cases', payload)
+    if (!current()) return
     ElMessage.success(`已立案：${resp.data.data.caseNo}`)
     createVisible.value = false
     router.push(`/case/detail/${resp.data.data.id}`)
@@ -355,16 +422,22 @@ async function onCreate() {
   }
 }
 
+watch([() => route.query.fromApproval, () => auth.token, canOperate], ([id, token, canFile], old) => {
+  if (old?.[1] || id !== undefined) resetFilingDraft()
+  if (id !== undefined && token && canFile) void resumeFiling(id)
+}, { immediate: true, flush: 'sync' })
+
 onMounted(async () => {
   const resp = await client.get('/bureau/causes')
   causes.value = resp.data.data
   enforceItems.value = (await client.get('/bureau/enforce-items')).data.data
   // 从线索页跳转：预填当事人并直接打开立案表单
-  if (route.query.clueId) {
-    form.clueId = Number(route.query.clueId)
-    form.partyName = String(route.query.suspectName || '')
-    form.partyType = String(route.query.suspectType || 'PROVIDER')
-    openCreate(true)
+  if (route.query.clueId && route.query.fromApproval === undefined) {
+    openCreate({
+      clueId: Number(route.query.clueId),
+      partyName: String(route.query.suspectName || ''),
+      partyType: String(route.query.suspectType || 'PROVIDER'),
+    })
   }
   // 承办人清单与案件列表互不依赖，并行拉取；从用户管理"去移交"跳转时 owner 已由 query 预填
   loadOwners()

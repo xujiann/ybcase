@@ -1,6 +1,7 @@
 package cn.ybcase.bureau;
 
 import cn.ybcase.core.security.JwtService;
+import cn.ybcase.bureau.service.MessageService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -9,10 +10,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 
@@ -34,6 +39,7 @@ class DistrictScopeIntegrationTest {
     @Autowired JdbcTemplate jdbc;
     @Autowired ObjectMapper mapper;
     @Autowired JwtService jwt;
+    @Autowired MessageService messages;
     private String originalScope;
 
     private record Actor(String name, String token, Long department) {}
@@ -276,6 +282,95 @@ class DistrictScopeIntegrationTest {
                 jdbc.queryForObject("select owner_user from case_file where id=?", String.class, caseId)));
         read(sender, "/cases/" + caseId, 2080);
         read(receiver, "/cases/" + caseId, 0);
+    }
+
+    @Test void receivingLeaderCanAssignTransferredInspectionWithoutReplacingCreatorOrLineage() throws Exception {
+        long first = department(), second = department();
+        var original = actor("HANDLER", "DISTRICT", first);
+        var sender = actor("LEADER", "DISTRICT", first);
+        var receiver = actor("LEADER", "DISTRICT", second);
+        var handler = actor("HANDLER", "DISTRICT", second);
+        var replacement = actor("HANDLER", "DISTRICT", second);
+        String marker = "inspection-handoff-" + System.nanoTime();
+        long inspection = write(original, "/inspections", Map.of("objectName", marker,
+                "objectType", "PROVIDER", "officers", "检查员甲、检查员乙"), 0).path("id").asLong();
+        String inspectionPath = "/inspections/" + inspection;
+        String listings = "/inspections?page=1&q=" + marker;
+        long handoff = write(sender, "/department-handoffs", Map.of("sourceType", "INSPECTION", "sourceId", inspection,
+                "targetDeptId", second, "reason", "跨区交接检查"), 0).path("id").asLong();
+        String handoffPath = "/department-handoffs/" + handoff;
+        write(receiver, handoffPath + "/decision", Map.of("accept", true, "opinion", "接收"), 0);
+        assertTrue(read(receiver, "/department-handoffs?focusId=" + handoff, 0).path("rows")
+                .get(0).path("can_assign_inspection").asBoolean());
+        assertTrue(ids(read(handler, listings, 0).path("rows")).isEmpty());
+        read(sender, handoffPath + "/inspection-assignees", 2080);
+        var options = read(receiver, handoffPath + "/inspection-assignees", 0);
+        assertTrue(options.path("assignedUserId").isNull());
+        assertEquals(2, options.path("candidates").size());
+        String assignment = handoffPath + "/inspection-assignment";
+        write(receiver, assignment, Map.of("username", original.name(), "reason", "不能指派原机构"), 2190);
+        var firstAssignment = Map.<String, Object>of("username", handler.name(), "reason", "分派接续");
+        write(receiver, assignment, firstAssignment, 0);
+        write(receiver, assignment, firstAssignment, 0); // same request must not leave a duplicate event
+        assertEquals(Set.of(inspection), ids(read(handler, listings, 0).path("rows")));
+        assertTrue(ids(read(replacement, listings, 0).path("rows")).isEmpty());
+        assertTrue(ids(read(original, listings, 0).path("rows")).isEmpty());
+        read(replacement, inspectionPath + "/attachments", 2080);
+        read(original, inspectionPath + "/attachments", 2080);
+
+        var uploaded = mvc.perform(multipart("/api/bureau" + inspectionPath + "/attachments")
+                        .file(new MockMultipartFile("file", "receipt.pdf", "application/pdf",
+                                "%PDF-1.4\nfixture".getBytes(StandardCharsets.UTF_8)))
+                        .header("Authorization", "Bearer " + handler.token()))
+                .andReturn().getResponse();
+        var attachment = mapper.readTree(uploaded.getContentAsString());
+        assertEquals(0, attachment.path("code").asInt(-1), attachment.toString());
+        long file = attachment.path("data").path("id").asLong();
+        assertEquals(Set.of(file), ids(read(handler, inspectionPath + "/attachments", 0)));
+        Long current = jdbc.queryForObject("select assigned_user_id from inspection where id=?", Long.class, inspection);
+        write(receiver, assignment, Map.of("username", replacement.name(), "reason", "确认改派"), 2190);
+        write(receiver, assignment, Map.of("username", replacement.name(), "expectedAssignedUserId", current,
+                "reason", "确认改派"), 0);
+        read(handler, inspectionPath + "/attachments", 2080);
+        write(handler, inspectionPath + "/complete", Map.of("result", "失权尝试", "violationFound", true), 2080);
+        assertEquals(Set.of(file), ids(read(replacement, inspectionPath + "/attachments", 0)));
+        write(replacement, inspectionPath + "/complete", Map.of("result", "发现违法", "violationFound", true), 0);
+        long clueId = write(replacement, inspectionPath + "/to-clue", Map.of(), 0).path("id").asLong();
+        assertEquals(second, jdbc.queryForObject("select owner_dept_id from case_clue where id=?", Long.class, clueId));
+        assertEquals(Set.of(file), ids(read(replacement, "/clues/" + clueId + "/attachments", 0)));
+        assertEquals(original.name(), jdbc.queryForObject("select created_by from inspection where id=?", String.class, inspection));
+        assertEquals(2, jdbc.queryForObject("select count(*) from inspection_assignment where inspection_id=?",
+                Integer.class, inspection));
+        write(receiver, assignment, firstAssignment, 2190); // converted inspections follow the new clue's scope
+    }
+
+    @Test void transferredClueRemindersFollowCurrentHandlerAndScopedFallback() throws Exception {
+        long first = department(), second = department();
+        var original = actor("HANDLER", "DISTRICT", first);
+        var sender = actor("LEADER", "DISTRICT", first);
+        var receiver = actor("LEADER", "DISTRICT", second);
+        var fallback = actor("LEADER", "DISTRICT", second);
+        var city = actor("LEADER", "BUREAU", null);
+        long clueId = clue(original, "交接提醒");
+        long handoff = write(sender, "/department-handoffs", Map.of("sourceType", "CLUE", "sourceId", clueId,
+                "targetDeptId", second, "reason", "跨区交接线索"), 0).path("id").asLong();
+        write(receiver, "/department-handoffs/" + handoff + "/decision", Map.of("accept", true, "opinion", "接收"), 0);
+        String key = "CLUE-" + clueId + "-" + LocalDate.now();
+        messages.generateReminders();
+        messages.generateReminders();
+        assertEquals(List.of(receiver.name()), jdbc.queryForList("select username from sys_message where dedup_key=?", String.class, key));
+        String link = "/case/clues?focus=" + clueId;
+        assertTrue(read(receiver, "/messages", 0).toString().contains(link));
+        assertEquals(Set.of(clueId), ids(read(receiver, "/clues?focusId=" + clueId + "&page=1", 0).path("rows")));
+        jdbc.update("update sys_user set enabled=false where username=?", receiver.name());
+        messages.generateReminders();
+        messages.generateReminders();
+        var targets = jdbc.queryForList("select username from sys_message where dedup_key=?", String.class, key);
+        assertEquals(2, targets.size());
+        assertEquals(Set.of(receiver.name(), fallback.name()), new HashSet<>(targets));
+        assertFalse(targets.contains(original.name()));
+        assertFalse(targets.contains(sender.name()));
+        assertFalse(targets.contains(city.name()));
     }
 
     @Test void legacySourceNeedsExplicitReconciliationAndDisabledTargetCannotReceive() throws Exception {

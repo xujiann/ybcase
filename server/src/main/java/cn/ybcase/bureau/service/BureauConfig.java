@@ -29,7 +29,16 @@ public class BureauConfig {
     private final Object holidayCacheMonitor = new Object();
     private long holidayGeneration;
 
-    private record Holidays(java.util.Set<LocalDate> off, java.util.Set<LocalDate> shiftWork) {}
+    record Holidays(java.util.Set<LocalDate> off, java.util.Set<LocalDate> shiftWork,
+                    java.util.Set<Integer> coveredYears) {
+        LocalDate plus(LocalDate from, int days) {
+            return Workdays.plus(from, days, off, shiftWork);
+        }
+
+        boolean hasHolidayRecords(int year) {
+            return coveredYears.contains(year);
+        }
+    }
 
     @org.springframework.context.event.EventListener
     public void onConfigChanged(cn.ybcase.core.common.ConfigChangedEvent e) {
@@ -48,11 +57,16 @@ public class BureauConfig {
     private Map<String, String> snapshot() {
         Map<String, String> c = cache;
         if (c != null && System.currentTimeMillis() - cacheAt < TTL_MS) return c;
+        Map<String, String> loaded = readParameters();
+        cache = loaded;
+        cacheAt = System.currentTimeMillis();
+        return loaded;
+    }
+
+    Map<String, String> readParameters() {
         Map<String, String> loaded = new java.util.HashMap<>();
         for (var r : jdbc.queryForList("select cfg_key, cfg_value from sys_config"))
             loaded.put((String) r.get("cfg_key"), (String) r.get("cfg_value"));
-        cache = loaded;
-        cacheAt = System.currentTimeMillis();
         return loaded;
     }
 
@@ -89,8 +103,7 @@ public class BureauConfig {
 
     /** 工作日推算（第58条：期间届满遇法定节假日顺延；sys_holiday：HOLIDAY 放假 / SHIFT_WORK 调休上班） */
     public LocalDate plusWorkdays(LocalDate from, int n) {
-        Holidays h = holidays();
-        return Workdays.plus(from, n, h.off(), h.shiftWork());
+        return holidays().plus(from, n);
     }
 
     public boolean isWorkingDay(LocalDate day) {
@@ -98,7 +111,7 @@ public class BureauConfig {
         return Workdays.isWorkingDay(day, h.off(), h.shiftWork());
     }
 
-    private Holidays holidays() {
+    Holidays holidays() {
         // A transaction must use its own DB snapshot and uncommitted changes. It must
         // neither consume a newer shared calendar nor publish an old/rolled-back one.
         if (org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive())
@@ -124,11 +137,14 @@ public class BureauConfig {
     private Holidays loadHolidays() {
         var off = new java.util.HashSet<LocalDate>();
         var shiftWork = new java.util.HashSet<LocalDate>();
+        var coveredYears = new java.util.HashSet<Integer>();
         for (var r : jdbc.queryForList("select day, kind from sys_holiday")) {
             LocalDate d = ((java.sql.Date) r.get("day")).toLocalDate();
-            if ("SHIFT_WORK".equals(r.get("kind"))) shiftWork.add(d); else off.add(d);
+            Object kind = r.get("kind");
+            if ("SHIFT_WORK".equals(kind)) shiftWork.add(d); else off.add(d);
+            if ("HOLIDAY".equals(kind)) coveredYears.add(d.getYear());
         }
-        return new Holidays(java.util.Set.copyOf(off), java.util.Set.copyOf(shiftWork));
+        return new Holidays(java.util.Set.copyOf(off), java.util.Set.copyOf(shiftWork), java.util.Set.copyOf(coveredYears));
     }
 
     /**

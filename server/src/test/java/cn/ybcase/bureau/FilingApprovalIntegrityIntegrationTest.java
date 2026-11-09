@@ -7,11 +7,13 @@ import cn.ybcase.bureau.service.ApprovalService;
 import cn.ybcase.bureau.service.BureauConfig;
 import cn.ybcase.bureau.service.CaseService;
 import cn.ybcase.bureau.service.ClueService;
+import cn.ybcase.bureau.service.EnforcerRegistryAccess;
 import cn.ybcase.bureau.web.FormalizationController;
 import cn.ybcase.core.common.ConfigChangedEvent;
 import cn.ybcase.core.entity.SysUser;
 import cn.ybcase.core.repository.SysRoleRepository;
 import cn.ybcase.core.repository.SysUserRepository;
+import cn.ybcase.core.security.AuthUser;
 import cn.ybcase.core.web.SysUserController;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -184,6 +186,160 @@ class FilingApprovalIntegrityIntegrationTest {
             var applicant = user(role); assertEquals(applicant.getUsername(), cases.create(request(null), applicant.getUsername()).getOwnerUser());
         }
     }
+
+    @Test void filingRetryAndRejectedResubmissionPreserveOnePendingApplicationAndTheOriginalDecision() {
+        var applicant = user("HANDLER");
+        var other = user("HANDLER");
+        var leader = user("LEADER");
+        long clueId = clue(applicant);
+        var body = payload(clueId);
+        var first = new ApprovalService.ApplyReq("FILE_CASE", clueId, null, body, "初次申请", "filing-first-123456", null);
+        long id = approvals.apply(first, applicant.getUsername(), false);
+        assertEquals(id, approvals.apply(first, applicant.getUsername(), false));
+        fails(2071, () -> approvals.apply(new ApprovalService.ApplyReq(
+                "FILE_CASE", clueId, null, body, "修改内容", first.requestKey(), null), applicant.getUsername(), false));
+        fails(2071, () -> approvals.apply(new ApprovalService.ApplyReq(
+                "FILE_CASE", clueId, null, body, "另行提交", "filing-other-123456", null), applicant.getUsername(), false));
+
+        approvals.decide(id, false, "补齐申请说明", leader.getUsername());
+        assertTrue(approvals.pendingFor(applicant.getUsername(), id).isEmpty());
+        assertTrue(approvals.mine(other.getUsername(), id).isEmpty());
+        var original = approvals.mine(applicant.getUsername(), id).getFirst();
+        assertEquals("REJECTED", original.get("status"));
+        assertEquals("补齐申请说明", original.get("opinion"));
+        assertEquals("/case/approvals?mine=1&focus=" + id, jdbc.queryForObject(
+                "select link from sys_message where username=? and title like ?", String.class,
+                applicant.getUsername(), "审批单 #" + id + "（%"));
+
+        var replacement = new ApprovalService.ApplyReq("FILE_CASE", clueId, null, body, "已补齐申请说明",
+                "filing-refile-123456", id);
+        long replacementId = approvals.apply(replacement, applicant.getUsername(), false);
+        assertNotEquals(id, replacementId);
+        assertEquals(replacementId, approvals.apply(replacement, applicant.getUsername(), false));
+        assertEquals(id, approval(replacementId).get("previous_approval_id"));
+        var retained = approvals.mine(applicant.getUsername(), id).getFirst();
+        assertEquals(true, retained.get("resubmitted"));
+        assertEquals(original.get("payload"), retained.get("payload"));
+        assertEquals(original.get("opinion"), retained.get("opinion"));
+        assertEquals(List.of(replacementId), approvals.pendingFor(applicant.getUsername()).stream()
+                .map(row -> ((Number) row.get("id")).longValue()).toList());
+    }
+
+    @Test void currentFilingSubmissionPreflightsBeforeOpeningAnApproval() {
+        var applicant = user("HANDLER");
+        var body = payload(null);
+        body.put("officers", List.of(TWO.getFirst(), TWO.getFirst()));
+        fails(2002, () -> approvals.apply(new ApprovalService.ApplyReq(
+                "FILE_CASE", null, null, body, "同一证号", "filing-preflight-123456", null),
+                applicant.getUsername(), false));
+        assertTrue(approvals.mine(applicant.getUsername(), null).isEmpty());
+    }
+
+    @Test void historicalPayloadOnlySourceParticipatesInDedupAndCurrentDepartmentScope() throws Exception {
+        var applicant = user("HANDLER");
+        long clueId = clue(applicant), conflictingClue = clue(applicant);
+        var departments = jdbc.queryForList("select id from sys_dept where enabled order by id limit 2", Long.class);
+        assertEquals(2, departments.size());
+        long own = departments.get(0), other = departments.get(1);
+        jdbc.update("update sys_user set account_category='DISTRICT', dept_id=? where id=?", own, applicant.getId());
+        jdbc.update("update case_clue set owner_dept_id=? where id in (?,?)", own, clueId, conflictingClue);
+        long original = historical("FILE_CASE", applicant, null, payload(clueId));
+        jdbc.update("update biz_approval set applicant_dept_id=? where id=?", own, original);
+        assertEquals(original, ((Number) approvals.mine(applicant.getUsername(), original).getFirst().get("id")).longValue());
+        fails(2071, () -> filing(applicant, clueId));
+
+        // Reassigning the clue must revoke history even though the applicant's recorded department stays the same.
+        jdbc.update("update case_clue set owner_dept_id=? where id=?", other, clueId);
+        assertTrue(approvals.mine(applicant.getUsername(), original).isEmpty());
+        assertTrue(approvals.pendingFor(applicant.getUsername(), original).isEmpty());
+        jdbc.update("update case_clue set owner_dept_id=? where id=?", own, clueId);
+        jdbc.update("update biz_approval set status='REJECTED' where id=?", original);
+
+        for (Object untrusted : List.of(String.valueOf(clueId), new BigInteger("9223372036854775808"),
+                new BigDecimal(clueId + ".5"), Map.of("id", clueId))) {
+            var bad = payload(null); bad.put("clueId", untrusted);
+            long id = historical("FILE_CASE", applicant, null, bad);
+            jdbc.update("update biz_approval set applicant_dept_id=? where id=?", own, id);
+            assertTrue(approvals.mine(applicant.getUsername(), id).isEmpty());
+            fails(2146, () -> approvals.apply(new ApprovalService.ApplyReq("FILE_CASE", null, null, bad, "无效来源"),
+                    applicant.getUsername(), false));
+        }
+        long conflict = historical("FILE_CASE", applicant, null, payload(clueId));
+        jdbc.update("update biz_approval set applicant_dept_id=?, clue_id=? where id=?", own, conflictingClue, conflict);
+        assertTrue(approvals.mine(applicant.getUsername(), conflict).isEmpty());
+        long next = filing(applicant, clueId);
+        assertEquals(clueId, ((Number) approval(next).get("clue_id")).longValue(),
+                "Untrusted payloads do not reserve a different clue");
+    }
+
+    @Test void queuedFilingRechecksTokenVersionAfterRegistryGate() throws Exception {
+        var applicant = user("HANDLER");
+        var auth = currentPrincipal(applicant, "HANDLER");
+        var request = new ApprovalService.ApplyReq("FILE_CASE", null, null, payload(null), "等待时登录已失效",
+                "filing-stale-token-1234", null);
+        var pool = Executors.newSingleThreadExecutor();
+        var pid = new CompletableFuture<Integer>();
+        try (Connection gate = dataSource.getConnection()) {
+            gate.setAutoCommit(false);
+            try (var lock = gate.prepareStatement("select pg_advisory_xact_lock(?,?)")) {
+                lock.setInt(1, EnforcerRegistryAccess.GATE_NAMESPACE); lock.setInt(2, EnforcerRegistryAccess.GATE_KEY);
+                lock.executeQuery().close();
+            }
+            try {
+                var submitted = authenticatedAsync(pool, auth, pid, () -> controller.apply(request, auth));
+                int backend = pid.get(15, TimeUnit.SECONDS);
+                await(() -> blocked(backend));
+                jdbc.update("update sys_user set token_version=token_version+1 where id=?", applicant.getId());
+                gate.commit();
+                var rejected = assertThrows(ExecutionException.class, () -> submitted.get(20, TimeUnit.SECONDS));
+                assertEquals(403, assertInstanceOf(BizException.class, rejected.getCause()).code);
+                assertTrue(approvals.mine(applicant.getUsername(), null).isEmpty());
+            } finally { gate.rollback(); }
+        } finally { stop(pool); }
+    }
+
+    @Test void queuedRejectionRechecksTokenVersionAfterApprovalRowLock() throws Exception {
+        var applicant = user("HANDLER"); var leader = user("LEADER");
+        long id = filing(applicant, null);
+        var before = approval(id);
+        var auth = currentPrincipal(leader, "LEADER");
+        var pool = Executors.newSingleThreadExecutor();
+        var pid = new CompletableFuture<Integer>();
+        try (Connection gate = dataSource.getConnection()) {
+            gate.setAutoCommit(false);
+            try (var lock = gate.prepareStatement("select id from biz_approval where id=? for update")) {
+                lock.setLong(1, id); lock.executeQuery().close();
+            }
+            try {
+                var decided = authenticatedAsync(pool, auth, pid, () -> approvals.decide(id, false, "等待期间登录已失效", leader.getUsername()));
+                int backend = pid.get(15, TimeUnit.SECONDS);
+                await(() -> blocked(backend));
+                jdbc.update("update sys_user set token_version=token_version+1 where id=?", leader.getId());
+                gate.commit();
+                var rejected = assertThrows(ExecutionException.class, () -> decided.get(20, TimeUnit.SECONDS));
+                assertEquals(403, assertInstanceOf(BizException.class, rejected.getCause()).code);
+                noDecision(id, before);
+            } finally { gate.rollback(); }
+        } finally { stop(pool); }
+    }
+
+    private Authentication currentPrincipal(SysUser user, String role) {
+        var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
+        return new UsernamePasswordAuthenticationToken(new AuthUser(user.getUsername(), user.getPassword(), true,
+                user.getTokenVersion(), user.getId(), false, authorities), "n/a", authorities);
+    }
+
+    private <T> Future<T> authenticatedAsync(ExecutorService pool, Authentication auth, CompletableFuture<Integer> pid,
+                                             Supplier<T> action) {
+        return pool.submit(() -> {
+            SecurityContextHolder.getContext().setAuthentication(auth);
+            try { return tx(() -> {
+                pid.complete(jdbc.queryForObject("select pg_backend_pid()", Integer.class));
+                return action.get();
+            }); } finally { SecurityContextHolder.clearContext(); }
+        });
+    }
+
     @Test void disabledApplicantsCannotBeApprovedWithOrWithoutClueButCanBeRejected() {
         invalidApplicant("DISABLED");
     }

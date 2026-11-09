@@ -33,6 +33,14 @@ const SNAPSHOT_FIELDS: Record<string, string> = {
   uploaded_by: '上传账号', uploaded_at: '上传时间',
   proposed_fine: '拟罚款金额', proposed_recoup: '拟追回基金', proposed_confiscate: '拟没收金额',
   statement: '陈述申辩', statement_review: '申辩复核意见', change_reason: '再告知变更理由',
+  notice_id: '告知版本', notified_at: '告知登记日', statement_deadline: '陈述申辩截止日',
+  statement_received_at: '申辩收到日', statement_waived: '是否明确放弃申辩',
+  hearing_entitled: '是否告知听证权利', hearing_requested: '是否申请听证',
+  hearing_requested_at: '听证申请收到日', hearing_request_deadline: '听证申请截止日',
+  delivery_id: '回证记录编号', method: '送达方式', delivered_at: '实际送达日', receipt_no: '回证编号',
+  receipt_signed_at: '回证签收日', receiver: '受送达人', notice_sent_at: '听证通知送达日',
+  scheduled_at: '听证计划日', held_at: '实际举行日', status: '状态',
+  event_type: '事件类型', reference: '凭据', recorded_by: '登记账号', recorded_at: '登记时间',
   host: '听证主持人', host_dept: '主持人部门', recorder: '记录人', record: '笔录内容',
   opinion: '意见', experts: '评审专家', org: '协查单位', result: '答复结果', reply: '协查回复', reply_content: '回复内容',
   refused: '是否拒绝协查', refuse_reason: '拒绝理由', conclusion: '结论',
@@ -61,6 +69,7 @@ export function snapshotSections(snapshot: unknown): { key: string; label: strin
     schemaVersion: '快照格式版本', version: '快照格式版本', caseFile: '案件事实', facts: '案件事实', caseFacts: '案件事实',
     finalReport: '调查终结报告', reports: '调查终结报告', report: '调查终结报告', evidences: '证据材料', evidence: '证据材料',
     attachments: '附件材料', documents: '调查报告与实质文书', notices: '处罚告知与陈述申辩', notice: '处罚告知与陈述申辩',
+    noticeProcedures: '各告知版本的送达与期限', noticeProcedureEvents: '放弃申辩和撤回听证凭据', noticeHearingLinks: '听证与告知版本关联',
     hearings: '听证材料', hearing: '听证材料', expertReviews: '已结束专家评审意见', assists: '协查实质回复', meetings: '集体讨论', officers: '办案人员', jurisdiction: '管辖事实',
   }
   const entries: [string, unknown][] = typeof parsed === 'object' && !Array.isArray(parsed) ? Object.entries(parsed) : [['snapshot', parsed]]

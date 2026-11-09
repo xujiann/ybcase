@@ -143,6 +143,11 @@ public class FormalizationController {
         return R.ok(approvalService.pendingFor(auth.getName(), focusId));
     }
 
+    @GetMapping("/approvals/mine")
+    public R<List<Map<String, Object>>> myApprovals(Authentication auth, @RequestParam(required = false) Long focusId) {
+        return R.ok(approvalService.mine(auth.getName(), focusId));
+    }
+
     @GetMapping("/cases/{caseId}/approvals")
     public R<List<Map<String, Object>>> byCase(@PathVariable Long caseId) {
         return R.ok(approvalService.byCase(caseId));
@@ -240,6 +245,18 @@ public class FormalizationController {
                     "select e_delivery_consent from case_file where id = ?", Boolean.class, caseId);
             if (!Boolean.TRUE.equals(consent))
                 throw new BizException(2054, "当事人未签订电子送达确认书（第59条）");
+        }
+        Long noticeId = deliveryDocumentId(body.get("noticeId"));
+        if (noticeId != null) {
+            if (documentId != null || !"NOTICE".equals(body.get("docKind")))
+                throw new BizException(2041, "请从当前告知记录登记对应版本的送达回证");
+            caseService.recordNoticeDelivery(caseId, noticeId, method,
+                    reqDate(body, "deliveredAt", "实际送达日期"),
+                    deliveryText(body, "receiver", null, "受送达人", 64, true),
+                    deliveryText(body, "receiptNo", null, "回证编号", 64, true),
+                    optDate(body, "receiptSignedAt", "回证签收日期"),
+                    deliveryText(body, "note", null, "送达备注", 255, false));
+            return R.ok();
         }
         jdbc.update("""
                 insert into case_delivery (case_id, method, delivered_at, receiver, note, receipt_no,

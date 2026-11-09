@@ -7,10 +7,11 @@ import * as Vue from 'vue'
 import {createResourceLoader,resourceState} from '../src/api/loadableResource.ts'
 import {createBlobPreview} from '../src/api/blobPreview.ts'
 import {createSessionExpiry,SESSION_EXPIRED_EVENT} from '../src/api/sessionExpiry.ts'
+import {parseTaskFocus} from '../src/api/taskFocus.ts'
 
 // Execute the actual SFC setup and handlers; HTTP completions are controlled so
 // stale results, failures and closing panels can be tested without production data.
-function view(file,client,exports) {
+function view(file,client,exports,overrides={}) {
   const source=readFileSync(new URL('../src/views/'+file,import.meta.url),'utf8')
   const script=source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const unmount=[]
@@ -22,12 +23,77 @@ function view(file,client,exports) {
     caseOperationAccess:()=>true,adminOperationAccess:()=>true,canWritePrecase:()=>true,
     emptyJurisdiction:()=>({}),jurisdictionError:()=>'',serializeJurisdiction:v=>v,
     ElMessage:{success(){},warning(){},error(){}},ElMessageBox:{},
+    ...overrides,
   }
   const js=stripTypeScriptTypes(script.replace(/^import .+\r?\n/gm,''))
   const output=vm.runInNewContext(js+'\n;({'+exports+'})',ctx)
   output.unmount=()=>unmount.forEach(fn=>fn())
   return output
 }
+
+function filingView(t) {
+  const route=Vue.reactive({query:{}})
+  const auth=Vue.reactive({token:'session',user:{roles:['LEADER']}})
+  const reads=[],writes=[],navigations=[]
+  const client={
+    get:(_url,config)=>new Promise(resolve=>reads.push({id:config.params.focusId,resolve:data=>resolve({data:{data}})})),
+    post:(url,body)=>new Promise(resolve=>writes.push({url,body,resolve:data=>resolve({data:{data}})})),
+  }
+  const scope=Vue.effectScope()
+  t.after(()=>scope.stop())
+  const instance=scope.run(()=>view('case/CasesView.vue',client,'openCreate,onCreate,createVisible,previousApproval,form',{
+    watch:Vue.watch,parseTaskFocus,useRoute:()=>route,useAuthStore:()=>auth,
+    useRouter:()=>({push:target=>navigations.push(target)}),
+  }))
+  return {...instance,route,auth,reads,writes,navigations}
+}
+
+test('a rejected historical filing with missing officers opens for correction and never seeds a new filing',async t=>{
+  const f=filingView(t)
+  f.route.query={fromApproval:'41'}
+  f.reads[0].resolve([{id:41,kind:'FILE_CASE',status:'REJECTED',clue_id:12,opinion:'补人员',
+    payload:JSON.stringify({partyName:'原当事人',amountInvolved:500,summary:'原摘要',jurisdiction:{type:'DESIGNATED'}})}])
+  await new Promise(setImmediate)
+  assert.equal(f.createVisible.value,true)
+  assert.equal(f.previousApproval.value.id,41)
+  assert.equal(f.form.partyName,'原当事人')
+  assert.equal(f.form.officers.length,2)
+  assert.equal(f.form.clueId,12)
+  f.createVisible.value=false
+  f.openCreate()
+  assert.equal(f.previousApproval.value,null)
+  assert.equal(f.form.partyName,'')
+  assert.equal(f.form.amountInvolved,0)
+  assert.equal(f.form.summary,'')
+  assert.equal(f.form.clueId,null)
+  f.openCreate({clueId:14,partyName:'线索当事人',partyType:'PERSON'})
+  assert.equal(f.form.clueId,14)
+  assert.equal(f.form.partyName,'线索当事人')
+})
+
+test('changing the approval route or session retires earlier forms and outstanding responses',async t=>{
+  const f=filingView(t)
+  f.openCreate()
+  Object.assign(f.form,{partyName:'当事人甲',partyType:'PERSON',causeId:1,officers:[{name:'甲',certNo:'1'},{name:'乙',certNo:'2'}]})
+  const pending=f.onCreate()
+  assert.equal(f.writes.length,1)
+  f.route.query={fromApproval:'41'}
+  assert.equal(f.createVisible.value,false)
+  await f.onCreate()
+  assert.equal(f.writes.length,1)
+  f.route.query={fromApproval:'42'}
+  f.reads[1].resolve([{id:42,kind:'FILE_CASE',status:'REJECTED',payload:{partyName:'当事人乙'}}])
+  await new Promise(setImmediate)
+  f.reads[0].resolve([{id:41,kind:'FILE_CASE',status:'REJECTED',payload:{partyName:'过期申请'}}])
+  f.writes[0].resolve({caseNo:'已提交',id:3})
+  await pending
+  assert.equal(f.createVisible.value,true)
+  assert.equal(f.form.partyName,'当事人乙')
+  assert.equal(f.navigations.length,0)
+  f.auth.token='another-session'
+  assert.equal(f.createVisible.value,false)
+  assert.equal(f.form.partyName,'')
+})
 function reads(file,exports) {
   const pending=[]
   const client={get:(url,config)=>new Promise((resolve,reject)=>pending.push({url,config,resolve:value=>resolve({data:{data:value}}),reject}))}

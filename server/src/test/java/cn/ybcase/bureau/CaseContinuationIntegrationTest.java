@@ -99,7 +99,14 @@ class CaseContinuationIntegrationTest {
 
     @Test void courtReturnCreatesSeparateRoundsAndReceiptsWithoutRewritingOldCase() throws Exception {
         var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");long id=caseFile(owner,"DELIVERED");
-        jdbc.update("update case_file set court_enforce_applied=true,court_enforce_status='RETURNED',court_applied_at=current_date-6,court_received_at=current_date-4,court_receipt_no='原退回回执' where id=?",id);
+        backdateDecision(id);
+        jdbc.update("""
+                update case_file set court_enforce_applied=true,court_enforce_status='RETURNED',
+                  court_applied_at=current_date-6,court_received_at=current_date-4,court_receipt_no='原退回回执',
+                  relief_deadline=current_date-19,relief_basis='原决定救济期限核定材料' where id=?
+                """,id);
+        long urge=jdbc.queryForObject("insert into case_document(case_id,doc_type,title,content,made_at,maker) values(?,'URGE_LETTER','催告书','催告正文',current_date-17,?) returning id",Long.class,id,owner.name());
+        jdbc.update("insert into case_delivery(case_id,method,delivered_at,doc_kind,document_id) values(?,'DIRECT',current_date-17,'URGE_LETTER',?)",id,urge);
         String original=original(id);
         for(int round=2;round<=3;round++) {
             var apply=Map.<String,Object>of("appliedAt",LocalDate.now().minusDays(2).toString(),"applicationReference","补正申请"+round,"eligibilityBasis","负责人核实本次再次申请材料和期限依据");
@@ -156,16 +163,103 @@ class CaseContinuationIntegrationTest {
     @Test void explicitCloseUsesReviewedVersionNetExecutionAndBlocksUnfinishedRemedy() throws Exception {
         var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");var leader=actor("BUREAU","LEADER");
         long id=caseFile(owner,"DELIVERED");
+        jdbc.update("""
+                update case_file set court_enforce_applied=true,court_enforce_status='ACCEPTED',
+                  court_applied_at=current_date-8,court_received_at=current_date-7,court_receipt_no='仅对应原决定的受理回执' where id=?
+                """,id);
         long remedy=write(owner,path(id)+"/remedies",remedy(),0).path("id").asLong();
         write(leader,"/bureau/cases/"+id+"/close",Map.of("closeReport","申请结案"),2193);
         var result=result(remedy,"CHANGE","PUNISH","80");result.put("recoupAmount",0);result.put("confiscateAmount",0);
         long request=write(owner,path(id)+"/requests",request("REMEDY_RESULT",result),0).path("id").asLong();review(legal,id,request,true,0);
+        assertFalse(closeCheck(leader,id,"delivery"));
+        long version=jdbc.queryForObject("select id from case_decision_version where case_id=?",Long.class,id);
+        var day=LocalDate.now().minusDays(1);
+        long document=supplementDocument(owner,id,version,"DECISION",day);
+        String deliveryPath="/bureau/cases/"+id+"/supplement-bundles/documents/"+document+"/deliver";
+        var announcement=Map.<String,Object>of("method","ANNOUNCE","announcedAt",day.toString(),
+                "receiver","受送达人","receiptNo","公告文号","sourceReference","公告原件");
+        long announcementId=write(owner,deliveryPath,announcement,0).path("id").asLong();
+        assertEquals(announcementId,write(owner,deliveryPath,announcement,0).path("id").asLong());
+        assertTrue(jdbc.queryForObject("select delivered_at>current_date from case_supplement_delivery where id=?",Boolean.class,announcementId));
+        assertFalse(closeCheck(leader,id,"delivery"),"新决定公告期未满，尚无有效送达");
+        write(owner,deliveryPath,Map.of("method","DIRECT","deliveredAt",day.toString(),
+                "receiver","受送达人","receiptNo","直接送达回证","sourceReference","签收原件"),0);
+        assertTrue(closeCheck(leader,id,"delivery"));
+        assertFalse(closeCheck(leader,id,"execution_or_court"),"原决定法院回执不能用于新决定结案");
         write(leader,"/bureau/cases/"+id+"/close",Map.of("closeReport","尚未执行"),2011);
         request=write(owner,path(id)+"/requests",request("EXECUTION",payment("80",LocalDate.now())),0).path("id").asLong();review(legal,id,request,true,0);
         write(leader,"/bureau/cases/"+id+"/close",Map.of("closeReport","核对有效决定及续执行后结案"),0);
         assertEquals("CLOSED",jdbc.queryForObject("select status from case_file where id=?",String.class,id));
         assertEquals(0,new BigDecimal("100").compareTo(jdbc.queryForObject("select fine_amount from case_decision where case_id=?",BigDecimal.class,id)));
         assertEquals(0,jdbc.queryForObject("select count(*) from case_execution where case_id=?",Integer.class,id));
+    }
+
+    @Test void revisedDecisionCourtApplicationNeedsExactDeliveryBasisAndUrging() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");var leader=actor("BUREAU","LEADER");
+        long id=caseFile(owner,"DELIVERED");
+        backdateDecision(id);
+        String original=original(id);
+        var intake=new LinkedHashMap<>(remedy());
+        intake.put("acceptedAt",LocalDate.now().minusDays(40).toString());
+        long remedy=write(owner,path(id)+"/remedies",intake,0).path("id").asLong();
+        var result=result(remedy,"CHANGE","PUNISH","80");
+        result.put("effectiveAt",LocalDate.now().minusDays(35).toString());
+        long request=write(owner,path(id)+"/requests",request("REMEDY_RESULT",result),0).path("id").asLong();
+        review(legal,id,request,true,0);
+        long version=jdbc.queryForObject("select id from case_decision_version where case_id=?",Long.class,id);
+        var application=Map.<String,Object>of("appliedAt",LocalDate.now().toString(),
+                "applicationReference","新决定执行申请","eligibilityBasis","核实新决定送达及申请期限");
+        var submission=request("COURT_APPLY",application);
+        write(owner,path(id)+"/requests",submission,2193);
+        long receipt=supplementDelivery(owner,id,version,"DECISION",LocalDate.now().minusDays(32));
+        write(owner,path(id)+"/requests",submission,2193);
+        var basis=new LinkedHashMap<String,Object>(Map.of("decisionVersionId",version,"deliveryId",receipt+1,
+                "reliefDeadline",LocalDate.now().minusDays(16).toString(),"reliefPending",false,"basis","核定的新决定救济期限材料"));
+        write(legal,path(id)+"/execution-basis",basis,2193);
+        basis.put("deliveryId",receipt);
+        long basisId=write(legal,path(id)+"/execution-basis",basis,0).path("id").asLong();
+        assertEquals(basisId,write(legal,path(id)+"/execution-basis",basis,0).path("id").asLong());
+        write(owner,path(id)+"/requests",submission,2193);
+        supplementDelivery(owner,id,version,"URGE_LETTER",LocalDate.now().minusDays(14));
+        request=write(owner,path(id)+"/requests",submission,0).path("id").asLong();
+        review(legal,id,request,true,0);
+        long round=jdbc.queryForObject("select id from case_court_round where case_id=? and decision_version_id=?",Long.class,id,version);
+        assertFalse(closeCheck(leader,id,"execution_or_court"));
+        request=write(owner,path(id)+"/requests",request("COURT_RECEIPT",Map.of("roundId",round,
+                "status","ACCEPTED","receivedAt",LocalDate.now().toString(),"receiptNo","新决定正式受理文号")),0).path("id").asLong();
+        review(legal,id,request,true,0);
+        assertTrue(closeCheck(leader,id,"execution_or_court"));
+        assertEquals(original,original(id));
+    }
+
+    @Test void announcedDecisionCannotCloseBeforeDeemedDelivery() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var leader=actor("BUREAU","LEADER");
+        long id=caseFile(owner,"DELIVERED");
+        jdbc.update("update case_file set delivered_at=current_date+1 where id=?",id);
+        jdbc.update("insert into case_delivery(case_id,method,delivered_at,doc_kind) values(?,'ANNOUNCE',current_date+1,'DECISION')",id);
+        jdbc.update("update case_decision set fine_amount=0,recoup_amount=0,confiscate_amount=0 where case_id=?",id);
+        assertFalse(closeCheck(leader,id,"delivery"));
+        assertTrue(closeCheck(leader,id,"execution_or_court"));
+        write(leader,"/bureau/cases/"+id+"/close",Map.of("closeReport","公告未到期"),2011);
+    }
+
+    @Test void mistakenRemedyStopsBlockingOnlyAfterIndependentReviewAndKeepsIntake() throws Exception {
+        var owner=actor("DISTRICT","LEADER");var legal=actor("BUREAU","LEGAL");long id=caseFile(owner,"DELIVERED");
+        String original=original(id);
+        long remedy=write(owner,path(id)+"/remedies",remedy(),0).path("id").asLong();
+        String intake=jdbc.queryForObject("select to_jsonb(r)::text from case_remedy r where id=?",String.class,remedy);
+        var payload=Map.<String,Object>of("remedyId",remedy);
+        long request=write(owner,path(id)+"/requests",request("REMEDY_VOID",payload),0).path("id").asLong();
+        assertFalse(closeCheck(owner,id,"continuation_review"));
+        review(owner,id,request,true,403);
+        assertEquals("OPEN",read(owner,path(id),0).path("remedies").get(0).path("status").asText());
+        review(legal,id,request,true,0);
+        assertEquals("VOIDED",read(owner,path(id),0).path("remedies").get(0).path("status").asText());
+        assertTrue(closeCheck(owner,id,"continuation_review"));
+        write(owner,path(id)+"/requests",request("REMEDY_VOID",payload),2193);
+        write(owner,path(id)+"/requests",request("REMEDY_RESULT",result(remedy,"CHANGE","PUNISH","80")),2193);
+        assertEquals(intake,jdbc.queryForObject("select to_jsonb(r)::text from case_remedy r where id=?",String.class,remedy));
+        assertEquals(original,original(id));
     }
 
     @Test void partialRefundsKeepOriginalPaymentAndCannotExceedOrReverseReturnedPrincipal() throws Exception {
@@ -229,6 +323,35 @@ class CaseContinuationIntegrationTest {
             """,Long.class,no,status,owner.name(),owner.dept(),"CLOSED".equals(status)?no+"卷":null);
         jdbc.update("insert into case_decision(case_id,decision_type,decision_no,content,penalty_basis,decided_at,fine_amount,recoup_amount,confiscate_amount) values(?,'PUNISH',?,'原决定全文','原依据',current_date-10,100,20,10)",id,no);
         jdbc.update("insert into case_document(case_id,doc_type,title,content,made_at,maker) values(?,'DECISION','原决定文书','原文书全文',current_date-10,?)",id,owner.name());return id;
+    }
+    private void backdateDecision(long id) {
+        jdbc.update("update case_file set filed_at=current_date-60,decided_at=current_date-50,delivered_at=current_date-44 where id=?",id);
+        jdbc.update("update case_decision set decided_at=current_date-50 where case_id=?",id);
+        jdbc.update("update case_document set made_at=current_date-50 where case_id=? and doc_type='DECISION'",id);
+    }
+    private long supplementDelivery(Actor owner,long id,long version,String type,LocalDate deliveredAt) {
+        long document=supplementDocument(owner,id,version,type,deliveredAt);
+        return jdbc.queryForObject("""
+                insert into case_supplement_delivery(document_id,method,delivered_at,receiver,receipt_no,source_reference,recorded_by)
+                values(?,'DIRECT',?,'收件人','补充送达回证','测试原件第1页',?) returning id
+                """,Long.class,document,deliveredAt,owner.name());
+    }
+    private long supplementDocument(Actor owner,long id,long version,String type,LocalDate madeAt) {
+        long bundle=jdbc.queryForObject("""
+                insert into case_supplement_bundle(case_id,request_key,title,source_reference,status,
+                  created_by,applicant_id,source_snapshot)
+                values(?,?, '已复核材料','测试原件','APPROVED',?,?,'{}') returning id
+                """,Long.class,id,UUID.randomUUID().toString(),owner.name(),owner.id());
+        return jdbc.queryForObject("""
+                insert into case_supplement_document(case_id,bundle_id,decision_version_id,request_key,doc_type,
+                  title,content,content_sha256,made_at,created_by)
+                values(?,?,?,?,?,'对应当前决定的送达文书','文书内容',?,?,?) returning id
+                """,Long.class,id,bundle,version,UUID.randomUUID().toString(),type,"0".repeat(64),madeAt,owner.name());
+    }
+    private boolean closeCheck(Actor actor,long id,String key) throws Exception {
+        var checklist=write(actor,"/bureau/cases/"+id+"/preflight",Map.of("action","CLOSE","close",Map.of("closeReport","核对后结案")),0);
+        for (var item : checklist.path("items")) if (key.equals(item.path("key").asText())) return item.path("passed").asBoolean();
+        throw new AssertionError("Missing close preflight item "+key+": "+checklist);
     }
     private String original(long id) { return jdbc.queryForObject("""
         select jsonb_build_object('case',to_jsonb(c),'decision',to_jsonb(d),'documents',(select jsonb_agg(to_jsonb(x) order by id) from case_document x where x.case_id=c.id),

@@ -25,8 +25,18 @@ public class SourceHistoryService {
         SourceAttachmentAccess.ReadPredicate scope;
         switch (kind) {
             case INSPECTIONS -> {
-                projection = "i.*, li.name as item_name";
-                from = "inspection i left join law_enforce_item li on li.id=i.item_id"; id = "i.id";
+                projection = """
+                        i.*,li.name as item_name,
+                        case when i.assigned_user_id is not null or exists (
+                            select 1 from department_handoff h where h.inspection_id=i.id and h.status='ACCEPTED'
+                        ) then assignee.username else i.created_by end as responsible_username,
+                        assignee.real_name as assigned_real_name
+                        """;
+                from = """
+                        inspection i left join law_enforce_item li on li.id=i.item_id
+                        left join sys_user assignee on assignee.id=i.assigned_user_id
+                        """;
+                id = "i.id";
                 search = List.of("i.insp_no", "i.object_name", "i.result", "i.officers", "li.name");
                 scope = access.inspectionReadPredicate("i", username);
             }

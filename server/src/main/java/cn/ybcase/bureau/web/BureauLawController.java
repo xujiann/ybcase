@@ -19,6 +19,7 @@ public class BureauLawController {
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.BureauConfig config;
     private final cn.ybcase.bureau.service.MaterialAccess materialAccess;
+    private final cn.ybcase.bureau.service.WorkdayDeadlinePreview deadlinePreview;
     private static final long HOLIDAY_WRITE_LOCK = 2026102801L;
 
     @GetMapping("/enforce-items")
@@ -56,6 +57,13 @@ public class BureauLawController {
     @GetMapping("/holidays/coverage")
     public R<Map<String, Object>> holidayCoverage() {
         return R.ok(Map.of("missingYears", config.missingHolidayYears()));
+    }
+
+    @GetMapping("/holidays/deadline-preview")
+    @PreAuthorize("hasRole('ADMIN')")
+    public R<cn.ybcase.bureau.service.WorkdayDeadlinePreview.Page> deadlinePreview(
+            @RequestParam(defaultValue = "1") int page, @RequestParam(defaultValue = "25") int size) {
+        return R.ok(deadlinePreview.preview(page, size));
     }
 
     /**

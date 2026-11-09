@@ -1,5 +1,6 @@
 <template>
   <div v-loading="loading">
+    <WorkdayCoverageNotice />
     <el-card class="mb">
       <div class="toolbar">
         <div>
@@ -149,15 +150,16 @@
         </template>
         <template v-if="c.status === 'NOTIFIED'">
           <el-button v-if="canWriteCase" type="warning" @click="openNotice">再次告知</el-button>
+          <el-button v-if="canWriteCase && currentNotice?.deliveryRequired && !currentNoticeReceipt" type="primary" @click="onDeliverNotice">登记告知回证</el-button>
           <el-button v-if="isLeader" type="primary" @click="openDecide">作出决定</el-button>
-          <el-button v-if="canWriteCase" @click="openStatement">陈述申辩/听证</el-button>
+          <el-button v-if="canWriteCase" :disabled="currentNotice?.deliveryRequired && !currentNoticeReceipt" @click="openStatement">陈述申辩/听证</el-button>
           <el-button v-if="canWriteCase" @click="onSubmitReview">提交法制审核</el-button>
           <el-button v-if="canWriteCase && (isLeader)" @click="onExtendCase">延长期限</el-button>
           <el-button v-else-if="canWriteCase" @click="dlg.apply = true">申请延期</el-button>
         </template>
         <template v-if="c.status === 'DECIDED'">
-          <el-button v-if="canWriteCase" type="primary" @click="dlg.deliver = true">登记送达</el-button>
-          <el-button v-if="canWriteCase" @click="dlg.execution = true">登记执行</el-button>
+          <el-button v-if="canWriteCase && !detail.executionDeadline?.decisionVersionId" type="primary" @click="dlg.deliver = true">登记送达</el-button>
+          <el-button v-if="canWriteCase && !detail.executionDeadline?.decisionVersionId" @click="dlg.execution = true">登记执行</el-button>
           <el-button v-if="isLeader" @click="onCloseCase">结案</el-button>
         </template>
         <!-- 终止调查/移送司法同样要立卷归档（第57条一案一卷），此前这批案件拿不到案卷号。
@@ -176,15 +178,20 @@
         <el-button v-if="canWriteCase && !c.archiveNo && !['CLOSED', 'TERMINATED'].includes(c.status)"
                    @click="dlg.eConsent = true">{{ c.edeliveryConsent ? '核实或变更同意地址' : '电子送达确认书' }}</el-button>
         <template v-if="c.status === 'DELIVERED'">
-          <el-button v-if="canWriteCase" type="primary" @click="dlg.execution = true">登记执行</el-button>
-          <el-button @click="onLateFee">加处罚款测算</el-button>
-          <el-button v-if="canWriteCase && (isLeader)" @click="onApproveDefer">批准暂缓/分期</el-button>
-          <el-button v-if="(isLeader || isLegal) && !c.courtEnforceApplied" @click="openRelief">登记救济/暂缓期限</el-button>
-          <el-button v-if="canWriteCase && (isLeader)" @click="openUrgeDelivery">登记催告送达</el-button>
-          <el-button v-if="canWriteCase && (isLeader)" :disabled="c.courtEnforceApplied" @click="onCourtEnforce">申请法院强制执行</el-button>
+          <template v-if="!detail.executionDeadline?.decisionVersionId">
+            <el-button v-if="canWriteCase" type="primary" @click="dlg.execution = true">登记执行</el-button>
+            <el-button @click="onLateFee">加处罚款测算</el-button>
+            <el-button v-if="canWriteCase && isLeader" @click="onApproveDefer">批准暂缓/分期</el-button>
+            <el-button v-if="(isLeader || isLegal) && !c.courtEnforceApplied" @click="openRelief">登记救济/暂缓期限</el-button>
+            <el-button v-if="canWriteCase && isLeader" @click="openUrgeDelivery">登记催告送达</el-button>
+            <el-button v-if="canWriteCase && isLeader" :disabled="c.courtEnforceApplied || !!detail.executionDeadline?.courtStatus" @click="onCourtEnforce">申请法院强制执行</el-button>
+          </template>
           <el-button v-if="canWriteCase && isLeader && c.courtEnforceApplied && (!c.courtEnforceStatus || c.courtEnforceStatus === 'APPLIED')" @click="dlg.courtResult = true">登记法院结果</el-button>
           <el-button v-if="isLeader" type="success" @click="onCloseCase">结案</el-button>
         </template>
+        <span v-if="detail.executionDeadline?.decisionVersionId && ['DECIDED', 'DELIVERED'].includes(c.status)" class="hint">
+          当前决定已有独立版本，请在归档补充卷中登记送达和催告，在执行续办中登记期限、款项和法院申请。
+        </span>
         <el-button v-if="!c.archiveNo && ['INVESTIGATING', 'SUSPENDED', 'REPORTED', 'NOTIFIED'].includes(c.status) && (!isLeader || (c.procedureType === 'NORMAL' && c.status === 'INVESTIGATING') || c.status === 'SUSPENDED' || c.status === 'REPORTED')" @click="openDecide">决定条件清单</el-button>
         <el-button v-if="!isLeader && !c.archiveNo && ['DECIDED', 'DELIVERED', 'TERMINATED'].includes(c.status)" @click="onCloseCase">结案条件清单</el-button>
         <el-button v-if="canWriteCase && (!['CLOSED', 'TERMINATED'].includes(c.status))" @click="dlg.meeting = true">集体讨论记录</el-button>
@@ -373,7 +380,16 @@
           </el-table>
           <h4>处罚告知与陈述申辩（第41条）</h4>
           <el-table :data="detail.notices" border size="small" class="mb">
-            <el-table-column prop="notifiedAt" label="告知日期" width="105" />
+            <el-table-column prop="id" label="告知版本" width="92" />
+            <el-table-column prop="notifiedAt" label="告知登记日" width="112" />
+            <el-table-column label="实际送达" min-width="145">
+              <template #default="{ row }">
+                <span v-if="noticeReceipt(row.id)">{{ noticeReceipt(row.id)?.delivered_at }} · {{ noticeReceipt(row.id)?.receipt_no }}</span>
+                <span v-else>{{ row.deliveryRequired ? '待登记实际回证' : '沿用历史登记口径' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="statementDeadline" label="陈述申辩截止日" width="140" />
+            <el-table-column prop="hearingRequestDeadline" label="听证申请截止日" width="140" />
             <el-table-column prop="proposedFine" label="拟罚款" width="110" align="right" />
             <el-table-column prop="proposedRecoup" label="拟追回基金" width="110" align="right" />
             <el-table-column label="听证" width="180">
@@ -384,15 +400,19 @@
             <el-table-column prop="statement" label="陈述申辩" show-overflow-tooltip />
             <el-table-column prop="statementReview" label="复核意见" show-overflow-tooltip />
           </el-table>
-          <h4>听证（辽46-50条）　<el-button v-if="canWriteCase" size="small" @click="dlg.hearing = true" :disabled="!['NOTIFIED','REPORTED'].includes(c.status)">安排听证</el-button></h4>
+          <h4>听证（辽46-50条）　<el-button v-if="canWriteCase" size="small" @click="openHearing"
+            :disabled="c.status !== 'NOTIFIED' || !currentNotice?.hearingRequested || currentNotice.deliveryRequired && !currentNoticeReceipt">安排听证</el-button></h4>
           <el-table :data="detail.hearings" border size="small" class="mb">
+            <el-table-column label="告知版本" width="100">
+              <template #default="{ row }">{{ row.notice_id ?? '历史未关联' }}</template>
+            </el-table-column>
             <el-table-column prop="notice_sent_at" label="通知送达" width="105" />
             <el-table-column prop="scheduled_at" label="举行日期" width="105" />
             <el-table-column prop="host" label="主持人" width="100" />
             <el-table-column label="状态" width="230">
               <template #default="{ row }">
                 <template v-if="row.status === 'SCHEDULED'">
-                  待举行 <el-button v-if="canWriteCase" size="small" text type="primary" @click="onHoldHearing(row)">举行并记录笔录</el-button>
+                  待举行 <el-button v-if="canWriteCase && (row.notice_id == null || String(row.notice_id) === String(currentNotice?.id))" size="small" text type="primary" @click="onHoldHearing(row)">举行并记录笔录</el-button>
                   <el-button v-if="canWriteCase" size="small" text type="danger" @click="onCancelHearing(row)">撤销排期</el-button>
                 </template>
                 <span v-else-if="row.status === 'CANCELLED'">已撤销</span>
@@ -780,6 +800,7 @@
         <el-form-item label="事实理由依据"><el-input v-model="noticeForm.content" type="textarea" :rows="5" /></el-form-item>
       </el-form>
       <p class="hint">拟罚款达到听证标准将自动告知听证权利；当事人享有陈述权、申辩权。</p>
+      <p class="hint">保存后请登记本版本实际送达回证，系统据此计算申辩与听证申请截止日。</p>
       <template #footer>
         <el-button @click="dlg.notice = false">取消</el-button>
         <el-button v-if="canWriteCase" type="primary" :loading="notifying" :disabled="notifying" @click="onNotify">保存本次告知</el-button>
@@ -789,12 +810,24 @@
     <el-dialog v-model="dlg.statement" title="陈述申辩 / 听证" width="600px">
       <el-form label-width="110px">
         <el-form-item label="陈述申辩内容"><el-input v-model="statementForm.statement" type="textarea" :rows="4" /></el-form-item>
+        <el-form-item v-if="statementForm.deliveryRequired && statementForm.statement.trim() && statementForm.statement !== statementSnapshot.statement" label="申辩收到日期">
+          <el-date-picker v-model="statementForm.statementReceivedAt" type="date" value-format="YYYY-MM-DD" />
+        </el-form-item>
         <el-form-item label="复核意见"><el-input v-model="statementForm.statementReview" type="textarea" :rows="3" placeholder="成立的应当采纳；不得因陈述申辩加重处罚" /></el-form-item>
         <el-form-item label="明确放弃">
-          <el-switch v-model="statementForm.statementWaived" />
+          <el-switch v-model="statementForm.statementWaived" :disabled="statementSnapshot.statementWaived" />
           <div class="hint">当事人明确表示放弃陈述申辩的，勾选后可在期限届满前作出决定（须另有书面/笔录佐证）</div>
         </el-form-item>
+        <el-form-item v-if="statementForm.deliveryRequired && statementForm.statementWaived && !statementSnapshot.statementWaived" label="放弃凭据">
+          <el-input v-model="statementForm.statementWaiverReference" maxlength="500" />
+        </el-form-item>
         <el-form-item label="申请听证"><el-switch v-model="statementForm.hearingRequested" /></el-form-item>
+        <el-form-item v-if="statementForm.deliveryRequired && statementForm.hearingRequested && !statementSnapshot.hearingRequested" label="申请收到日期">
+          <el-date-picker v-model="statementForm.hearingRequestedAt" type="date" value-format="YYYY-MM-DD" />
+        </el-form-item>
+        <el-form-item v-if="statementForm.deliveryRequired && !statementForm.hearingRequested && statementSnapshot.hearingRequested" label="撤回凭据">
+          <el-input v-model="statementForm.hearingWithdrawalReference" maxlength="500" />
+        </el-form-item>
         <el-form-item label="听证日期">
           <span>{{ statementForm.hearingHeldAt || '尚未举行' }}（由听证举行记录生成）</span>
         </el-form-item>
@@ -952,6 +985,7 @@
         <el-form-item label="送达日期"><el-date-picker v-model="docDeliverForm.deliveredAt" type="date" value-format="YYYY-MM-DD" /></el-form-item>
         <el-form-item label="受送达人"><el-input v-model="docDeliverForm.receiver" /></el-form-item>
         <el-form-item label="回证编号"><el-input v-model="docDeliverForm.receiptNo" /></el-form-item>
+        <p v-if="docDeliverForm.noticeId" class="hint">请填写本版本已经实际生效的送达日期。采用公告方式时，填写实际期满生效日。</p>
       </el-form>
       <template #footer>
         <el-button @click="dlg.docDeliver = false">取消</el-button>
@@ -1079,6 +1113,7 @@ import DeliveryReceiptsPanel from '../../components/DeliveryReceiptsPanel.vue'
 import JurisdictionSummary from '../../components/JurisdictionSummary.vue'
 import { emptyJurisdiction, serializeJurisdiction, jurisdictionError, canEditJurisdiction } from '../../api/jurisdiction'
 import PreflightChecklist from '../../components/PreflightChecklist.vue'
+import WorkdayCoverageNotice from '../../components/WorkdayCoverageNotice.vue'
 import { createPreflightCheck, type PreflightState } from '../../api/preflight'
 import client, { LARGE_TRANSFER } from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
@@ -1224,7 +1259,7 @@ let applyDisposed = false
 function invalidateApplyContext() { applyContextGeneration++ }
 watch(() => dlg.apply, visible => { if (!visible) invalidateApplyContext() }, { flush: 'sync' })
 onUnmounted(() => { applyDisposed = true; invalidateApplyContext() })
-const docDeliverForm = reactive<any>({ documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
+const docDeliverForm = reactive<any>({ documentId: null, noticeId: null, title: '', docKind: 'OTHER', method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
 const deliveringDocument = ref(false)
 let deliveryDraftGeneration = 0
 watch(() => dlg.docDeliver, () => { deliveryDraftGeneration++ }, { flush: 'sync' })
@@ -1242,7 +1277,7 @@ function openReviewSnapshot(row: MaterialReview) {
 }
 
 const installmentForm = reactive<any>({ seq: 1, dueAt: '', amount: 0, kind: 'FINE' })
-const hearingForm = reactive<any>({ announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
+const hearingForm = reactive<any>({ noticeId: null, announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
 const attachments = ref<any[]>([])
 const timeline = ref<any[]>([])
 const installments = ref<any[]>([])
@@ -1256,16 +1291,31 @@ const officerForm = reactive({ name: '', certNo: '', duty: 'MEMBER' })
 const evidenceForm = reactive({ type: 'DOCUMENT', name: '', source: '', obtainedAt: todayLocal(), keeper: '', note: '', registerHold: false, sealed: false })
 const documentForm = reactive<any>({ docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false, dueAt: null })
 const exclusionForm = reactive({ reason: 'APPRAISE', startAt: todayLocal(), endAt: todayLocal(), note: '' })
-const noticeForm = reactive<any>({ content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '' })
+const currentNotice = computed(() => detail.value.notices?.[0])
+function noticeReceipt(noticeId: number | string) {
+  return detail.value.deliveries?.find((receipt: any) => receipt.notice_id != null && String(receipt.notice_id) === String(noticeId))
+}
+const currentNoticeReceipt = computed(() => noticeReceipt(currentNotice.value?.id))
+const noticeForm = reactive({ content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '', requireDelivery: true, previousNoticeId: null as number | null })
 const notifying=ref(false)
 function openNotice() {
   if(!canWriteCase.value || notifying.value || !['REPORTED','NOTIFIED'].includes(c.value.status))return
-  const previous=detail.value.notices?.[0]
-  Object.assign(noticeForm,{content:previous?.content||'',proposedFine:Number(previous?.proposed_fine||0),
-    proposedRecoup:Number(previous?.proposed_recoup||0),proposedConfiscate:Number(previous?.proposed_confiscate||0),changeReason:''})
+  const previous = currentNotice.value
+  Object.assign(noticeForm, {
+    content: previous?.content || '', proposedFine: Number(previous?.proposedFine || 0),
+    proposedRecoup: Number(previous?.proposedRecoup || 0), proposedConfiscate: Number(previous?.proposedConfiscate || 0),
+    changeReason: '', previousNoticeId: previous?.id ?? null,
+  })
   dlg.notice=true
 }
-const statementForm = reactive<any>({ statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null, statementWaived: false })
+function emptyStatementForm() {
+  return {
+    noticeId: null, deliveryRequired: false, statement: '', statementReview: '', hearingRequested: false,
+    hearingHeldAt: null, statementWaived: false, statementReceivedAt: null, hearingRequestedAt: null,
+    hearingWithdrawalReference: '', statementWaiverReference: '',
+  }
+}
+const statementForm = reactive<any>(emptyStatementForm())
 /** 打开弹窗时的回填快照，提交时据此只发改动过的字段 */
 let statementSnapshot: any = { ...statementForm }
 const meetingForm = reactive({ heldAt: todayLocal(), attendees: '', record: '', conclusion: '' })
@@ -1488,7 +1538,17 @@ async function onVerifyDoc(row: any) {
 function onDeliverDoc(row: any) {
   if (!canWriteCase.value) return
   if (materialDisposed || deliveringDocument.value) return
-  Object.assign(docDeliverForm, { documentId: row.id, title: row.title, docKind: row.doc_type, method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
+  Object.assign(docDeliverForm, { documentId: row.id, noticeId: null, title: row.title, docKind: row.doc_type, method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
+  dlg.docDeliver = true
+}
+
+function onDeliverNotice() {
+  const notice = currentNotice.value
+  if (!canWriteCase.value || deliveringDocument.value || !notice?.deliveryRequired || currentNoticeReceipt.value) return
+  Object.assign(docDeliverForm, {
+    documentId: null, noticeId: notice.id, title: `处罚告知 #${notice.id}`, docKind: 'NOTICE',
+    method: 'DIRECT', deliveredAt: '', receiver: '', receiptNo: '',
+  })
   dlg.docDeliver = true
 }
 
@@ -1496,6 +1556,10 @@ async function onDocDeliverSubmit() {
   if (!canWriteCase.value) return
   if (materialDisposed || deliveringDocument.value || !dlg.docDeliver) return
   const context = captureMaterialContext(), draft = deliveryDraftGeneration, payload = { ...docDeliverForm }
+  if (payload.noticeId && (!payload.deliveredAt || !payload.receiver.trim() || !payload.receiptNo.trim())) {
+    ElMessage.warning('请填写实际送达日期、受送达人和回证编号')
+    return
+  }
   deliveringDocument.value = true
   try {
     await client.post(`/bureau/cases/${context.caseId}/doc-deliveries`, payload)
@@ -1961,26 +2025,20 @@ async function onNotify() {
   } finally {notifying.value=false}
 }
 
-/**
- * 打开前必须从最新告知记录回填。后端 recordStatement 是"null 才不修改"的偏更新语义，
- * 而本弹窗此前恒以空白初值打开并整表提交：
- *  - 发 hearingRequested:false 会把当事人已申请的听证静默改成"未申请"，
- *    之后既排不了期（2039），decide() 的 2075 守卫也随之失效；
- *  - 发 statement:"" 是非 null，2076 守卫判的是 getStatement()==null，一次空白保存即解除
- *    "陈述申辩期届满前不得作出处罚决定"；且此后任何保存都会撞 2046，复核意见再也补不上。
- */
 function openStatement() {
   if (!canWriteCase.value) return
-  const n = detail.value?.notices?.[0] || {}
-  // notices 来自 noticeRepository（JPA 实体，Jackson 输出驼峰），
-  // 与 hearings/deliveries 那些走 json_agg 的蛇形列不同——上一版这里读了蛇形键，
-  // 四个字段恒为 undefined：回填全空、快照全假，"取消勾选听证申请"永远提交不上去
-  Object.assign(statementForm, {
+  const n = currentNotice.value
+  if (!n || n.deliveryRequired && !currentNoticeReceipt.value) return
+  Object.assign(statementForm, emptyStatementForm(), {
+    noticeId: n.id,
+    deliveryRequired: n.deliveryRequired,
     statement: n.statement ?? '',
     statementReview: n.statementReview ?? '',
     hearingRequested: n.hearingRequested ?? false,
     hearingHeldAt: n.hearingHeldAt ?? null,
     statementWaived: n.statementWaived ?? false,
+    statementReceivedAt: n.statementReceivedAt ?? null,
+    hearingRequestedAt: n.hearingRequestedAt ?? null,
   })
   statementSnapshot = { ...statementForm }
   dlg.statement = true
@@ -1988,6 +2046,7 @@ function openStatement() {
 
 async function onStatement() {
   if (!canWriteCase.value) return
+  const caseId = id.value, noticeId = statementForm.noticeId
   // 只发真正被改动的字段，未改动的一律发 null（后端语义＝不修改）。
   // 不能简单地"只发真值"：那样取消勾选听证申请就永远提交不上去。
   const body: any = {}
@@ -1995,13 +2054,21 @@ async function onStatement() {
     const v = (statementForm as any)[k]
     if (v === (statementSnapshot as any)[k]) { body[k] = null; continue }
     // 空串归一为 null：否则等于向后端声明"当事人已陈述申辩"
-    body[k] = v === '' ? null : v
+    body[k] = typeof v === 'string' && !v.trim() ? null : v
   }
   if (Object.values(body).every((v) => v === null)) {
     ElMessage.info('没有需要保存的改动')
     return
   }
-  await client.post(`/bureau/cases/${id.value}/statement`, body)
+  if (noticeId != null) body.noticeId = noticeId
+  if (statementForm.deliveryRequired) {
+    if (body.statement) body.statementReceivedAt = statementForm.statementReceivedAt
+    if (body.hearingRequested === true) body.hearingRequestedAt = statementForm.hearingRequestedAt
+    if (body.hearingRequested === false) body.hearingWithdrawalReference = statementForm.hearingWithdrawalReference
+    if (body.statementWaived === true) body.statementWaiverReference = statementForm.statementWaiverReference
+  }
+  await client.post(`/bureau/cases/${caseId}/statement`, body)
+  if (caseId !== id.value || noticeId !== statementForm.noticeId) return
   ElMessage.success('已保存')
   dlg.statement = false
   load()
@@ -2079,7 +2146,7 @@ async function saveCourtResult() {
 }
 function openUrgeDelivery() {
   if (!canWriteCase.value) return
-  Object.assign(docDeliverForm, { documentId: null, title: '催告书', docKind: 'URGE_LETTER', method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
+  Object.assign(docDeliverForm, { documentId: null, noticeId: null, title: '催告书', docKind: 'URGE_LETTER', method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
   dlg.docDeliver = true
 }
 async function onCourtEnforce() {
@@ -2087,6 +2154,16 @@ async function onCourtEnforce() {
   await client.post(`/bureau/cases/${id.value}/court-enforce`)
   ElMessage.success('已登记申请法院强制执行')
   load()
+}
+
+function openHearing() {
+  const notice = currentNotice.value
+  if (!canWriteCase.value || !notice?.hearingRequested || notice.deliveryRequired && !currentNoticeReceipt.value) return
+  Object.assign(hearingForm, {
+    noticeId: notice.id, announcedAt: null, noticeSentAt: notice.deliveryRequired ? '' : todayLocal(),
+    scheduledAt: '', host: '', hostDept: '', recorder: '',
+  })
+  dlg.hearing = true
 }
 
 async function onScheduleHearing() {
@@ -2280,17 +2357,17 @@ function resetCaseLocalForms() {
   Object.values(FORM_RESETS).forEach((reset) => reset())
   // 复位对象必须与 759-764 行的初值逐字段对齐：漏掉 statementWaived 会把 A 案的"明确放弃陈述申辩"
   // 带进 B 案，一次误提交就在 B 案案卷里写下当事人放弃陈述申辩的假事实并解除 2076 守卫
-  Object.assign(noticeForm, { content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '' })
-  Object.assign(statementForm, { statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null, statementWaived: false })
+  Object.assign(noticeForm, { content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '', previousNoticeId: null })
+  Object.assign(statementForm, emptyStatementForm())
   Object.assign(decisionForm, { decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '', penaltyBasis: '' })
   Object.assign(deliveryForm, { method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', note: '', receiptNo: '', receiptSignedAt: null })
   Object.assign(reliefForm, { deadline: '', pending: false, basis: '', deferUntil: null })
   Object.assign(courtResultForm, { status: 'ACCEPTED', receiptNo: '', receivedAt: '', note: '' })
   Object.assign(reviewForm, { reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
   Object.assign(installmentForm, { seq: 1, dueAt: '', amount: 0, kind: 'FINE' })
-  Object.assign(hearingForm, { announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
+  Object.assign(hearingForm, { noticeId: null, announcedAt: null, noticeSentAt: todayLocal(), scheduledAt: '', host: '', hostDept: '', recorder: '' })
   Object.assign(applyForm, { kind: 'EXTEND', days: 30, reason: '' })
-  Object.assign(docDeliverForm, { documentId: null, title: '', docKind: 'OTHER', method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
+  Object.assign(docDeliverForm, { documentId: null, noticeId: null, title: '', docKind: 'OTHER', method: 'DIRECT', deliveredAt: todayLocal(), receiver: '', receiptNo: '' })
   Object.assign(eConsentForm, { receiver: '', channel: '', docNo: '' })
   reportContent.value = ''
   violationFinding.value = emptyViolationFinding()

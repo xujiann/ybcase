@@ -28,7 +28,7 @@ function fixture(t, kind) {
   const file = kind === 'holidays' ? 'HolidaysView.vue' : 'TemplatesView.vue'
   const source = readFileSync(new URL('../src/views/system/' + file, import.meta.url), 'utf8')
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .+\r?\n/gm, '')
-  const exposed = kind === 'holidays' ? 'load,onAdd,onDelete,onBatch,rows,loading,year,missingYears,form,batchVisible,batchText,batchError,batchSubmitting'
+  const exposed = kind === 'holidays' ? 'load,onAdd,onDelete,onBatch,rows,loading,year,missingYears,form,batchVisible,batchText,batchError,batchSubmitting,openPreview,loadPreview,previewVisible,preview,previewFailed'
     : 'load,openEdit,onSave,openHistory,clearHistory,rows,loading,listFailed,form,saving,editVisible,history,historyVisible,historyType'
   const scope = Vue.effectScope(), listeners = new Map()
   const view = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) + ';({' + exposed + ',expireView:typeof onSessionExpired === "function" ? onSessionExpired : ()=>{}})', {
@@ -110,6 +110,35 @@ test('holidays: rows are committed only with successful coverage', async t => {
   assert.equal(f.rows.value.length, 0)
   f.reads.find(read => !read.done && read.url.endsWith('/coverage')).reject(new Error('coverage offline'))
   await job.catch(() => {}); assert.equal(f.rows.value.length, 0); assert.equal(f.loading.value, false)
+})
+test('holidays: deadline preview pages use the newest read and require the current administrator', async t => {
+  const f = fixture(t, 'holidays')
+  f.openPreview()
+  const second = f.loadPreview(2)
+  assert.deepEqual(f.reads.map(r => [r.url, r.config.params.page]), [
+    ['/bureau/holidays/deadline-preview', 1], ['/bureau/holidays/deadline-preview', 2],
+  ])
+  f.reads[1].resolve({ rows: [], total: 50, page: 2, size: 25 }); await second
+  f.reads[0].resolve({ rows: [], total: 50, page: 1, size: 25 }); await tick()
+  assert.equal(f.preview.value.page, 2)
+  const late = f.loadPreview(1)
+  f.auth.user.roles = ['HANDLER']
+  assert.equal(f.previewVisible.value, false)
+  f.reads[2].resolve({ rows: [{ referenceNo: 'private' }], page: 1 }); await late
+  assert.equal(f.preview.value, null)
+  f.openPreview()
+  assert.equal(f.reads.length, 3)
+  assert.equal(f.writes.length, 0)
+})
+test('holidays: calendar maintenance invalidates an open deadline preview', async t => {
+  const f = fixture(t, 'holidays')
+  f.openPreview()
+  Object.assign(f.form, holiday())
+  const add = f.onAdd()
+  f.reads[0].resolve({ rows: [{ referenceNo: 'before import' }], page: 1 }); await tick()
+  assert.equal(f.previewVisible.value, false)
+  assert.equal(f.preview.value, null)
+  f.writes[0].resolve({}); await finishReads(f, add)
 })
 test('holidays: adding is single-flight and snapshots form values', async t => {
   const f = fixture(t, 'holidays'); Object.assign(f.form, holiday())

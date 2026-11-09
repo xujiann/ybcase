@@ -24,6 +24,7 @@ public class SupplementBundleService {
  private final ObjectMapper mapper;
  private final SignatureProvider signatures;
  private final RuntimePolicy runtime;
+ private final BureauConfig config;
  public record FileData(String filename,String contentType,byte[] bytes,String sha256) {}
  private static final String FILES="select id,filename,content_type,size_bytes,sha256,uploaded_by,uploaded_at from case_supplement_file where bundle_id=? order by id";
  @Transactional(readOnly=true,isolation=Isolation.REPEATABLE_READ)
@@ -47,7 +48,7 @@ public class SupplementBundleService {
      union all select case b.status when 'APPROVED' then '材料复核通过' when 'WITHDRAWN' then '材料撤回' else '材料复核退回' end,b.reviewed_at,b.title,b.opinion,b.reviewed_by from case_supplement_bundle b where b.case_id=? and b.reviewed_at is not null
      union all select '后续文书制作',d.created_at,d.title,'补充卷文书，原卷保持封存',d.created_by from case_supplement_document d where d.case_id=?
      union all select '后续文书签章',s.signed_at,d.title,'签章提供者：'||s.provider,s.signer from case_supplement_signature s join case_supplement_document d on d.id=s.document_id where d.case_id=?
-     union all select '后续文书送达',s.recorded_at,d.title,s.receipt_no||'；实际送达日 '||s.delivered_at,s.recorded_by from case_supplement_delivery s join case_supplement_document d on d.id=s.document_id where d.case_id=?
+     union all select '后续文书送达',s.recorded_at,d.title,s.receipt_no||'；送达生效日 '||s.delivered_at,s.recorded_by from case_supplement_delivery s join case_supplement_document d on d.id=s.document_id where d.case_id=?
      union all select '续办申请',r.requested_at,'续办编号 '||r.id,r.reason,r.requested_username from case_continuation_request r where r.case_id=?
      union all select case r.status when 'APPROVED' then '续办批准' when 'CANCELLED' then '续办撤回' else '续办退回' end,r.reviewed_at,'续办编号 '||r.id,r.opinion,r.reviewed_username from case_continuation_request r where r.case_id=? and r.reviewed_at is not null
    ) events order by event_time,reference
@@ -153,16 +154,41 @@ public class SupplementBundleService {
  }
  @Transactional
  public long recordDelivery(long caseId,long documentId,Map<String,Object> body,String username) {
-  CaseGuards.lock(jdbc,caseId);bureau(access.requireCaseWriter(caseId,username));deliveryDocument(caseId,documentId);
+  CaseGuards.lock(jdbc,caseId);bureau(access.requireCaseWriter(caseId,username));var document=deliveryDocument(caseId,documentId);
   String method=text(string(body,"method"),24,"送达方式");if(!Set.of("DIRECT","POST","LEAVE","ANNOUNCE","OTHER").contains(method))throw invalid("电子回执须通过专用送达链登记");
-  LocalDate day;try{day=LocalDate.parse(string(body,"deliveredAt"));}catch(Exception ex){throw invalid("须填写实际送达日期");}
-  if(day.isAfter(LocalDate.now())||day.getYear()<1)throw invalid("实际送达日期无效");
-  return insertDelivery(documentId,method,day,text(string(body,"receiver"),64,"受送达人"),text(string(body,"receiptNo"),64,"回证号"),humanText(string(body,"sourceReference"),1000,"回证出处"),username);
+  boolean announcement="ANNOUNCE".equals(method);
+  String dateLabel=announcement?"公告发布日期":"实际送达日期";
+  LocalDate day;try{day=LocalDate.parse(string(body,announcement?"announcedAt":"deliveredAt"));}catch(Exception ex){throw invalid("须填写"+dateLabel);}
+  if(day.isAfter(ExecutionDeadlines.today())||day.getYear()<1)throw invalid(dateLabel+"无效");
+  if(document.get("decision_version_id") instanceof Number version) {
+   java.sql.Date effective=jdbc.queryForObject("select effective_at from case_decision_version where id=? and case_id=?",
+           java.sql.Date.class,version.longValue(),caseId);
+   if(day.isBefore(effective.toLocalDate()))throw invalid(dateLabel+"不得早于对应决定版本生效日");
+  }
+  LocalDate delivered=announcement?day.plusDays(config.intVal("announce_deliver_days",60)):day;
+  return insertDelivery(documentId,method,delivered,text(string(body,"receiver"),64,"受送达人"),
+          text(string(body,"receiptNo"),64,"回证号"),humanText(string(body,"sourceReference"),1000,"回证出处"),username,
+          announcement?day:null);
  }
  long insertDelivery(long doc,String method,LocalDate day,String receiver,String receipt,String ref,String username) {
+  return insertDelivery(doc,method,day,receiver,receipt,ref,username,null);
+ }
+ private long insertDelivery(long doc,String method,LocalDate day,String receiver,String receipt,String ref,String username,
+                             LocalDate announcedAt) {
   var old=jdbc.queryForList("select * from case_supplement_delivery where document_id=? and receipt_no=?",doc,receipt);
-  if(!old.isEmpty()){var r=old.getFirst();if(!Objects.equals(r.get("method"),method)||!Objects.equals(((java.sql.Date)r.get("delivered_at")).toLocalDate(),day)||!Objects.equals(r.get("receiver"),receiver)||!Objects.equals(r.get("source_reference"),ref))throw invalid("回证号已用于其他送达内容");return number(r.get("id"));}
-  return jdbc.queryForObject("insert into case_supplement_delivery(document_id,method,delivered_at,receiver,receipt_no,source_reference,recorded_by) values(?,?,?,?,?,?,?) returning id",Long.class,doc,method,day,receiver,receipt,ref,username);
+  if(!old.isEmpty()){
+   var row=old.getFirst();
+   boolean sameDate=announcedAt==null
+           ? row.get("announced_at")==null && java.sql.Date.valueOf(day).equals(row.get("delivered_at"))
+           : java.sql.Date.valueOf(announcedAt).equals(row.get("announced_at"));
+   if(!sameDate||!Objects.equals(row.get("method"),method)||!Objects.equals(row.get("receiver"),receiver)
+           ||!Objects.equals(row.get("source_reference"),ref))throw invalid("回证号已用于其他送达内容");
+   return number(row.get("id"));
+  }
+  return jdbc.queryForObject("""
+          insert into case_supplement_delivery(document_id,method,delivered_at,receiver,receipt_no,source_reference,recorded_by,announced_at)
+          values(?,?,?,?,?,?,?,?) returning id
+          """,Long.class,doc,method,day,receiver,receipt,ref,username,announcedAt);
  }
  @Transactional
  public void consent(long caseId,long documentId,Map<String,Object> body,String username) {

@@ -31,6 +31,10 @@ public class CaseContinuationController {
     public R<?> remedy(@PathVariable long caseId,@RequestBody byte[] bytes,Authentication auth) {
         return R.ok(Map.of("id",service.registerRemedy(caseId,body(bytes),auth.getName())));
     }
+    @PostMapping("/execution-basis") @PreAuthorize("hasAnyRole('LEGAL','LEADER')")
+    public R<?> executionBasis(@PathVariable long caseId,@RequestBody byte[] bytes,Authentication auth) {
+        return R.ok(Map.of("id",service.registerExecutionBasis(caseId,body(bytes),auth.getName())));
+    }
     @PostMapping("/requests") @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     public R<?> request(@PathVariable long caseId,@RequestBody byte[] bytes,Authentication auth) {
         return R.ok(Map.of("id",service.request(caseId,body(bytes),auth.getName())));

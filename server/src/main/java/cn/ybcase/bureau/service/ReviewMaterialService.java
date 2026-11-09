@@ -95,6 +95,21 @@ public class ReviewMaterialService {
                 select id,host,host_dept,recorder,record,opinion from case_hearing
                 where case_id=? and status in ('HELD','OPINION_DONE')
                   and coalesce(btrim(record),'')<>'' order by id""", caseId));
+        var noticeProcedures = jdbc.queryForList("""
+                select n.id as notice_id,n.notified_at,n.statement_deadline,n.statement_received_at,n.statement_waived,
+                       n.hearing_entitled,n.hearing_requested,n.hearing_requested_at,n.hearing_request_deadline,
+                       d.id as delivery_id,d.method,d.delivered_at,d.receipt_no,d.receipt_signed_at,d.receiver
+                from case_notice n left join case_delivery d on d.notice_id=n.id
+                where n.case_id=? and n.delivery_required order by n.id""", caseId);
+        if (!noticeProcedures.isEmpty()) {
+            bundle.put("noticeProcedures", noticeProcedures);
+            bundle.put("noticeProcedureEvents", jdbc.queryForList("""
+                    select notice_id,event_type,reference,recorded_by,recorded_at
+                    from case_notice_procedure_event where case_id=? order by id""", caseId));
+            bundle.put("noticeHearingLinks", jdbc.queryForList("""
+                    select id,notice_id,notice_sent_at,scheduled_at,held_at,status
+                    from case_hearing where case_id=? and notice_id is not null order by id""", caseId));
+        }
         bundle.put("expertReviews", jdbc.queryForList("""
                 select id,experts,opinion from expert_review
                 where case_id=? and ended_at is not null and coalesce(btrim(opinion),'')<>'' order by id""", caseId));

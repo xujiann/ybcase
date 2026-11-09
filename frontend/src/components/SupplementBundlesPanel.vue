@@ -33,7 +33,7 @@
         <el-table-column type="expand"><template #default="{row}"><h4>{{ row.title }}</h4><pre>{{ row.content }}</pre>
           <p>关联决定版本：{{ row.decision_version_id || '—' }}　材料包：{{ row.bundle_id }}</p>
           <el-table :data="row.signatures" border size="small"><el-table-column prop="signer" label="签章人" /><el-table-column label="签章性质"><template #default="{row:sig}"><el-tag :type="sig.provider==='MOCK'?'warning':'success'">{{ sig.provider==='MOCK'?'模拟摘要签章':sig.provider }}</el-tag></template></el-table-column><el-table-column prop="content_hash" label="正文摘要" show-overflow-tooltip /></el-table>
-          <h4>本版本送达记录</h4><el-table :data="row.deliveries" border size="small"><el-table-column prop="method" label="方式" /><el-table-column prop="delivered_at" label="实际日期" /><el-table-column prop="receiver" label="受送达人" /><el-table-column prop="receipt_no" label="回证号" /><el-table-column prop="source_reference" label="回证材料出处" /></el-table>
+          <h4>本版本送达记录</h4><el-table :data="row.deliveries" border size="small"><el-table-column prop="method" label="方式" /><el-table-column prop="announced_at" label="公告发布日期" /><el-table-column prop="delivered_at" label="送达生效日" /><el-table-column prop="receiver" label="受送达人" /><el-table-column prop="receipt_no" label="回证号" /><el-table-column prop="source_reference" label="回证材料出处" /></el-table>
           <p v-if="row.consents.length">最新同意受送达人：{{ row.consents[0].receiver }}；地址：{{ row.consents[0].channel }}；材料出处：{{ row.consents[0].source_reference }}</p>
         </template></el-table-column>
         <el-table-column prop="id" label="文书编号" width="90" /><el-table-column prop="title" label="后续文书" />
@@ -74,7 +74,12 @@
     <el-dialog v-model="actionVisible" :title="actionMode==='consent'?'核实本版本电子送达同意地址':'登记本版本实际送达'" width="620px" :show-close="!busy" :close-on-click-modal="!busy">
       <el-form label-width="100px" :disabled="busy"><el-form-item label="受送达人" required><el-input v-model="actionForm.receiver" maxlength="64" /></el-form-item>
         <el-form-item v-if="actionMode==='consent'" label="同意地址" required><el-input v-model="actionForm.channel" maxlength="500" /></el-form-item>
-        <template v-else><el-form-item label="实际方式"><el-select v-model="actionForm.method"><el-option v-for="(label,key) in methods" :key="key" :value="key" :label="label" /></el-select></el-form-item><el-form-item label="实际日期" required><el-date-picker v-model="actionForm.deliveredAt" value-format="YYYY-MM-DD" /></el-form-item><el-form-item label="回证号" required><el-input v-model="actionForm.receiptNo" maxlength="64" /></el-form-item></template>
+        <template v-else>
+          <el-form-item label="实际方式"><el-select v-model="actionForm.method"><el-option v-for="(label,key) in methods" :key="key" :value="key" :label="label" /></el-select></el-form-item>
+          <el-form-item :label="actionForm.method==='ANNOUNCE'?'公告发布日期':'实际送达日期'" required><el-date-picker v-model="actionForm.deliveryDate" value-format="YYYY-MM-DD" /></el-form-item>
+          <p v-if="actionForm.method==='ANNOUNCE'">平台按公告发布日期和配置期限计算送达生效日。</p>
+          <el-form-item label="回证号" required><el-input v-model="actionForm.receiptNo" maxlength="64" /></el-form-item>
+        </template>
         <el-form-item label="材料出处" required><el-input v-model="actionForm.sourceReference" maxlength="1000" type="textarea" /></el-form-item>
       </el-form><template #footer><el-button :disabled="busy" @click="actionVisible=false">取消</el-button><el-button :loading="busy" type="primary" @click="saveDocumentAction">保存实际资料</el-button></template>
     </el-dialog>
@@ -100,7 +105,7 @@ const focusedBundle=computed(()=>data.value?.bundles.find(row=>row.id===focusId.
 const createVisible=ref(false),documentVisible=ref(false),opinionVisible=ref(false),actionVisible=ref(false)
 const selectedBundle=ref<Bundle>(),selectedDoc=ref<Doc>(),opinion=ref(''),operation=ref<'approve'|'reject'|'withdraw'>('approve')
 const createForm=reactive({title:'',sourceReference:''}),docForm=reactive({docType:'OTHER',title:'',content:'',decisionVersionId:undefined as number|undefined})
-const actionMode=ref<'consent'|'deliver'>('deliver'),actionForm=reactive({receiver:'',channel:'',method:'DIRECT',deliveredAt:localDate(),receiptNo:'',sourceReference:''})
+const actionMode=ref<'consent'|'deliver'>('deliver'),actionForm=reactive({receiver:'',channel:'',method:'DIRECT',deliveryDate:localDate(),receiptNo:'',sourceReference:''})
 const statuses:Record<string,string>={DRAFT:'草稿',PENDING:'待复核',APPROVED:'已批准',REJECTED:'已退回',WITHDRAWN:'已撤回'}
 const docTypes:Record<string,string>={DECISION:'后续决定',NOTICE:'后续告知',URGE_LETTER:'催告文书',COURT_RECEIPT:'法院回执',OTHER:'其他文书'}
 const methods:Record<string,string>={DIRECT:'直接送达',POST:'邮寄送达',LEAVE:'留置送达',ANNOUNCE:'公告送达',OTHER:'其他实际方式'}
@@ -151,8 +156,19 @@ function openDocument(row:Bundle){if(!writer.value||busy.value||!liveBundle(row)
 function selectVersion(){if(docForm.docType!=='DECISION')return;const version=data.value?.decisionVersions.find(v=>v.id===docForm.decisionVersionId);docForm.content=version?.content||'';if(version)docForm.title=version.decision_no}
 async function createDocument(){const row=selectedBundle.value;if(!row||!writer.value||busy.value||!documentVisible.value||!liveBundle(row)||row.status!=='APPROVED')return;if(!docForm.title.trim()||!docForm.content.trim()||docForm.docType==='DECISION'&&!docForm.decisionVersionId){ElMessage.warning('请填写后续文书，决定文书须选择具体结果版本');return}documentKey ||= crypto.randomUUID();await mutate(base()+'/'+row.id+'/documents',{...docForm,requestKey:documentKey},()=>{documentVisible.value=false;documentKey='';ElMessage.success('后续文书已独立保存')})}
 async function sign(row:Doc){if(writer.value&&!busy.value&&liveDoc(row))await mutate(base()+'/documents/'+row.id+'/sign',{},v=>ElMessage.success(v.provider==='MOCK'?'已作模拟摘要签章，不能替代正式CA签章':'已签章：'+v.provider))}
-function openDocumentAction(row:Doc,mode:'deliver'|'consent'){if(!writer.value||busy.value||!liveDoc(row))return;selectedDoc.value=row;actionMode.value=mode;Object.assign(actionForm,{receiver:'',channel:'',method:'DIRECT',deliveredAt:localDate(),receiptNo:'',sourceReference:''});actionVisible.value=true}
-async function saveDocumentAction(){const doc=selectedDoc.value;if(!doc||!writer.value||busy.value||!actionVisible.value||!liveDoc(doc))return;const consent=actionMode.value==='consent';if(!actionForm.receiver.trim()||!actionForm.sourceReference.trim()||(consent?!actionForm.channel.trim():!actionForm.receiptNo.trim()||!actionForm.deliveredAt||actionForm.deliveredAt>localDate())){ElMessage.warning('请核对实际地址、日期、回证及材料出处');return}const body=consent?{receiver:actionForm.receiver,channel:actionForm.channel,sourceReference:actionForm.sourceReference}:{receiver:actionForm.receiver,method:actionForm.method,deliveredAt:actionForm.deliveredAt,receiptNo:actionForm.receiptNo,sourceReference:actionForm.sourceReference};await mutate(base()+'/documents/'+doc.id+'/'+actionMode.value,body,()=>{actionVisible.value=false;ElMessage.success('本版本实际资料已记录')})}
+function openDocumentAction(row:Doc,mode:'deliver'|'consent'){if(!writer.value||busy.value||!liveDoc(row))return;selectedDoc.value=row;actionMode.value=mode;Object.assign(actionForm,{receiver:'',channel:'',method:'DIRECT',deliveryDate:localDate(),receiptNo:'',sourceReference:''});actionVisible.value=true}
+async function saveDocumentAction(){
+ const doc=selectedDoc.value
+ if(!doc||!writer.value||busy.value||!actionVisible.value||!liveDoc(doc))return
+ const {receiver,channel,method,deliveryDate,receiptNo,sourceReference}=actionForm
+ const consent=actionMode.value==='consent'
+ if(!receiver.trim()||!sourceReference.trim()||(consent?!channel.trim():!receiptNo.trim()||!deliveryDate||deliveryDate>localDate())){
+  ElMessage.warning('请核对实际地址、日期、回证及材料出处');return
+ }
+ const dateField=method==='ANNOUNCE'?'announcedAt':'deliveredAt'
+ const body=consent?{receiver,channel,sourceReference}:{receiver,method,[dateField]:deliveryDate,receiptNo,sourceReference}
+ await mutate(base()+'/documents/'+doc.id+'/'+actionMode.value,body,()=>{actionVisible.value=false;ElMessage.success('本版本实际资料已记录')})
+}
 async function electronic(row:Doc){if(!writer.value||busy.value||!liveDoc(row)||!row.consents.length)return;const key=electronicKeys.get(row.id)||crypto.randomUUID();electronicKeys.set(row.id,key);await mutate(`/bureau/cases/${props.caseId}/electronic-deliveries/supplements`,{documentId:row.id,requestKey:key},value=>ElMessage.success('电子发送记录 #'+value.id+' 已建立，请在电子回证面板刷新并发送'))}
 async function download(url:string,filename:string,expected?:string){
  if(disposed||!permitted.value||downloading.value)return

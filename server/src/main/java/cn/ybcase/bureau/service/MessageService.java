@@ -105,24 +105,13 @@ public class MessageService {
             administratorAccess.requireCurrentAdmin();
         }
         int ahead = config.intVal("reminder_days_ahead", 5);
-        String today = LocalDate.now().toString();
+        LocalDate currentDay = LocalDate.now();
+        String today = currentDay.toString();
         int n = 0;
 
         // 承办人/登记人已停用时的兜底收件人：全部启用的负责人（只查一次）
         List<String> leaders = enabledLeaders();
-        // 线索核查临期/超期 → 登记人（已停用则转负责人）
-        for (var r : jdbc.queryForList("""
-                select c.id, c.clue_no, c.suspect_name, c.deadline_at, c.created_by, su.enabled
-                from case_clue c left join sys_user su on su.username = c.created_by
-                where c.status = 'PENDING' and c.deadline_at <= current_date + ?::int""", ahead)) {
-            if (r.get("created_by") == null) continue;
-            boolean overdue = ((java.sql.Date) r.get("deadline_at")).toLocalDate().isBefore(LocalDate.now());
-            sendOrEscalate((String) r.get("created_by"), r.get("enabled"), leaders, "登记人", "DEADLINE",
-                    (overdue ? "【超期】" : "【临期】") + "线索核查 " + r.get("clue_no"),
-                    r.get("suspect_name") + "，核查期限 " + r.get("deadline_at"),
-                    "/case/clues", "CLUE-" + r.get("id") + "-" + today);
-            n++;
-        }
+        n += remindClueDeadlines(ahead, currentDay);
         // 办案期限临期/超期 → 承办人（已停用则转负责人）
         for (var r : jdbc.queryForList("""
                 select cf.id, cf.case_no, cf.owner_user, su.enabled,
@@ -195,6 +184,68 @@ public class MessageService {
         }
         log.info("期限提醒生成 {} 条", n);
         return n;
+    }
+
+    private int remindClueDeadlines(int ahead, LocalDate today) {
+        LocalDate horizon = today.plusDays(ahead);
+        var clues = jdbc.queryForList("""
+                select c.id,c.clue_no,c.suspect_name,c.deadline_at,c.owner_dept_id,c.created_by,u.enabled
+                from case_clue c left join sys_user u on u.username=c.created_by
+                where c.status='PENDING' and c.deadline_at<=?
+                  and not exists (select 1 from case_file f where f.clue_id=c.id)
+                order by c.id
+                """, horizon);
+        int count = 0;
+        for (var clue : clues) {
+            long id = ((Number) clue.get("id")).longValue();
+            // Resolve recipient, assignment and organization in one current database statement.
+            var recipients = jdbc.queryForList("""
+                    with candidates as (
+                        select u.username, min(case
+                            when u.username=any(regexp_split_to_array(coalesce(c.handler,''),?)) then 0
+                            when u.username=c.created_by and not exists (
+                                select 1 from department_handoff h where h.clue_id=c.id and h.status='ACCEPTED'
+                            ) then 1
+                            when r.code='LEADER' then 2
+                            when r.code='ADMIN' then 3
+                        end) as priority
+                        from case_clue c cross join sys_user u
+                        left join sys_dept d on d.id=u.dept_id
+                        join sys_user_role ur on ur.user_id=u.id join sys_role r on r.id=ur.role_id
+                        where c.id=? and c.status='PENDING' and c.deadline_at<=?
+                          and not exists (select 1 from case_file f where f.clue_id=c.id)
+                          and u.enabled and r.code in ('HANDLER','LEADER','ADMIN')
+                          and (u.dept_id is null or d.enabled)
+                          and ((c.owner_dept_id is null and u.account_category is distinct from 'DISTRICT')
+                               or (c.owner_dept_id=u.dept_id and d.enabled
+                                   and (d.org_kind is null or d.org_kind=u.account_category)))
+                        group by u.id
+                    )
+                    select username,priority from candidates
+                    where priority=(select min(priority) from candidates)
+                    order by username
+                    """, "[、,，;；\\s]+", id, horizon);
+            String key = "CLUE-" + id + "-" + today;
+            boolean overdue = ((java.sql.Date) clue.get("deadline_at")).toLocalDate().isBefore(today);
+            String baseTitle = (overdue ? "【超期】" : "【临期】") + "线索核查 " + clue.get("clue_no");
+            String baseBody = clue.get("suspect_name") + "，核查期限 " + clue.get("deadline_at");
+            for (var recipient : recipients) {
+                String account = (String) recipient.get("username");
+                boolean fallback = ((Number) recipient.get("priority")).intValue() >= 2;
+                // Keep the historical unowned-source escalation key and title. Both keys
+                // share the same recipient/day deduplication when responsibility changes.
+                boolean legacyInactive = fallback && clue.get("owner_dept_id") == null
+                        && clue.get("created_by") != null && !Boolean.TRUE.equals(clue.get("enabled"));
+                String title = legacyInactive ? "【登记人已停用】" + baseTitle : fallback ? "【待分派】" + baseTitle : baseTitle;
+                String body = fallback ? baseBody + "，请核对当前承办人并办理。" : baseBody;
+                if (Boolean.TRUE.equals(jdbc.queryForObject("""
+                        select exists(select 1 from sys_message where username=? and dedup_key in (?,?))
+                        """, Boolean.class, account, key, key + "-INACTIVE"))) continue;
+                send(account, "DEADLINE", title, body, "/case/clues?focus=" + id, legacyInactive ? key + "-INACTIVE" : key);
+                count++;
+            }
+        }
+        return count;
     }
 
     private int remindAgencyDeadlines(int ahead) {

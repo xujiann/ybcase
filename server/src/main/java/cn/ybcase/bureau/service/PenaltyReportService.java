@@ -122,17 +122,27 @@ public class PenaltyReportService {
                        ) as defer_requested,
                        case when t.current_state and not cf.relief_pending and nullif(btrim(cf.relief_basis), '') is not null
                             then t.cutoff > cf.relief_deadline end as relief_expired,
-                       exists (
+                       case when d.version_id is null then exists (
                            select 1 from case_delivery del join case_document doc on doc.id = del.document_id
                            where del.case_id = cf.id and doc.case_id = cf.id and doc.doc_type = 'URGE_LETTER'
-                                 and del.delivered_at is not null and (t.legacy or del.delivered_at <= t.cutoff)
-                       ) as urged,
+                                 and del.delivered_at <= t.cutoff
+                       ) else exists (
+                           select 1 from case_supplement_delivery del
+                           join case_supplement_document doc on doc.id = del.document_id
+                           join case_supplement_bundle b on b.id = doc.bundle_id and b.case_id = doc.case_id
+                           where doc.case_id = cf.id and doc.decision_version_id = d.version_id
+                                 and doc.doc_type = 'URGE_LETTER' and b.status = 'APPROVED'
+                                 and b.reviewed_at <= least(current_timestamp, statement_timestamp())
+                                 and del.delivered_at between d.effective_at and t.cutoff
+                       ) end as urged,
                        case when exists (
                                 select 1 from case_court_round cr join case_continuation_request cq on cq.id=cr.request_id
-                                where cr.case_id=cf.id and cr.applied_at<=t.cutoff and cq.status='APPROVED'
+                                where cr.case_id=cf.id and cr.decision_version_id is not distinct from d.version_id
+                                  and cr.applied_at between d.effective_at and t.cutoff
+                                  and cq.request_type='COURT_APPLY' and cq.status='APPROVED'
                                   and cq.reviewed_at<=least(current_timestamp,statement_timestamp())
                             ) then true
-                            when t.legacy then cf.court_enforce_applied
+                            when d.version_id is not null then false
                             when cf.court_applied_at is not null then cf.court_applied_at <= t.cutoff
                             when not cf.court_enforce_applied then false
                             when t.current_state then cf.court_enforce_applied end as enforced,

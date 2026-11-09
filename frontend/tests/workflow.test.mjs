@@ -123,7 +123,7 @@ test('read-only checklist users cannot mutate decision or closure even by invoki
 test('filing and filing approval both carry the same jurisdiction snapshot and clue association', async () => {
   for (const leader of [true,false]) {
     const form={partyName:'测试单位',causeId:1,clueId:12,officers:[{name:'甲',certNo:'证1'},{name:'乙',certNo:'证2'}],jurisdiction:{...emptyJurisdiction(),type:'DESIGNATED',basis:' 批复依据 ',designatedNo:' 指定1 '}}
-    const ctx=state({isLeader:{value:leader},submitting:{value:false},form,jurisdictionError,serializeJurisdiction,createVisible:{value:true},router:{push(){}},client:{post:async(...args)=>{ctx.calls.push(args);return {data:{data:{caseNo:'测试案',id:3}}}}}})
+    const ctx=state({isLeader:{value:leader},submitting:{value:false},form,jurisdictionError,serializeJurisdiction,createVisible:{value:true},previousApproval:{value:null},filingRequestKey:()=> 'example-filing-key',auth:{token:'session'},filingDraftGeneration:1,disposed:false,router:{push(){}},client:{post:async(...args)=>{ctx.calls.push(args);return {data:{data:{caseNo:'测试案',id:3}}}}}})
     await handler('case/CasesView.vue','onCreate',ctx)()
     assert.equal(ctx.calls.length,1)
     const payload=leader?ctx.calls[0][1]:ctx.calls[0][1].payload
@@ -131,15 +131,11 @@ test('filing and filing approval both carry the same jurisdiction snapshot and c
     assert.equal(payload.jurisdiction.basis,'批复依据')
     assert.equal(payload.jurisdiction.designatedNo,'指定1')
     assert.notEqual(payload.jurisdiction,form.jurisdiction)
-    if (!leader) assert.equal(ctx.calls[0][1].clueId,12)
+    if (!leader) {
+      assert.equal(ctx.calls[0][1].clueId,12)
+      assert.equal(ctx.calls[0][1].requestKey,'example-filing-key')
+    }
   }
-})
-test('new filing clears jurisdiction draft while preserving explicitly linked clue', () => {
-  const ctx=state({form:{clueId:12,jurisdiction:{type:'DESIGNATED',designatedNo:'旧案'}},emptyJurisdiction,emptyOfficers:()=>[],createVisible:{value:false}})
-  handler('case/CasesView.vue','openCreate',ctx)(true)
-  assert.equal(ctx.form.clueId,12)
-  assert.equal(ctx.form.jurisdiction.type,'PENDING')
-  assert.equal(ctx.form.jurisdiction.designatedNo,'')
 })
 test('opening jurisdiction correction loads current case facts and clears prior reason', () => {
   const ctx=state({canUpdateJurisdiction:{value:true},detail:{value:{jurisdiction:{...emptyJurisdiction(),type:'LOCAL',basis:'当前依据',violationPlace:'当前地点'}}},jurisdictionForm:{jurisdiction:{type:'DESIGNATED'},reason:'旧理由'},serializeJurisdiction})
@@ -270,7 +266,7 @@ test('read-only business roles cannot invoke source, inspection, transfer, rewar
     'system/EnforcersView.vue':['openCreate','onSave'],
   }
   for (const [page,names] of Object.entries(pages)) for (const name of names) {
-    const ctx=state({canOperate:{value:false},isLeader:{value:false},isAdmin:{value:false},canManageClue:()=>false})
+    const ctx=state({canOperate:{value:false},isLeader:{value:false},isAdmin:{value:false},canManageClue:()=>false,showMine:{value:false}})
     await handler(page,name,ctx)({id:1})
     assert.equal(ctx.calls.length,0,`${page}:${name}`)
   }

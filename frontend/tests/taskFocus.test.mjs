@@ -24,13 +24,16 @@ test('focus banner reacts to route changes and supports the independent report q
   view.clearFocus();assert.equal(replacements[0].query.q,'留存');assert.equal('reportBatch' in replacements[0].query,false)
 })
 function fixture(t,file,exports){
-  const auth=Vue.reactive({token:'one',user:{id:1,username:'actor',roles:['LEADER'],accountCategory:'BUREAU'}}),requests=[]
-  const client={get:(path,config)=>new Promise((resolve,reject)=>requests.push({path,config,resolve:data=>resolve({data:{data}}),reject}))}
+  const auth=Vue.reactive({token:'one',user:{id:1,username:'actor',roles:['LEADER'],accountCategory:'BUREAU'}}),requests=[],posts=[]
+  const client={
+    get:(path,config)=>new Promise((resolve,reject)=>requests.push({path,config,resolve:data=>resolve({data:{data}}),reject})),
+    post:(path,body)=>new Promise(resolve=>posts.push({path,body,resolve})),
+  }
   const code=readFileSync(new URL('../src/views/case/'+file+'.vue',import.meta.url),'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .+\r?\n/gm,'')
   const unmounts=[],scope=Vue.effectScope()
-  const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(code)+`;({${exports}})`,{...Vue,client,resourceState,createResourceLoader,createHistoryPagination,historyPageState,useAuthStore:()=>auth,useRouter:()=>({push(){}}),onMounted(){},onUnmounted:fn=>unmounts.push(fn),caseOperationAccess:()=>true,canWritePrecase:()=>true,ElMessage:{warning(){},success(){}},ElMessageBox:{},CLUE_STATUS:{},PARTY_TYPE:{},SOURCE:{},INSTITUTION_GRADE:{},fmtTime:value=>value}))
+  const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(code)+`;({${exports}})`,{...Vue,client,AbortController,resourceState,createResourceLoader,createHistoryPagination,historyPageState,useAuthStore:()=>auth,useRoute:()=>({query:{}}),useRouter:()=>({push(){}}),onMounted(){},onUnmounted:fn=>unmounts.push(fn),caseOperationAccess:()=>true,canWritePrecase:()=>true,ElMessage:{warning(){},success(){}},ElMessageBox:{},CLUE_STATUS:{},PARTY_TYPE:{},SOURCE:{},INSTITUTION_GRADE:{},fmtTime:value=>value}))
   t.after(()=>{unmounts.forEach(fn=>fn());scope.stop()})
-  return {...view,auth,requests}
+  return {...view,auth,requests,posts}
 }
 test('clue focus ignores list filters and malformed IDs never load the first page',async t=>{
   const f=fixture(t,'CluesView','setTaskFocus,load,records,q,statusFilter,range')
@@ -39,7 +42,7 @@ test('clue focus ignores list filters and malformed IDs never load the first pag
   f.requests[0].resolve({rows:[{id:250001}],total:1});await read;assert.equal(f.records.value[0].id,250001)
   f.setTaskFocus(0);await f.load();assert.equal(f.requests.length,1);assert.equal(f.records.value.length,0)
 })
-test('approval focus changes invalidate an earlier target and never require useRoute in its parent',async t=>{
+test('approval focus changes invalidate an earlier target and refuse an invalid focus',async t=>{
   const f=fixture(t,'ApprovalsView','setTaskFocus,load,rows')
   f.setTaskFocus(1);const old=f.load();f.setTaskFocus(2);const next=f.load()
   assert.equal(f.requests[1].config.params.focusId,2);f.requests[1].resolve([{id:2,kind:'EXTEND',payload:'{}'}]);await next
@@ -52,4 +55,27 @@ test('handoff focus makes one scoped request and discards a previous identity re
   assert.equal(f.requests[0].config.params.focusId,999);assert.equal('status' in f.requests[0].config.params,false)
   f.auth.user.id=2;f.requests[0].resolve({rows:[{id:999}],total:1,page:1,size:1});await pending
   assert.equal(f.pagination.rows.length,0)
+})
+
+test('inspection assignment discards a previous handoff lookup and submits against the displayed assignee',async t=>{
+  const f=fixture(t,'DepartmentHandoffsView','openAssignment,assignment,assignees,submitAssignment')
+  const first=f.openAssignment({id:1,source_no:'检查一',can_assign_inspection:true})
+  const second=f.openAssignment({id:2,source_no:'检查二',can_assign_inspection:true})
+  assert.equal(f.requests[0].config.signal.aborted,true)
+  f.requests[0].resolve({candidates:[{id:3,username:'stale'}],assignedUserId:3})
+  await first
+  assert.equal(f.assignees.value.length,0)
+  f.requests[1].resolve({candidates:[{id:4,username:'current'},{id:5,username:'replacement'}],assignedUserId:4})
+  await second
+  assert.equal(f.assignment.username,'current')
+  f.assignment.username='replacement'
+  f.assignment.reason='接续办理'
+  const submitted=f.submitAssignment()
+  assert.equal(f.posts[0].path,'/bureau/department-handoffs/2/inspection-assignment')
+  assert.equal(f.posts[0].body.username,'replacement')
+  assert.equal(f.posts[0].body.expectedAssignedUserId,4)
+  f.auth.user.id=2
+  f.posts[0].resolve()
+  await submitted
+  assert.equal(f.requests.length,2)
 })

@@ -18,18 +18,19 @@
       </el-table-column>
       <el-table-column prop="object_name" label="检查对象" width="160" show-overflow-tooltip />
       <el-table-column prop="officers" label="检查人员" width="150" show-overflow-tooltip />
+      <el-table-column prop="assigned_real_name" label="交接承办人" min-width="112" show-overflow-tooltip />
       <el-table-column prop="planned_at" label="计划日期" width="105" />
       <el-table-column label="状态" width="200">
         <template #default="{ row }">
           <template v-if="!row.done_at">
             <el-tag size="small">待检查</el-tag>
-            <el-button v-if="canOperate" size="small" text type="primary" @click="onComplete(row)">登记结果</el-button>
+            <el-button v-if="canOperateInspection(row)" size="small" text type="primary" @click="onComplete(row)">登记结果</el-button>
           </template>
           <template v-else>
             <el-tag size="small" :type="row.violation_found ? 'danger' : 'success'">
               {{ row.violation_found ? '发现违法' : '未见违法' }}
             </el-tag>
-            <el-button v-if="canOperate && (row.violation_found && !row.clue_id)" size="small" text type="danger" @click="onToClue(row)">转线索</el-button>
+            <el-button v-if="canOperateInspection(row) && row.violation_found" size="small" text type="danger" @click="onToClue(row)">转线索</el-button>
             <span v-if="row.clue_id" class="hint">已转线索#{{ row.clue_id }}</span>
           </template>
         </template>
@@ -100,7 +101,7 @@ import { historyPageState, createHistoryPagination } from '../../api/historyPagi
 import { useAuthStore } from '../../stores/auth'
 import { caseOperationAccess } from '../../api/caseWriteAccess'
 import PrecaseAttachments from '../../components/PrecaseAttachments.vue'
-import type { PrecaseSource } from '../../api/precaseAttachments'
+import { canWritePrecase, type PrecaseSource } from '../../api/precaseAttachments'
 import { PARTY_TYPE } from './labels'
 
 const auth = useAuthStore()
@@ -111,8 +112,15 @@ const taskLevels: Record<string, string> = {
 
 const materialsVisible = ref(false)
 const materialsSource = ref<PrecaseSource>({ id: 0, type: 'inspections' })
+function inspectionSource(row: any): PrecaseSource {
+  return { id: row.id, type: 'inspections', clueId: row.clue_id,
+    owner: row.responsible_username === undefined ? row.created_by : row.responsible_username ?? undefined }
+}
+function canOperateInspection(row: any) {
+  return canWritePrecase(auth.user?.roles, auth.user?.username, inspectionSource(row), false)
+}
 function openMaterials(row: any) {
-  materialsSource.value = { id: row.id, type: 'inspections', clueId: row.clue_id, owner: row.created_by }
+  materialsSource.value = inspectionSource(row)
   materialsVisible.value = true
 }
 const pagination = reactive(historyPageState<any>())

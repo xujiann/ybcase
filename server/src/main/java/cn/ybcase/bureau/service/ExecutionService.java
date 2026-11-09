@@ -191,37 +191,15 @@ public class ExecutionService {
         CaseGuards.lockWritable(jdbc, caseId);
         materialAccess.requireCurrentCaseWriter(caseId);
         CaseFile c = CaseGuards.get(caseRepository, caseId);
-        if (!"DELIVERED".equals(c.getStatus())) throw new BizException(2042, "决定书送达且当事人逾期不履行方可申请强制执行");
-        if (Boolean.TRUE.equals(c.getCourtEnforceApplied())) throw new BizException(2142, "该案已登记法院强执申请");
-        CaseDecision decision = decisionRepository.findByCaseId(caseId).orElseThrow();
-        if (!"PUNISH".equals(decision.getDecisionType())) throw new BizException(2142, "仅未履行的处罚决定可申请法院强执");
-        if (sum(caseId,"FINE").compareTo(decision.getFineAmount()) >= 0
-                && sum(caseId,"RECOUP").compareTo(decision.getRecoupAmount()) >= 0
-                && sum(caseId,"CONFISCATE").compareTo(decision.getConfiscateAmount()) >= 0)
-            throw new BizException(2142, "该决定已执行完毕，无需申请法院强执");
-        LocalDate payDeadline = deadlines.paymentDeadline(c);
-        LocalDate today = LocalDate.now();
-        LocalDate start = deadlines.applicationStart(c);
-        if (Boolean.TRUE.equals(c.getReliefPending())) throw new BizException(2142, "尚有未结束的复议或诉讼，请先登记救济结果与期限依据");
-        if (start == null) throw new BizException(2142, "须由法制或负责人登记法定救济期限依据；暂缓分期须登记期限");
-        if (!today.isAfter(start))
-            throw new BizException(2142, "缴款或法定救济期限尚未届满（" + start + "）");
-        if (!today.isAfter(payDeadline))
-            throw new BizException(2042, "缴款期至 " + payDeadline + " 届满前不得申请法院强制执行（行政强制法53条）");
-        int urgeDays = config.intVal("court_urge_days", 10);
-        var urged = jdbc.queryForList(
-                """
-                select max(d.delivered_at) as delivered_at from case_delivery d join case_document doc on doc.id = d.document_id
-                where d.case_id = ? and doc.case_id = d.case_id and doc.doc_type = 'URGE_LETTER'
-                having max(d.delivered_at) is not null""",
-                caseId);
-        if (urged.isEmpty())
-            throw new BizException(2042, "申请法院强制执行前应当先行催告（行政强制法54条）：请先制作催告书（文书类型 URGE_LETTER）");
-        LocalDate urgedAt = ((java.sql.Date) urged.get(0).get("delivered_at")).toLocalDate();
-        if (today.isBefore(urgedAt.plusDays(urgeDays)))
-            throw new BizException(2042, "催告后须满 " + urgeDays + " 日当事人仍不履行方可申请（行政强制法54条）");
-        if (today.isAfter(deadlines.applicationDeadline(c)))
-            throw new BizException(2142, "已超过登记的法定申请期限，请由法制核实后另行处理");
+        if (!"DELIVERED".equals(c.getStatus()))
+            throw new BizException(2042, "决定书送达且当事人逾期不履行方可申请强制执行");
+        LocalDate today = ExecutionDeadlines.today();
+        var decision = deadlines.effectiveDecision(caseId,today);
+        if (ExecutionDeadlines.version(decision) != null)
+            throw new BizException(2193,"当前决定已有独立版本，请在执行续办登记该版本的法院申请");
+        if (deadlines.currentCourtRound(c,decision,today) != null)
+            throw new BizException(2142,"该决定已登记法院强执申请");
+        deadlines.requireCourtApplication(c,decision,today,today,false);
         c.setCourtEnforceApplied(true);
         c.setCourtEnforceStatus("APPLIED");
         c.setCourtAppliedAt(today);
@@ -235,9 +213,14 @@ public class ExecutionService {
         CaseGuards.lockWritable(jdbc, caseId);
         materialAccess.requireCurrentCaseRoles(caseId, "LEGAL", "LEADER", "ADMIN");
         CaseFile c = CaseGuards.get(caseRepository, caseId);
-        if (!"DELIVERED".equals(c.getStatus()) || c.getDeliveredAt() == null)
+        LocalDate today = ExecutionDeadlines.today();
+        var decision = deadlines.effectiveDecision(caseId,today);
+        if (ExecutionDeadlines.version(decision) != null)
+            throw new BizException(2193,"请在执行续办登记当前决定版本的期限依据");
+        if (deadlines.effectiveDelivery(c,decision,today) == null)
             throw new BizException(2142, "决定书送达后方可登记法定救济期限");
-        if (Boolean.TRUE.equals(c.getCourtEnforceApplied())) throw new BizException(2142, "申请后不能改写期限依据");
+        if (deadlines.currentCourtRound(c,decision,today) != null)
+            throw new BizException(2142, "申请后不能改写期限依据");
         if (req.deadline() == null || req.deadline().isBefore(c.getDeliveredAt()) || req.basis() == null || req.basis().isBlank())
             throw new BizException(2142, "须填写不早于送达日的救济期限届满日与法律或文书依据");
         if (req.deferUntil() != null && (!Boolean.TRUE.equals(c.getDeferApproved()) || req.deferUntil().isBefore(c.getDeliveredAt())))

@@ -42,6 +42,15 @@ public class CaseNotice {
     private LocalDate statementDeadline;
 
     @Column(nullable = false)
+    private boolean deliveryRequired;
+
+    private Integer statementPeriodDays;
+    private Integer hearingPeriodDays;
+    private LocalDate hearingRequestDeadline;
+    private LocalDate statementReceivedAt;
+    private LocalDate hearingRequestedAt;
+
+    @Column(nullable = false)
     private Boolean hearingEntitled = false;
 
     @Column(nullable = false)

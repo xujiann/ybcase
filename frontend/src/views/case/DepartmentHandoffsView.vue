@@ -32,6 +32,7 @@
           <el-button v-if="row.can_decide" type="primary" text :disabled="saving" @click="openDecision(row, 'accept')">接收</el-button>
           <el-button v-if="row.can_decide" text :disabled="saving" @click="openDecision(row, 'reject')">驳回</el-button>
           <el-button v-if="row.can_cancel" type="warning" text :disabled="saving" @click="openDecision(row, 'cancel')">撤回</el-button>
+          <el-button v-if="row.can_assign_inspection" type="primary" text :disabled="saving" @click="openAssignment(row)">指派承办</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -73,6 +74,29 @@
         <el-button type="primary" :loading="saving" @click="submitDecision">确认{{ ACTIONS[decision.action] }}</el-button>
       </template>
     </el-dialog>
+    <el-dialog v-model="assignmentVisible" title="指派检查承办人" width="min(500px, 94vw)"
+      :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
+      <p>{{ assignment.number }}</p>
+      <el-alert v-if="assignmentReady && !assignees.length" type="info" :closable="false"
+        title="本机构暂无可指派的办案员，接收负责人可直接办理。" />
+      <el-form label-width="90px">
+        <el-form-item label="承办人" required>
+          <el-select v-model="assignment.username" filterable :loading="assignmentLoading" :disabled="!assignmentReady || saving"
+            placeholder="选择本机构办案员" style="width:100%">
+            <el-option v-for="person in assignees" :key="person.id"
+              :label="`${person.real_name}（${person.username}）`" :value="person.username" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="指派原因" required>
+          <el-input v-model="assignment.reason" type="textarea" :rows="3" maxlength="512" show-word-limit :disabled="saving" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button :disabled="saving" @click="assignmentVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!assignmentReady || !assignment.username || !assignment.reason.trim()"
+          :loading="saving" @click="submitAssignment">确认指派</el-button>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
@@ -94,9 +118,10 @@ const ACTIONS = { accept: '接收交接', reject: '驳回交接', cancel: '撤�
 type SourceType = keyof typeof SOURCES
 type Status = keyof typeof STATES
 type Action = keyof typeof ACTIONS
-interface Handoff { id: number; source_no: string; source_type: SourceType; status: Status; can_decide: boolean; can_cancel: boolean }
+interface Handoff { id: number; source_no: string; source_type: SourceType; status: Status; can_decide: boolean; can_cancel: boolean; can_assign_inspection?: boolean }
 interface Department { id: number; name: string; enabled: boolean; orgKind: string }
 interface SourceOption { id: number; number: string }
+interface Assignee { id: number; username: string; real_name: string }
 
 const auth = useAuthStore()
 const endpoint = '/bureau/department-handoffs'
@@ -113,6 +138,10 @@ const paging = createHistoryPagination(pagination, async (params, { signal }) =>
 })
 const requestVisible = ref(false)
 const decisionVisible = ref(false)
+const assignmentVisible = ref(false)
+const assignmentLoading = ref(false)
+const assignmentReady = ref(false)
+const assignees = ref<Assignee[]>([])
 const saving = ref(false)
 const deptLoading = ref(false)
 const sourceLoading = ref(false)
@@ -121,13 +150,16 @@ const sources = ref<SourceOption[]>([])
 const request = reactive({ sourceType: 'CLUE' as SourceType, sourceId: undefined as number | undefined,
   targetDeptId: undefined as number | undefined, reason: '' })
 const decision = reactive({ id: 0, number: '', action: 'accept' as Action, opinion: '' })
+const assignment = reactive({ id: 0, number: '', username: '', reason: '', expectedAssignedUserId: null as number | null })
 let sourceSearch: AbortController | undefined
+let assignmentSearch: AbortController | undefined
 let disposed = false
 let mounted = false
 function setTaskFocus(value: number | undefined) {
   if (value === focusId.value) return
   focusId.value = value
   decisionVisible.value = false
+  assignmentVisible.value = false
   if (value === undefined) pagination.size = 20
   if (mounted) void paging.firstPage()
 }
@@ -209,13 +241,46 @@ async function submitDecision() {
   await submit(endpoint + '/' + id + '/' + path, body, decisionVisible, '交接处理已保存', paging.load)
 }
 
+async function openAssignment(row: Handoff) {
+  if (saving.value || !row.can_assign_inspection) return
+  assignmentSearch?.abort()
+  const current = assignmentSearch = new AbortController()
+  const identity = readIdentity()
+  Object.assign(assignment, { id: row.id, number: row.source_no, username: '', reason: '', expectedAssignedUserId: null })
+  assignees.value = []
+  assignmentReady.value = false
+  assignmentLoading.value = true
+  assignmentVisible.value = true
+  try {
+    const { data } = await client.get<{ data: { candidates: Assignee[]; assignedUserId: number | null } }>(
+      `${endpoint}/${row.id}/inspection-assignees`, { signal: current.signal })
+    if (disposed || current.signal.aborted || !assignmentVisible.value || identity !== readIdentity()) return
+    assignees.value = data.data.candidates
+    assignment.expectedAssignedUserId = data.data.assignedUserId
+    assignment.username = assignees.value.find(person => person.id === assignment.expectedAssignedUserId)?.username ?? ''
+    assignmentReady.value = true
+  } catch {
+    // An unsuccessful lookup leaves the dialog read-only.
+  } finally {
+    if (assignmentSearch === current) assignmentLoading.value = false
+  }
+}
+
+async function submitAssignment() {
+  if (saving.value || !assignmentVisible.value || !assignmentReady.value) return
+  const { id, username, expectedAssignedUserId, reason } = assignment
+  if (!assignees.value.some(person => person.username === username) || !reason.trim()) return
+  await submit(`${endpoint}/${id}/inspection-assignment`, { username, expectedAssignedUserId, reason: reason.trim() },
+    assignmentVisible, '检查承办人已指派', paging.load)
+}
+
 async function submit(path: string, body: object, visible: typeof requestVisible, message: string,
   refresh: () => Promise<boolean>) {
-  const token = auth.token
+  const identity = readIdentity()
   saving.value = true
   try {
     await client.post(path, body)
-    if (disposed || token !== auth.token) return
+    if (disposed || identity !== readIdentity() || !visible.value) return
     visible.value = false
     ElMessage.success(message)
     await refresh()
@@ -227,13 +292,16 @@ async function submit(path: string, body: object, visible: typeof requestVisible
 }
 
 watch(requestVisible, visible => { if (!visible) sourceSearch?.abort() })
+watch(assignmentVisible, visible => { if (!visible) assignmentSearch?.abort() })
 watch(readIdentity, () => {
   pagination.rows=[]; pagination.total=0; requestVisible.value=false; decisionVisible.value=false; departments.value=[]; sources.value=[]; sourceSearch?.abort()
+  assignmentVisible.value=false; assignmentReady.value=false; assignees.value=[]; assignmentSearch?.abort()
 }, { flush: 'sync' })
 onMounted(() => { mounted = true; void paging.load() })
 onUnmounted(() => {
   disposed = true
   sourceSearch?.abort()
+  assignmentSearch?.abort()
   paging.dispose()
 })
 </script>
