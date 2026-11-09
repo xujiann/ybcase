@@ -20,17 +20,18 @@
           <el-button v-if="canCorrect" size="small" @click="openCorrection">更正要素</el-button>
         </template>
         <el-descriptions-item label="当事人">{{ c.partyName }}（{{ PARTY_TYPE[c.partyType] }}）</el-descriptions-item>
+        <el-descriptions-item v-if="auth.user?.roles.includes('ADMIN')" label="授权核对案件记录号">{{ c.id }}</el-descriptions-item>
         <el-descriptions-item label="证照号">{{ c.partyCreditNo || '-' }}</el-descriptions-item>
         <el-descriptions-item label="法定代表人">{{ c.partyLegalRep || '-' }}</el-descriptions-item>
         <el-descriptions-item label="案由" :span="2">{{ cause.itemNo }}. {{ cause.category }}——{{ cause.description }}</el-descriptions-item>
-        <el-descriptions-item v-if="c.institutionCode" label="机构信息">
+        <el-descriptions-item v-if="c.institutionCode" :label="c.decidedAt ? '原卷机构信息' : '机构信息'">
           {{ c.institutionCode }} / {{ c.institutionOwnership === 'PUBLIC' ? '公立' : '社会办' }} /
           {{ INSTITUTION_GRADE[c.institutionGrade] }}
         </el-descriptions-item>
         <template v-if="c.confirmedViolationStart">
-          <el-descriptions-item label="违法发生期间">{{ c.confirmedViolationStart }} 至 {{ c.confirmedViolationEnd }}</el-descriptions-item>
-          <el-descriptions-item label="认定违法金额">{{ c.confirmedViolationAmount }}</el-descriptions-item>
-          <el-descriptions-item label="认定违法事实" :span="3">{{ c.confirmedViolationFacts }}</el-descriptions-item>
+          <el-descriptions-item :label="c.decidedAt ? '原卷违法期间' : '违法发生期间'">{{ c.confirmedViolationStart }} 至 {{ c.confirmedViolationEnd }}</el-descriptions-item>
+          <el-descriptions-item :label="c.decidedAt ? '原卷认定违法金额' : '认定违法金额'">{{ c.confirmedViolationAmount }}</el-descriptions-item>
+          <el-descriptions-item :label="c.decidedAt ? '原卷认定违法事实' : '认定违法事实'" :span="3">{{ c.confirmedViolationFacts }}</el-descriptions-item>
         </template>
         <el-descriptions-item label="涉案金额">{{ c.amountInvolved }}</el-descriptions-item>
         <el-descriptions-item label="案情摘要" :span="3">{{ c.summary || '-' }}</el-descriptions-item>
@@ -141,12 +142,13 @@
           <el-button v-if="canWriteCase && (isLeader)" type="primary" @click="onResume">恢复调查</el-button>
         </template>
         <template v-if="c.status === 'REPORTED'">
-          <el-button v-if="canWriteCase" type="primary" @click="dlg.notice = true">处罚告知</el-button>
+          <el-button v-if="canWriteCase" type="primary" @click="openNotice">处罚告知</el-button>
           <el-button v-if="canWriteCase" @click="onSubmitReview">提交法制审核</el-button>
           <el-button v-if="canWriteCase && (isLeader)" @click="onExtendCase">延长期限</el-button>
           <el-button v-else-if="canWriteCase" @click="dlg.apply = true">申请延期</el-button>
         </template>
         <template v-if="c.status === 'NOTIFIED'">
+          <el-button v-if="canWriteCase" type="warning" @click="openNotice">再次告知</el-button>
           <el-button v-if="isLeader" type="primary" @click="openDecide">作出决定</el-button>
           <el-button v-if="canWriteCase" @click="openStatement">陈述申辩/听证</el-button>
           <el-button v-if="canWriteCase" @click="onSubmitReview">提交法制审核</el-button>
@@ -171,8 +173,8 @@
                    @click="onSummaryRecord">简易程序备案</el-button>
         <!-- 实体字段名 eDeliveryConsent，Jackson 对 getEDeliveryConsent 生成的 JSON 键是 edeliveryConsent
              （首字母连续大写被整体小写），读驼峰恒 undefined → 登记后按钮不消失，每点一次多插一份确认书 -->
-        <el-button v-if="canWriteCase && (!c.edeliveryConsent && !['CLOSED', 'TERMINATED'].includes(c.status))"
-                   @click="dlg.eConsent = true">电子送达确认书</el-button>
+        <el-button v-if="canWriteCase && !c.archiveNo && !['CLOSED', 'TERMINATED'].includes(c.status)"
+                   @click="dlg.eConsent = true">{{ c.edeliveryConsent ? '核实或变更同意地址' : '电子送达确认书' }}</el-button>
         <template v-if="c.status === 'DELIVERED'">
           <el-button v-if="canWriteCase" type="primary" @click="dlg.execution = true">登记执行</el-button>
           <el-button @click="onLateFee">加处罚款测算</el-button>
@@ -198,12 +200,15 @@
                                 :key="id" :case-id="Number(id)" />
     <SupplementCorrectionPanel v-if="caseReady && ['DECIDED','DELIVERED','CLOSED'].includes(c.status)" :key="`correction-${id}`" :case-id="Number(id)" />
     <CaseContinuationPanel v-if="caseReady && ['DECIDED','DELIVERED','CLOSED'].includes(c.status)" :key="`continuation-${id}`" :case-id="Number(id)" />
+    <SupplementBundlesPanel v-if="caseReady && ['DECIDED','DELIVERED','CLOSED'].includes(c.status)" :case-id="Number(id)" :writable="canOperateCase" />
+    <FactRevisionPanel v-if="caseReady" :key="`facts-${id}`" :case-id="Number(id)" @changed="load" />
     <DeliveryReceiptsPanel v-if="caseReady" :case-id="Number(id)" :writable="canWriteCase" :refresh-key="detail" />
     <el-card>
       <el-tabs>
         <el-tab-pane :label="`办案人员(${detail.officers?.length || 0})`">
           <el-button v-if="canWriteCase" size="small" class="mb" @click="dlg.officer = true" :disabled="['CLOSED','TERMINATED'].includes(c.status)">添加人员</el-button>
           <el-table :data="detail.officers" border size="small">
+            <el-table-column v-if="auth.user?.roles.includes('ADMIN')" prop="id" label="授权核对参办记录号" width="160" />
             <el-table-column prop="name" label="姓名" width="120" />
             <el-table-column prop="cert_no" label="执法证号" width="160" />
             <el-table-column label="分工" width="80">
@@ -261,6 +266,7 @@
           <el-button size="small" class="mb" @click="onCatalog">案卷目录</el-button>
           <el-button size="small" class="mb" @click="dlg.evidenceCatalog = true">证据卷目录</el-button>
           <el-button size="small" class="mb" type="success" :loading="printingArchive" :disabled="printingArchive" @click="onPrintArchive">打印卷宗</el-button>
+          <SignaturePolicyBanner />
           <el-table :data="detail.documents" border size="small">
             <el-table-column label="类型" width="130">
               <template #default="{ row }">{{ DOC_TYPE[row.doc_type] || row.doc_type }}</template>
@@ -758,7 +764,8 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="dlg.notice" title="行政处罚告知（第41条）" width="600px">
+    <el-dialog v-model="dlg.notice" :title="c.status==='NOTIFIED' ? '再次行政处罚告知' : '行政处罚告知（第41条）'" width="600px">
+      <el-alert v-if="detail.notices?.length" title="再次告知保留历次记录；变更后须核对申辩、听证及重新送审。" type="warning" :closable="false" />
       <el-form label-width="110px">
         <el-form-item label="拟罚款金额"><el-input-number v-model="noticeForm.proposedFine" :min="0" :precision="2" style="width: 200px" /></el-form-item>
         <el-form-item label="拟追回基金"><el-input-number v-model="noticeForm.proposedRecoup" :min="0" :precision="2" style="width: 200px" /></el-form-item>
@@ -775,7 +782,7 @@
       <p class="hint">拟罚款达到听证标准将自动告知听证权利；当事人享有陈述权、申辩权。</p>
       <template #footer>
         <el-button @click="dlg.notice = false">取消</el-button>
-        <el-button v-if="canWriteCase" type="primary" @click="onNotify">送达告知书</el-button>
+        <el-button v-if="canWriteCase" type="primary" :loading="notifying" :disabled="notifying" @click="onNotify">保存本次告知</el-button>
       </template>
     </el-dialog>
 
@@ -1064,6 +1071,9 @@ import { evidenceCatalogHtml } from '../../api/evidenceCatalog'
 import JurisdictionForm from '../../components/JurisdictionForm.vue'
 import HistoricalReportSupplement from './HistoricalReportSupplement.vue'
 import CaseContinuationPanel from '../../components/CaseContinuationPanel.vue'
+import FactRevisionPanel from '../../components/FactRevisionPanel.vue'
+import SupplementBundlesPanel from '../../components/SupplementBundlesPanel.vue'
+import SignaturePolicyBanner from '../../components/SignaturePolicyBanner.vue'
 import SupplementCorrectionPanel from '../../components/SupplementCorrectionPanel.vue'
 import DeliveryReceiptsPanel from '../../components/DeliveryReceiptsPanel.vue'
 import JurisdictionSummary from '../../components/JurisdictionSummary.vue'
@@ -1247,6 +1257,14 @@ const evidenceForm = reactive({ type: 'DOCUMENT', name: '', source: '', obtained
 const documentForm = reactive<any>({ docType: 'INQUIRY_RECORD', title: '', content: '', maker: '', signed: false, dueAt: null })
 const exclusionForm = reactive({ reason: 'APPRAISE', startAt: todayLocal(), endAt: todayLocal(), note: '' })
 const noticeForm = reactive<any>({ content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '' })
+const notifying=ref(false)
+function openNotice() {
+  if(!canWriteCase.value || notifying.value || !['REPORTED','NOTIFIED'].includes(c.value.status))return
+  const previous=detail.value.notices?.[0]
+  Object.assign(noticeForm,{content:previous?.content||'',proposedFine:Number(previous?.proposed_fine||0),
+    proposedRecoup:Number(previous?.proposed_recoup||0),proposedConfiscate:Number(previous?.proposed_confiscate||0),changeReason:''})
+  dlg.notice=true
+}
 const statementForm = reactive<any>({ statement: '', statementReview: '', hearingRequested: false, hearingHeldAt: null, statementWaived: false })
 /** 打开弹窗时的回填快照，提交时据此只发改动过的字段 */
 let statementSnapshot: any = { ...statementForm }
@@ -1446,7 +1464,8 @@ async function onSignDoc(row: any) {
     if (!materialContextCurrent(context) || !canWriteCase.value) return
     const resp = await client.post(`/bureau/cases/${context.caseId}/documents/${documentId}/sign`, { signer: value })
     if (!materialContextCurrent(context)) return
-    ElMessage.success(`已签章（${resp.data.data.provider}，摘要 ${resp.data.data.contentHash.slice(0, 12)}…）`)
+    if(resp.data.data.provider==='MOCK') ElMessage.warning('已保存模拟签章，仅摘要留痕；不作为正式 CA 签章')
+    else ElMessage.success(`已签章（${resp.data.data.provider}，摘要 ${resp.data.data.contentHash.slice(0, 12)}…）`)
     await load()
   } catch { /* Includes a dismissed signature prompt. */ }
   finally { signingDocument.value = false }
@@ -1461,7 +1480,7 @@ async function onVerifyDoc(row: any) {
     if (!materialContextCurrent(context) || sequence !== verificationSequence) return
     if (!sigs.length) { ElMessage.info('该文书尚无签章'); return }
     const ok = sigs.every((s: any) => s.valid)
-    await ElMessageBox.alert(sigs.map((s: any) => `${s.signer}（${s.signer_role}）${s.signed_at}：${s.valid ? '有效' : '校验未通过：正文或签章信息不一致'}`).join('\n'),
+    await ElMessageBox.alert(sigs.map((s: any) => `${s.signer}（${s.signer_role}）${s.signed_at}：${s.valid ? '摘要及签章校验通过' : '校验未通过'}；${s.simulation || s.provider==='MOCK' ? '模拟记录' : '外部签章'}；${s.formalAccepted===true ? '符合当前正式策略' : '未作为正式签章接受'}`).join('\n'),
       ok ? '验签通过' : '验签失败', { type: ok ? 'success' : 'error' })
   } catch { /* Do not show verification results for an obsolete document or case. */ }
 }
@@ -1926,15 +1945,20 @@ async function onDoReview() {
 }
 
 async function onNotify() {
-  if (!canWriteCase.value) return
+  if (!canWriteCase.value || notifying.value || !dlg.notice || !['REPORTED','NOTIFIED'].includes(c.value.status)) return
   if (!noticeForm.content.trim()) {
     ElMessage.warning('请填写告知内容')
     return
   }
-  await client.post(`/bureau/cases/${id.value}/notice`, noticeForm)
-  ElMessage.success('已告知当事人')
-  dlg.notice = false
-  load()
+  const context=captureMaterialContext(), token=auth.token, request=JSON.parse(JSON.stringify(noticeForm))
+  notifying.value=true
+  try {
+    await client.post(`/bureau/cases/${context.caseId}/notice`, request)
+    if(!materialContextCurrent(context)||auth.token!==token)return
+    ElMessage.success('本次告知已保存，历次告知保留')
+    dlg.notice = false
+    load()
+  } finally {notifying.value=false}
 }
 
 /**

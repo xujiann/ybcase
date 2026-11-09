@@ -173,6 +173,42 @@ class NextStepTaskIntegrationTest {
         jdbc.update("update electronic_delivery set status='TIMED_OUT' where id=?",id);jdbc.update("update case_file set archive_no=? where id=?",unique(),c);assertFalse(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",id));
     }
 
+    @Test void supplementalMaterialReviewTasksUseCaseScopeAndAnotherFormalBureauReviewer() {
+        var owner=actor("DISTRICT","HANDLER");var reviewer=actor("BUREAU","LEGAL");var admin=actor("BUREAU","ADMIN");var district=actor("DISTRICT","LEADER");
+        long c=caseFile(owner,"CLOSED"),bundle=pendingBundle(c,owner);
+        var task=tasks.bureau(reviewer.name(),1,100).rows().stream().filter(row->row.sourceType().equals("SUPPLEMENT_BUNDLE")&&row.sourceId()==bundle).findFirst().orElseThrow();
+        assertEquals("/case/detail/"+c+"?supplementBundle="+bundle,task.link());
+        assertFalse(has(tasks.bureau(owner.name(),1,100),"SUPPLEMENT_BUNDLE",bundle));
+        assertFalse(has(tasks.bureau(admin.name(),1,100),"SUPPLEMENT_BUNDLE",bundle));
+        assertFalse(has(tasks.bureau(district.name(),1,100),"SUPPLEMENT_BUNDLE",bundle));
+        long own=pendingBundle(caseFile(reviewer,"CLOSED"),reviewer);
+        assertFalse(has(tasks.bureau(reviewer.name(),1,100),"SUPPLEMENT_BUNDLE",own));
+        jdbc.update("update sys_dept set org_kind=null where id=?",reviewer.department());
+        assertFalse(has(tasks.bureau(reviewer.name(),1,100),"SUPPLEMENT_BUNDLE",bundle));
+        jdbc.update("update sys_dept set org_kind='BUREAU',enabled=false where id=?",reviewer.department());
+        assertEquals(403,assertThrows(BizException.class,()->tasks.bureau(reviewer.name(),1,100)).code);
+        jdbc.update("update sys_dept set enabled=true where id=?",reviewer.department());
+        jdbc.update("update case_supplement_bundle set status='REJECTED',reviewed_by=?,reviewed_at=clock_timestamp(),opinion='核对退回' where id=?",reviewer.name(),bundle);
+        assertFalse(has(tasks.bureau(reviewer.name(),1,100),"SUPPLEMENT_BUNDLE",bundle));
+    }
+
+    @Test void archivedSupplementDeliveryExceptionsRemainActionableButSupersededAndForeignSourcesDoNot() {
+        var owner=actor("DISTRICT","HANDLER");var foreign=actor("DISTRICT","LEADER");long c=caseFile(owner,"CLOSED");
+        long bundle=jdbc.queryForObject("insert into case_supplement_bundle(case_id,request_key,title,source_reference,status,created_by,applicant_id,applicant_dept_id,applicant_category,source_snapshot) values(?,?,'后续材料','实际回证','APPROVED',?,?,?,'DISTRICT','{}') returning id",Long.class,c,unique(),owner.name(),owner.id(),owner.department());
+        long doc=jdbc.queryForObject("insert into case_supplement_document(case_id,bundle_id,request_key,doc_type,title,content,content_sha256,made_at,created_by) values(?,?,?,'NOTICE','后续告知','后续正文',?,current_date,?) returning id",Long.class,c,bundle,unique(),"a".repeat(64),owner.name());
+        long delivery=jdbc.queryForObject("insert into electronic_delivery(case_id,supplement_document_id,request_key,document_hash,receiver,channel,status,created_by) values(?,?,?,'hash','受送达人','fixture@example.invalid','FAILED',?) returning id",Long.class,c,doc,unique(),owner.name());
+        assertTrue(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",delivery));
+        assertFalse(has(tasks.bureau(foreign.name(),1,100),"DELIVERY_EXCEPTION",delivery));
+        jdbc.update("update electronic_delivery set status='TIMED_OUT' where id=?",delivery);
+        assertTrue(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",delivery));
+        jdbc.update("update electronic_delivery set superseded_at=clock_timestamp(),superseded_reason='已核对替代轮次' where id=?",delivery);
+        assertFalse(has(tasks.bureau(owner.name(),1,100),"DELIVERY_EXCEPTION",delivery));
+    }
+
+    private long pendingBundle(long caseId,Actor owner) {
+        return jdbc.queryForObject("insert into case_supplement_bundle(case_id,request_key,title,source_reference,status,created_by,applicant_id,applicant_dept_id,applicant_category,source_snapshot,manifest,manifest_sha256) values(?,?,'合成待核对材料','原件第3页','PENDING',?,?,?,?, '{}','{}',?) returning id",Long.class,caseId,unique(),owner.name(),owner.id(),owner.department(),jdbc.queryForObject("select account_category from sys_user where id=?",String.class,owner.id()),"b".repeat(64));
+    }
+
     private Actor actor(String category, String role) {
         String code = unique();
         long dept = jdbc.queryForObject("insert into sys_dept(name,code,type,org_kind) values(?,?,'ADMIN',?) returning id",

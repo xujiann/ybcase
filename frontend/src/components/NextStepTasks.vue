@@ -109,7 +109,7 @@ function changePage(next: number) {
 function openTask(row: TaskRow) {
   if (!active() || !rows.value.includes(row)) return
   if (props.domain === 'agency' ? !/^\/agency\/agreements\?focus=\d+&cycle=\d+$/.test(row.link)
-    : !/^(\/case\/(detail\/\d+|clues\?focus=\d+|approvals\?focus=\d+|department-handoffs\?focus=\d+|stats\?reportBatch=\d+)|\/system\/integrations\?treasuryItem=\d+)$/.test(row.link)) return
+    : !/^(\/case\/(detail\/\d+(\?supplementBundle=\d+)?|interviews|clues\?focus=\d+|approvals\?focus=\d+|department-handoffs\?focus=\d+|stats\?reportBatch=\d+)|\/system\/integrations\?treasuryItem=\d+)$/.test(row.link)) return
   void router.push(row.link)
 }
 onMounted(() => { window.addEventListener(SESSION_EXPIRED_EVENT, invalidate); void refresh() })

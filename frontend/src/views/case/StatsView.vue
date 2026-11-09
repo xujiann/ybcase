@@ -1,4 +1,5 @@
 <template>
+  <AccountReadinessPanel />
   <div v-loading="loading">
     <el-alert type="info" :closable="false" :title="d.scopeLabel || '按当前账号可见范围统计'" class="mb" />
     <el-alert v-if="overviewResource.failed || publishedResource.failed || reportResource.failed" type="warning" :closable="false" title="部分统计未能加载，请刷新重试；未加载成功的报表暂不能导出。" class="mb" />
@@ -109,9 +110,12 @@
       </el-col>
     </el-row>
   </div>
+  <InterviewChangesPanel />
 </template>
 
 <script setup lang="ts">
+import AccountReadinessPanel from '../../components/AccountReadinessPanel.vue'
+import InterviewChangesPanel from '../../components/InterviewChangesPanel.vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import client from '../../api/client'

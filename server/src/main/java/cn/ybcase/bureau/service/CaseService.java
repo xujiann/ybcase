@@ -46,6 +46,7 @@ public class CaseService {
     private final EnforcerRegistryAccess enforcerRegistry;
     private final MaterialAccess materialAccess;
     private final MessageService messageService;
+    private final CaseFactService factHistory;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
     private final jakarta.persistence.EntityManager entityManager;
 
@@ -274,6 +275,8 @@ public class CaseService {
             Map.entry("partyName", "当事人名称"), Map.entry("partyCreditNo", "证照号"), Map.entry("partyAddress", "地址"),
             Map.entry("partyLegalRep", "法定代表人"), Map.entry("partyContact", "联系方式"), Map.entry("summary", "案情摘要"),
             Map.entry("amountInvolved", "涉案金额"), Map.entry("causeId", "案由"), Map.entry("name", "案件名称"),
+            Map.entry("institutionCode", "机构编码"), Map.entry("institutionOwnership", "机构性质"),
+            Map.entry("institutionGrade", "机构等级"), Map.entry("institutionKind", "机构类型"),
             Map.entry("jurisdictionType", "管辖分类"), Map.entry("jurisdictionBasis", "管辖依据"),
             Map.entry("violationPlace", "违法行为地"), Map.entry("treatmentPlace", "就医地"), Map.entry("insuredPlace", "参保地"),
             Map.entry("designatedNo", "指定管辖文号"), Map.entry("jurisdictionDisputeNote", "管辖争议及处理情况"));
@@ -338,7 +341,12 @@ public class CaseService {
     /** 字段为空 = 不更正；传空串 = 清空（partyName 除外，不允许清空） */
     public record CorrectionReq(String partyName, String partyCreditNo, String partyAddress,
                                 String partyLegalRep, String partyContact, String summary,
-                                BigDecimal amountInvolved, Long causeId, String reason) {}
+                                BigDecimal amountInvolved, Long causeId, String reason, InstitutionReq institution,String sourceReference) {
+        public CorrectionReq(String partyName,String partyCreditNo,String partyAddress,String partyLegalRep,
+                             String partyContact,String summary,BigDecimal amountInvolved,Long causeId,String reason) {
+            this(partyName,partyCreditNo,partyAddress,partyLegalRep,partyContact,summary,amountInvolved,causeId,reason,null,null);
+        }
+    }
 
     /**
      * 立案后要素录错的系统内更正通道：此前只能直连库改且不留痕（审计只记 method/path）。
@@ -355,6 +363,7 @@ public class CaseService {
                     + "）不允许更正要素：已告知/已决定的案件请通过更正决定书路径处理");
         if (req.reason() == null || req.reason().isBlank())
             throw new BizException(2121, "须填写更正理由");
+        var previousFacts = factHistory.snapshot(caseId);
 
         // 顺序即记录顺序；name 派生自 partyName/案由，放最后
         List<String[]> changes = new java.util.ArrayList<>();
@@ -381,6 +390,15 @@ public class CaseService {
             }
         }
         CaseCause cause = causeRepository.findById(c.getCauseId()).orElse(null);
+        if (req.institution() != null) {
+            CaseFactService.text(req.reason(),2000,"机构更正理由");
+            CaseFactService.text(req.sourceReference(),1000,"机构更正材料出处");
+            InstitutionReq next=normalizeInstitution(c.getPartyType(),req.institution());
+            c.setInstitutionCode(diffText(changes,"institutionCode",c.getInstitutionCode(),next.code()));
+            c.setInstitutionOwnership(diffText(changes,"institutionOwnership",c.getInstitutionOwnership(),next.ownership()));
+            c.setInstitutionGrade(diffText(changes,"institutionGrade",c.getInstitutionGrade(),next.grade()));
+            if(next.kind()!=null) c.setInstitutionKind(diffText(changes,"institutionKind",c.getInstitutionKind(),next.kind()));
+        }
         if (req.causeId() != null && !req.causeId().equals(c.getCauseId())) {
             CaseCause next = requireCauseMatch(req.causeId(), c.getPartyType());
             changes.add(new String[]{"causeId", causeText(cause), causeText(next)});
@@ -400,7 +418,13 @@ public class CaseService {
         for (String[] ch : changes)
             jdbc.update("insert into case_correction (case_id, batch_no, field, old_value, new_value, reason, operator)"
                     + " values (?,?,?,?,?,?,?)", caseId, batchNo, ch[0], ch[1], ch[2], req.reason().trim(), operator);
-        return caseRepository.save(c);
+        CaseFile saved=caseRepository.save(c);
+        if(req.institution()!=null) {
+            entityManager.flush();
+            factHistory.record(caseId,"INSTITUTION_CORRECTION",null,null,LocalDate.now(),factHistory.snapshot(caseId),
+                    previousFacts,req.reason().trim(),req.sourceReference().strip(),operator);
+        }
+        return saved;
     }
 
     @Transactional(readOnly = true, isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
@@ -684,6 +708,7 @@ public class CaseService {
         CaseFile c = get(caseId);
         if (!"INVESTIGATING".equals(c.getStatus())) throw new BizException(2004, "仅调查中的案件可出具调查终结报告");
         if ("SUMMARY".equals(c.getProcedureType())) throw new BizException(2004, "简易程序无需调查终结报告，可直接当场决定");
+        var previousFacts=factHistory.snapshot(caseId);
         String reportContent = req.content();
         if (reportContent == null || reportContent.isBlank())
             throw new BizException(2004, "调查终结报告须包含当事人情况/案件来源/事实证据/性质/处理意见（第36条）");
@@ -701,6 +726,43 @@ public class CaseService {
                 reportContent, LocalDate.now(), maker, false, null, null));
         c.setStatus("REPORTED");
         c.setReportedAt(LocalDate.now());
+        CaseFile saved=caseRepository.save(c);
+        entityManager.flush();
+        var facts=new java.util.LinkedHashMap<String,Object>(factHistory.snapshot(caseId));
+        facts.put("reportContent",reportContent);
+        factHistory.record(caseId,"INVESTIGATION_REPORT",null,null,LocalDate.now(),facts,previousFacts,
+                "调查终结确认事实","本案调查终结报告",maker);
+        return saved;
+    }
+
+    public record InvestigationReturnReq(String reason,String sourceReference) {}
+
+    @Transactional
+    public CaseFile returnForInvestigation(Long caseId,InvestigationReturnReq req,String username) {
+        CaseGuards.lockWritable(jdbc,caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        var actor=materialAccess.readActor(username);
+        CaseFile c=get(caseId);
+        String reason=CaseFactService.text(req==null?null:req.reason(),2000,"补查理由");
+        String reference=CaseFactService.text(req.sourceReference(),1000,"补查材料依据");
+        if(!"NORMAL".equals(c.getProcedureType()) || !List.of("REPORTED","NOTIFIED").contains(c.getStatus())
+                || decisionRepository.findByCaseId(caseId).isPresent())
+            throw new BizException(2194,"仅尚未决定的普通程序已终结调查案件可退回补查");
+        CaseReview review=reviewRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+        if(review==null || review.getReviewedAt()==null || !Set.of("CONTINUE","CHANGE","CORRECT").contains(java.util.Objects.toString(review.getOpinionType(),""))
+                || Boolean.TRUE.equals(review.getPassed()))
+            throw new BizException(2194,"须依据最新已完成且要求继续调查、变更或纠正的法审意见办理补查");
+        if(!jdbc.queryForList("select id from case_investigation_return where review_id=?",review.getId()).isEmpty())
+            throw new BizException(2194,"该审核意见已办理补查，请完成新报告并重新送审");
+        var before=factHistory.snapshot(caseId);
+        var notice=noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+        jdbc.update("""
+            insert into case_investigation_return(case_id,review_id,previous_status,previous_reported_at,prior_notice_id,
+              reason,source_reference,actor_id,actor_username) values(?,?,?,?,?,?,?,?,?)
+            """,caseId,review.getId(),c.getStatus(),c.getReportedAt(),notice==null?null:notice.getId(),reason,reference,actor.id(),username);
+        factHistory.record(caseId,"INVESTIGATION_RETURN",null,review.getId(),LocalDate.now(),before,before,reason,reference,username);
+        c.setStatus("INVESTIGATING");
+        c.setReportedAt(null);
         return caseRepository.save(c);
     }
 
@@ -1010,6 +1072,13 @@ public class CaseService {
                     2006, "作出处罚决定前应当书面告知当事人并听取陈述申辩（第41条）", "HANDLER");
             CaseNotice notice = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
             out.check("notice", "处罚告知记录", notice != null, 2006, "缺少处罚告知记录（第41条）", "HANDLER");
+            var returns=jdbc.queryForList("select review_id,prior_notice_id from case_investigation_return where case_id=? order by id desc limit 1",caseId);
+            boolean returned=!returns.isEmpty();
+            if(returned) {
+                var prior=returns.getFirst().get("prior_notice_id");
+                out.check("reinvestigation_notice","补查后重新告知",notice!=null && (prior==null || notice.getId()>((Number)prior).longValue()),
+                        2194,"补查后须重新履行告知程序，不能沿用补查前告知", "HANDLER");
+            }
             LocalDate heldHearing = procedureService.heldHearingDate(caseId);
             if (notice != null) {
                 List<CaseNotice> notices = noticeRepository.findByCaseIdOrderByIdDesc(caseId);
@@ -1037,8 +1106,10 @@ public class CaseService {
                         "陈述申辩期至 " + notice.getStatementDeadline()
                                 + " 届满前不得作出处罚决定（第41条）；当事人已陈述申辩或明确放弃的，请先录入陈述申辩记录", "HANDLER");
             }
-            if (validAmounts && documentService.legalReviewRequired(caseId, fine, recoup, conf)) {
+            if (validAmounts && (returned || documentService.legalReviewRequired(caseId, fine, recoup, conf))) {
                 CaseReview review = reviewRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
+                if(returned) out.check("reinvestigation_review","补查后新法审",review!=null && review.getId()>((Number)returns.getFirst().get("review_id")).longValue(),
+                        2194,"补查后须重新提交法制审核，原意见保留历史", "LEGAL");
                 out.check("legal_review", "法制审核通过", review != null && Boolean.TRUE.equals(review.getPassed()),
                         2005, "本案属法制审核范围，未经审核通过不得作出决定（第37条/辽40条）", "LEGAL");
                 out.check("legal_review_materials", "法制审核覆盖当前材料", review != null && reviewMaterials.matches(review),
@@ -1197,6 +1268,8 @@ public class CaseService {
     public CaseFile deliver(Long caseId, DeliveryReq req) {
         CaseGuards.lockWritable(jdbc, caseId);
         materialAccess.requireCurrentCaseWriter(caseId);
+        if(Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from case_effective_decisions(current_date,clock_timestamp()) where case_id=? and version_id is not null)",Boolean.class,caseId)))
+            throw new BizException(2193,"本案已有当前生效的独立决定版本，不得继续登记原决定送达；请办理具体后续版本文书送达");
         CaseFile c = get(caseId);
         if (!"DECIDED".equals(c.getStatus())) throw new BizException(2041, "仅已决定的案件可登记送达（第59条）");
         if (!List.of("DIRECT", "MAIL", "LEFT", "ELECTRONIC", "ANNOUNCE").contains(req.method()))

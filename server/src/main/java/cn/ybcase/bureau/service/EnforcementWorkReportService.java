@@ -35,7 +35,7 @@ public class EnforcementWorkReportService {
         ReportExport.query(jdbc, """
                 with period as (select cast(? as date) as starts, cast(? as date) as ends)
                 select c.id as report_case_id, c.case_no, dept.name as department, officers.leads, c.party_name, officers.members,
-                       case c.institution_kind when 'SINGLE_PHARMACY' then '单体药店'
+                       case rf.institution_kind when 'SINGLE_PHARMACY' then '单体药店'
                             when 'CHAIN_PHARMACY' then '连锁药店' when 'MEDICAL' then
                             case rf.institution_ownership when 'PUBLIC' then '公立医疗机构'
                                  when 'SOCIAL' then '非公立医疗机构' end end as institution_type,
@@ -61,7 +61,7 @@ public class EnforcementWorkReportService {
                                  '日常检查：' || inspections.ordinary) as remarks,
                        inspections.national, inspections.provincial, inspections.municipal
                 from case_file c cross join period p
-                left join case_reporting_facts_at() rf on rf.case_id = c.id
+                left join lateral case_effective_reporting_facts(p.ends) rf on rf.case_id = c.id
                 left join sys_dept dept on dept.id = c.owner_dept_id
                 left join case_clue cl on cl.id = c.clue_id
                 left join case_effective_decisions(?) d on d.case_id = c.id and d.decided_at <= p.ends

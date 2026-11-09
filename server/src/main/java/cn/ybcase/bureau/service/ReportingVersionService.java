@@ -146,6 +146,7 @@ public class ReportingVersionService {
                 return metadata(value, actor);
             throw invalid("该冻结批次已确认");
         }
+        if (!"GENERATED".equals(value.get("status"))) throw invalid("该批次已撤回、退回或作废，不能确认");
         if (actor.id().equals(number(value.get("generated_by"))))
             throw new BizException(403, "生成者不能确认本人生成的报表");
         long rows = jdbc.queryForObject("select count(*) from report_frozen_row where batch_id=?", Long.class, id);
@@ -155,6 +156,31 @@ public class ReportingVersionService {
                     confirmer_dept_id=?,confirmed_at=now(),confirmation_note=? where id=? and status='GENERATED'
                 """, actor.id(), actor.username(), actor.deptId(), opinion.strip(), id);
         return metadata(batch(id), actor);
+    }
+
+    @Transactional
+    public Map<String,Object> transition(long id,String action,String opinion,String username) {
+        if (!Set.of("WITHDRAW","RETURN","VOID").contains(Objects.toString(action,""))) throw invalid("无效的报表处理操作");
+        if (opinion==null||opinion.isBlank()||opinion.length()>2000||opinion.indexOf(0)>=0) throw invalid("须填写不超过2000字的处理理由");
+        if(jdbc.queryForList("select id from report_frozen_batch where id=? for no key update",id).isEmpty())throw invalid("报表批次不存在");
+        var observed=jdbc.queryForList("select dept_id from sys_user where username=?",Long.class,username);
+        if(!observed.isEmpty()&&observed.getFirst()!=null)jdbc.queryForList("select id from sys_dept where id=? for share",observed.getFirst());
+        var actor=materials.lockActor(username,false);requireReader(actor);
+        if(!Objects.equals(observed.isEmpty()?null:observed.getFirst(),actor.deptId()))throw new BizException(403,"账号所属机构已变化，请刷新核对");
+        var value=batch(id);
+        boolean own=actor.id().equals(number(value.get("generated_by")));
+        if("WITHDRAW".equals(action)?!own:own||!canConfirm(actor))throw new BizException(403,"仅生成者可撤回；退回或作废须另一名已归类局机关法制或负责人办理");
+        String status=switch(action){case "WITHDRAW"->"WITHDRAWN";case "RETURN"->"REJECTED";default->"VOIDED";};
+        var old=jdbc.queryForList("select * from report_batch_event where batch_id=?",id);
+        if(!old.isEmpty()){
+            var event=old.getFirst();
+            if(actor.id().equals(number(event.get("actor_id")))&&action.equals(event.get("event_type"))&&opinion.strip().equals(event.get("opinion")))return metadata(value,actor);
+            throw invalid("该批次已终结，不能重复处理");
+        }
+        if(!"GENERATED".equals(value.get("status"))&&!("VOID".equals(action)&&"CONFIRMED".equals(value.get("status"))))throw invalid("当前批次不能执行该操作");
+        jdbc.update("insert into report_batch_event(batch_id,event_type,previous_status,resulting_status,actor_id,actor_username,opinion) values(?,?,?,?,?,?,?)",id,action,value.get("status"),status,actor.id(),actor.username(),opinion.strip());
+        jdbc.update("update report_frozen_batch set status=? where id=?",status,id);
+        return metadata(batch(id),actor);
     }
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
@@ -243,6 +269,11 @@ public class ReportingVersionService {
         result.put("criteria", parse(row.get("criteria")));
         result.put("canConfirm", "GENERATED".equals(row.get("status")) && canConfirm(actor)
                 && !actor.id().equals(number(row.get("generated_by"))));
+        boolean own=actor.id().equals(number(row.get("generated_by")));
+        result.put("canWithdraw","GENERATED".equals(row.get("status"))&&own);
+        result.put("canReturn","GENERATED".equals(row.get("status"))&&!own&&canConfirm(actor));
+        result.put("canVoid",Set.of("GENERATED","CONFIRMED").contains(row.get("status"))&&!own&&canConfirm(actor));
+        result.put("events",jdbc.queryForList("select event_type,previous_status,resulting_status,actor_username,opinion,created_at from report_batch_event where batch_id=? order by id",row.get("id")));
         result.put("columns", columns(ReportExport.Kind.valueOf((String) row.get("report_type"))));
         return result;
     }

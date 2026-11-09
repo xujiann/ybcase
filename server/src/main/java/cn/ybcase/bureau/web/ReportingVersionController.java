@@ -26,6 +26,12 @@ public class ReportingVersionController {
     private final ReportingVersionService versions;
 
     public record Confirmation(String opinion) {}
+    public record Transition(String action,String opinion) {}
+
+    @PostMapping("/{id}/transition")
+    public ResponseEntity<R<Map<String,Object>>> transition(@PathVariable long id,@RequestBody Transition body,Authentication auth) {
+        return response(versions.transition(id,body.action(),body.opinion(),auth.getName()));
+    }
 
     @GetMapping
     public ResponseEntity<R<Map<String, Object>>> list(Authentication auth,

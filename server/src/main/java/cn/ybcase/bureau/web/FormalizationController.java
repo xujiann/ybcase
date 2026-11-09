@@ -45,9 +45,19 @@ public class FormalizationController {
     private final cn.ybcase.bureau.service.MaterialAccess materialAccess;
     private final cn.ybcase.core.security.AdminReadAccess adminReads;
     private final AgencyAgreementService agencyAgreements;
+    private final cn.ybcase.bureau.service.RuntimePolicy runtimePolicy;
 
 
     // ---------- 电子签章 ----------
+
+    @GetMapping("/signatures/policy")
+    @PreAuthorize("hasAnyRole('HANDLER','LEGAL','LEADER','ADMIN')")
+    @org.springframework.transaction.annotation.Transactional(readOnly = true,
+            isolation = org.springframework.transaction.annotation.Isolation.REPEATABLE_READ)
+    public R<Map<String, Object>> signaturePolicy(Authentication auth) {
+        materialAccess.readActor(auth.getName());
+        return R.ok(runtimePolicy.diagnostics());
+    }
 
     @PostMapping("/cases/{caseId}/documents/{docId}/sign")
     @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
@@ -56,6 +66,7 @@ public class FormalizationController {
                                        @RequestBody Map<String, Object> body, Authentication auth) {
         cn.ybcase.bureau.service.CaseGuards.lockWritable(jdbc, caseId);
         var actor = materialAccess.requireCaseWriter(caseId, auth.getName());
+        runtimePolicy.requireProvider(signatureProvider);
         var rows = jdbc.queryForList(
                 "select content from case_document where id = ? and case_id = ?", docId, caseId);
         if (rows.isEmpty()) throw new BizException(2045, "文书不存在");
@@ -72,7 +83,8 @@ public class FormalizationController {
                     where case_id=? and document_id=? and signer=? and signer_role=?
                       and provider='CA_GATEWAY' and content_hash=?
                     """, Integer.class, caseId, docId, signer, role, hash);
-            if (existing != null && existing > 0) return R.ok(Map.of("provider", "CA_GATEWAY", "contentHash", hash));
+            if (existing != null && existing > 0) return R.ok(Map.of("provider", "CA_GATEWAY", "contentHash", hash,
+                    "simulation", false, "formalAccepted", runtimePolicy.formalAccepted("CA_GATEWAY", true)));
         }
         var result = signatureProvider.sign(content, signer);
         // operator=登录用户：signer 可以是署名主体（如机构负责人），但谁点的签章必须可追溯
@@ -82,7 +94,9 @@ public class FormalizationController {
                 caseId, docId, signer, role, result.contentHash(), result.signature(), result.provider(),
                 auth.getName());
         jdbc.update("update case_document set signed = true where id = ? and case_id = ?", docId, caseId);
-        return R.ok(Map.of("provider", result.provider(), "contentHash", result.contentHash()));
+        return R.ok(Map.of("provider", result.provider(), "contentHash", result.contentHash(),
+                "simulation", "MOCK".equals(result.provider()),
+                "formalAccepted", runtimePolicy.formalAccepted(result.provider(), true)));
     }
 
     /** 验签：文书当前内容与签章时摘要一致性（防篡改） */
@@ -98,9 +112,12 @@ public class FormalizationController {
         String content = (String) doc.get(0).get("content");
         var sigs = jdbc.queryForList("select * from doc_signature where document_id = ? and case_id = ? order by id", docId, caseId);
         for (var s : sigs) {
-            s.put("valid", signatureProvider.verify(content,
+            boolean valid = signatureProvider.verify(content,
                     (String) s.get("content_hash"), (String) s.get("signature"),
-                    (String) s.get("signer"), (String) s.get("provider")));
+                    (String) s.get("signer"), (String) s.get("provider"));
+            s.put("valid", valid);
+            s.put("simulation", "MOCK".equals(s.get("provider")));
+            s.put("formalAccepted", runtimePolicy.formalAccepted((String) s.get("provider"), valid));
         }
         return R.ok(sigs);
     }
@@ -212,6 +229,9 @@ public class FormalizationController {
             decisionDocument |= "DECISION".equals(jdbc.queryForObject(
                     "select doc_type from case_document where id=? and case_id=?", String.class, documentId, caseId));
         }
+        if (decisionDocument && Boolean.TRUE.equals(jdbc.queryForObject(
+                "select exists(select 1 from case_effective_decisions(current_date,clock_timestamp()) where case_id=? and version_id is not null)",Boolean.class,caseId)))
+            throw new BizException(2193,"原决定已有当前生效的独立结果版本，请通过具体后续文书登记送达");
         if ("ELECTRONIC".equals(method)) {
             if (decisionDocument && !Boolean.TRUE.equals(jdbc.queryForObject(
                     "select exists(select 1 from sys_config where cfg_key='delivery_electronic_decision_allowed' and cfg_value='true')", Boolean.class)))

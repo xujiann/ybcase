@@ -30,7 +30,7 @@
     <el-table v-loading="loading" :data="batches" border size="small">
       <el-table-column prop="id" label="批次" width="75" />
       <el-table-column label="报表" min-width="160"><template #default="{ row }">{{ types[row.report_type as Kind] }}</template></el-table-column>
-      <el-table-column label="状态" width="90"><template #default="{ row }">{{ row.status === 'CONFIRMED' ? '已确认' : '待确认' }}</template></el-table-column>
+      <el-table-column label="状态" width="90"><template #default="{ row }">{{ statusLabel(row.status) }}</template></el-table-column>
       <el-table-column label="业务期间" min-width="215"><template #default="{ row }">{{ row.period_start }} 至 {{ row.period_end }}</template></el-table-column>
       <el-table-column prop="business_cutoff" label="业务截至日" width="112" />
       <el-table-column prop="known_at" label="生成取数时点" min-width="180" show-overflow-tooltip />
@@ -50,7 +50,7 @@
     <el-dialog v-model="previewVisible" title="冻结报表预览" width="95%" :close-on-click-modal="!saving" :show-close="!saving">
       <template v-if="selected">
         <el-descriptions :column="2" border size="small">
-          <el-descriptions-item label="批次">{{ selected.id }} · {{ selected.status === 'CONFIRMED' ? '已确认' : '待确认' }}</el-descriptions-item>
+          <el-descriptions-item label="批次">{{ selected.id }} · {{ statusLabel(selected.status) }}</el-descriptions-item>
           <el-descriptions-item label="前版">{{ selected.parent_batch_id || '—' }}</el-descriptions-item>
           <el-descriptions-item label="模板版本">{{ selected.template_version }}</el-descriptions-item>
           <el-descriptions-item label="口径版本">{{ selected.rule_version }}</el-descriptions-item>
@@ -94,12 +94,19 @@
                            layout="total, prev, pager, next" @current-change="loadChanges" />
           </el-tab-pane>
         </el-tabs>
-        <el-input v-if="selected.canConfirm" v-model="opinion" :disabled="saving" type="textarea" maxlength="2000"
+        <el-table v-if="selected.events?.length" :data="selected.events" border size="small">
+          <el-table-column prop="actor_username" label="处理人" /><el-table-column prop="resulting_status" label="终态" />
+          <el-table-column prop="opinion" label="处理理由" /><el-table-column prop="created_at" label="时间" />
+        </el-table>
+        <el-input v-if="selected.canConfirm || selected.canWithdraw || selected.canReturn || selected.canVoid" v-model="opinion" :disabled="saving" type="textarea" maxlength="2000"
                   :rows="2" placeholder="填写逐行核对及文件确认意见" />
       </template>
       <template #footer>
         <el-button :disabled="saving" @click="previewVisible = false">关闭</el-button>
         <el-button v-if="selected" :loading="downloading" :disabled="saving" @click="download(selected)">原样下载</el-button>
+        <el-button v-if="selected?.canWithdraw" :loading="saving" @click="transition('WITHDRAW')">撤回批次</el-button>
+        <el-button v-if="selected?.canReturn" :loading="saving" @click="transition('RETURN')">退回批次</el-button>
+        <el-button v-if="selected?.canVoid" type="danger" :loading="saving" @click="transition('VOID')">作废批次</el-button>
         <el-button v-if="selected?.canConfirm" type="primary" :loading="saving" @click="confirm">确认冻结批次</el-button>
       </template>
     </el-dialog>
@@ -118,7 +125,7 @@ import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../api/sessionExpiry'
 type Kind = 'PENALTIES' | 'ENFORCEMENT_WORK' | 'INTERVIEWS'
 interface Batch {
   id: number; report_type: Kind; status: string; period_start: string; period_end: string; business_cutoff: string
-  known_at: string; generated_username: string; row_count: number; parent_batch_id?: number; canConfirm: boolean
+  known_at: string; generated_username: string; row_count: number; parent_batch_id?: number; canConfirm: boolean; canWithdraw?: boolean; canReturn?: boolean; canVoid?: boolean; events?: Record<string, unknown>[]
   template_version: string; rule_version: string; file_sha256: string; template_sha256: string; filename: string
   confirmed_username?: string; confirmation_note?: string; columns: string[]; criteria: { year?: number }
 }
@@ -252,6 +259,23 @@ async function confirm() {
     ElMessage.success('冻结批次已确认')
     await loadList()
   } catch { /* Keep the confirmation opinion for correction or retry. */ }
+  finally { saving.value = false }
+}
+function statusLabel(status: string) { return ({ GENERATED: '待确认', CONFIRMED: '已确认', WITHDRAWN: '已撤回', REJECTED: '已退回', VOIDED: '已作废' } as Record<string,string>)[status] || status }
+async function transition(action: 'WITHDRAW' | 'RETURN' | 'VOID') {
+  const batch = selected.value
+  if (!batch || disposed || saving.value || !previewVisible.value || !allowed.value) return
+  if (!(action === 'WITHDRAW' ? batch.canWithdraw : action === 'RETURN' ? batch.canReturn : batch.canVoid)) return
+  if (!opinion.value.trim()) { ElMessage.warning('请填写撤回、退回或作废理由'); return }
+  const context = capture(), body = { action, opinion: opinion.value.trim() }
+  saving.value = true
+  try {
+    const { data } = await client.post(base + '/' + batch.id + '/transition', body)
+    if (!current(context) || selected.value?.id !== batch.id || !previewVisible.value) return
+    selected.value = data.data
+    ElMessage.success('批次已处理，原文件及来源记录保留')
+    await loadList()
+  } catch { /* Preserve reason for a safe retry. */ }
   finally { saving.value = false }
 }
 async function download(batch: Batch) {

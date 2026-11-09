@@ -33,7 +33,7 @@ public class AgencyInterviewService {
         var sources = jdbc.queryForList("""
                 select a.agency_cycle,a.agency_dept_id,a.sent_at,c.party_name,rf.institution_code,d.name as department_name
                 from agreement_action a join case_file c on c.id=a.case_id
-                join case_reporting_facts rf on rf.case_id=c.id
+                join case_effective_reporting_facts((current_timestamp at time zone 'Asia/Shanghai')::date) rf on rf.case_id=c.id
                 join sys_dept d on d.id=a.agency_dept_id and d.enabled and d.org_kind='AGENCY'
                 where a.id=? and a.action='INTERVIEW' and a.agency_status='COMPLETED'
                   and (a.agency_result_type='COMPLETED' or a.agency_result_type is null) and c.party_type='PROVIDER'

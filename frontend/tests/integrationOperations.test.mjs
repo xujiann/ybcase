@@ -15,7 +15,7 @@ function fixture(t, component='IntegrationWorkbench',role='LEADER') {
   const client={get:(path,config)=>request('GET',path,null,config),post:(path,body,config)=>request('POST',path,body,config)}
   const source=readFileSync(new URL(`../src/components/${component}.vue`,import.meta.url),'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .+\r?\n/gm,'')
   const scope=Vue.effectScope()
-  const exports=component==='IntegrationWorkbench'?'refresh,loadPage,selectSources,createBatch,openBatch,openItem,openAction,submitAction,runBatch,sources,selected,detail,detailVisible,actionVisible,activeItem,form,busy,failed':'load,create,send,expire,data,documentId,busy,failed,hasAddress,canWrite'
+  const exports=component==='IntegrationWorkbench'?'refresh,loadPage,selectSources,createBatch,openBatch,openItem,openAction,submitAction,runBatch,sources,selected,detail,detailVisible,actionVisible,activeItem,form,busy,failed':'load,create,send,expire,data,documentId,busy,failed,hasAddress,canWrite,canSupplement,openReplace,replaceRound,replaceVisible,replacement,replacementRow'
   const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(source)+`;({${exports}})`,{...Vue,client,useAuthStore:()=>auth,defineProps:()=>props,sessionExpiry,SESSION_EXPIRED_EVENT,crypto:{randomUUID:()=>`request-${requests.length}`},ElMessage:{info:m=>notices.push(m),warning:m=>notices.push(m)},onMounted:()=>{},onUnmounted:fn=>unmounts.push(fn),window:{addEventListener:(k,fn)=>listeners.set(k,fn),removeEventListener:k=>listeners.delete(k)}}))
   t.after(()=>{unmounts.forEach(fn=>fn());scope.stop()})
   return {...view,auth,props,requests,notices}
@@ -91,4 +91,31 @@ test('delivery sending retains supplier idempotency route and blocks duplicate c
   const pending=f.send(row);await f.send(row);assert.equal(f.requests.length,1);assert.equal(f.requests[0].path,'/bureau/cases/1/electronic-deliveries/20/send')
   f.requests[0].reject(new Error('network'));await pending
   assert.equal(f.busy.value,false);assert.equal(f.data.value.deliveries[0].id,20)
+})
+
+test('replacing a failed delivery keeps the replacement request on uncertain result and rejects duplicate clicks',async t=>{
+  const f=fixture(t,'DeliveryReceiptsPanel');f.data.value=deliveryData();const row=f.data.value.deliveries[0]
+  f.openReplace(row);f.replacement.value.reason='核实旧供应商结果和新地址';f.replacement.value.providerChecked=true
+  const first=f.replaceRound();await f.replaceRound();assert.equal(f.requests.length,1)
+  const key=f.requests[0].body.requestKey;f.requests[0].reject(new Error('timeout'));await first
+  const retry=f.replaceRound();assert.equal(f.requests[1].body.requestKey,key);f.requests[1].reject(new Error('timeout'));await retry
+  assert.equal(f.replaceVisible.value,true);assert.equal(f.busy.value,false)
+})
+
+test('sealed original cannot send while independent supplement retains its own send and replacement route',async t=>{
+  const f=fixture(t,'DeliveryReceiptsPanel')
+  f.data.value=deliveryData({status:'CLOSED',archive_no:'SEALED',deliveries:[{id:21,status:'DRAFT'},{id:22,status:'DRAFT',supplement_document_id:7}]})
+  assert.equal(f.canWrite.value,false);assert.equal(f.canSupplement.value,true)
+  await f.send(f.data.value.deliveries[0]);assert.equal(f.requests.length,0)
+  const p=f.send(f.data.value.deliveries[1]);assert.equal(f.requests[0].path,'/bureau/cases/1/electronic-deliveries/22/send');f.requests[0].reject(new Error('timeout'));await p
+  f.openReplace(f.data.value.deliveries[1]);assert.equal(f.replaceVisible.value,true)
+})
+
+test('in-flight and superseded deliveries cannot start replacement and old identity cannot reopen replacement after response',async t=>{
+  const f=fixture(t,'DeliveryReceiptsPanel');f.data.value=deliveryData({deliveries:[{id:20,status:'SENT'},{id:21,status:'SUPERSEDED',superseded_at:'2026-11-08'},{id:22,status:'FAILED'}]})
+  f.openReplace(f.data.value.deliveries[0]);assert.equal(f.replaceVisible.value,false)
+  f.openReplace(f.data.value.deliveries[1]);assert.equal(f.replaceVisible.value,false)
+  f.openReplace(f.data.value.deliveries[2]);f.replacement.value.reason='已核对';f.replacement.value.providerChecked=true
+  const p=f.replaceRound();f.auth.user.id=4;f.requests[0].resolve({id:23});await p
+  assert.equal(f.replaceVisible.value,false);assert.equal(f.replacementRow.value,null);assert.equal(f.data.value,null)
 })

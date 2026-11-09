@@ -25,7 +25,11 @@ public class CaseContinuationService {
     private final ObjectMapper mapper;
     private final MaterialAccess access;
     private final WorkflowUserAccess users;
-    private static final Set<String> TYPES = Set.of("EXECUTION", "REVERSAL", "REFUND", "COURT_APPLY", "COURT_RECEIPT", "REMEDY_RESULT");
+    private final CaseFactService factHistory;
+    private final SupplementBundleService materialBundles;
+    private static final Set<String> TYPES = Set.of("EXECUTION", "REVERSAL", "REFUND", "COURT_APPLY", "COURT_RECEIPT", "REMEDY_RESULT", "FACT_CORRECTION");
+    private static final Set<String> FACT_FIELDS=Set.of("institutionCode","institutionOwnership","institutionGrade","institutionKind",
+            "confirmedViolationStart","confirmedViolationEnd","confirmedViolationFacts","confirmedViolationAmount");
     private static final Set<String> KINDS = Set.of("FINE", "RECOUP", "CONFISCATE", "LATE_FEE");
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
@@ -49,6 +53,7 @@ public class CaseContinuationService {
         var originals=jdbc.queryForList("select * from case_decision where case_id=?", caseId);
         result.put("originalDecision", originals.isEmpty()?Map.of():originals.getFirst());
         result.put("effectiveDecision", effectiveDecision(caseId, cutoff));
+        result.put("effectiveFacts",jdbc.queryForMap("select * from case_effective_reporting_facts(?) where case_id=?",cutoff,caseId));
         result.put("executions", jdbc.queryForList("select * from case_effective_executions(?) where case_id=? order by paid_at,source,id", cutoff, caseId));
         result.put("balances", balances(caseId, cutoff));
         result.put("courtRounds", courtRounds(caseId));
@@ -93,12 +98,13 @@ public class CaseContinuationService {
 
     @Transactional
     public long request(long caseId, Map<String,Object> body, String username) {
-        keys(body,Set.of("type","requestKey","reason","sourceReference","payload"));
+        allowedKeys(body,Set.of("type","requestKey","reason","sourceReference","payload"),Set.of("materialBundleId"));
         String type=choice(body.get("type"),TYPES,"续办类型");
         String key=requestKey(body.get("requestKey"));
         String reason=text(body.get("reason"),1000,"申请理由");
         String evidence=text(body.get("sourceReference"),1000,"材料出处");
         Map<String,Object> payload=object(body.get("payload"));
+        Long bundleId=body.get("materialBundleId")==null?null:positiveId(body.get("materialBundleId"));
         payload.replaceAll((field,value)->value instanceof String s?s.strip():value);
         CaseGuards.lock(jdbc,caseId);
         var actor=access.requireCaseWriter(caseId,username);
@@ -107,17 +113,23 @@ public class CaseContinuationService {
         if (!old.isEmpty()) {
             var row=old.getFirst();
             if (type.equals(row.get("request_type")) && same(payload,row.get("payload")) && reason.equals(row.get("reason"))
-                    && evidence.equals(row.get("source_reference")) && actor.id().equals(number(row.get("requested_by")))) return number(row.get("id"));
+                    && evidence.equals(row.get("source_reference")) && actor.id().equals(number(row.get("requested_by")))) {
+                long existingId=number(row.get("id"));
+                materialBundles.attachToRequest(caseId,existingId,bundleId,username);
+                return existingId;
+            }
             throw invalid("请求号已用于其他申请内容");
         }
         if (!eligible(source(caseId))) throw invalid("仅已有处理决定的案件可以办理后续事项");
         noPending(caseId);
         validate(caseId,type,payload);
-        return jdbc.queryForObject("""
+        long requestId=jdbc.queryForObject("""
                 insert into case_continuation_request(case_id,request_key,request_type,payload,source_snapshot,reason,
                    source_reference,requested_by,requested_username,requester_dept_id,requester_category)
                 values(?,?,?,?::jsonb,?::jsonb,?,?,?,?,?,?) returning id
                 """,Long.class,caseId,key,type,json(payload),snapshot(caseId),reason,evidence,actor.id(),username,actor.deptId(),actor.accountCategory());
+        materialBundles.attachToRequest(caseId,requestId,bundleId,username);
+        return requestId;
     }
 
     @Transactional
@@ -127,11 +139,20 @@ public class CaseContinuationService {
         String opinion=text(body.get("opinion"),2000,"复核意见");
         CaseGuards.lock(jdbc,caseId);
         var request=lockedRequest(caseId,id);
+        boolean factReview=needsFactReviewer(request);
+        Long observedDepartment=null;
+        if(factReview) {
+            var department=jdbc.queryForList("select dept_id from sys_user where username=?",Long.class,username);
+            observedDepartment=department.isEmpty()?null:department.getFirst();
+            if(observedDepartment!=null) jdbc.queryForList("select id from sys_dept where id=? for share",observedDepartment);
+        }
         // Ordered account locking matches account administration and concurrent actor reassignments.
         var actors=users.lockUsers(username,(String)request.get("requested_username"));
         var actor=access.lockActor(username,false);
         requireReviewer(actor);
         access.assertCaseScope(caseId,actor);
+        if(factReview && (!Objects.equals(observedDepartment,actor.deptId()) || !factReviewer(actor)))
+            throw forbidden("有效事实变更须由另一名所属机构已启用并归类的局机关法制或负责人复核；请核对当前机构归属");
         if (actor.id().equals(number(request.get("requested_by")))) throw forbidden("申请人不能复核本人申请");
         pending(request);
         if (approve) {
@@ -145,8 +166,9 @@ public class CaseContinuationService {
             var payload=object(request.get("payload"));
             String type=(String)request.get("request_type");
             validate(caseId,type,payload);
+            materialBundles.assertRequestMaterials(caseId,id);
             finish(id,"APPROVED",actor,opinion);
-            apply(caseId,id,type,payload,(String)request.get("reason"));
+            apply(caseId,id,type,payload,(String)request.get("reason"),(String)request.get("source_reference"),username);
         } else finish(id,"REJECTED",actor,opinion);
     }
 
@@ -242,6 +264,12 @@ public class CaseContinuationService {
                 text(p.get("receiptNo"),128,"法院回执文号");
             }
             case "REMEDY_RESULT" -> validateRemedy(caseId,p);
+            case "FACT_CORRECTION" -> {
+                allowedKeys(p,Set.of("effectiveAt"),FACT_FIELDS);
+                LocalDate effective=day(p.get("effectiveAt"),"事实更正生效日期");
+                if(effective.isBefore(date(source(caseId).get("decided_at")))) throw invalid("决定后的事实更正不得早于原决定日期");
+                if(normalizedFacts(caseId,p).isEmpty()) throw invalid("须填写要更正的完整机构资料或完整认定事实");
+            }
             default -> throw invalid("不支持的续办类型");
         }
     }
@@ -249,8 +277,12 @@ public class CaseContinuationService {
     private void validateRemedy(long caseId,Map<String,Object> p) {
         String outcome=choice(p.get("outcome"),Set.of("MAINTAIN","CORRECT","CHANGE","REVOKE"),"结果结论");
         Set<String> fields=new HashSet<>(Set.of("remedyId","outcome","effectiveAt","resultReference","resultContent"));
-        if (!"MAINTAIN".equals(outcome)) fields.addAll(Set.of("decisionType","decisionNo","fineAmount","recoupAmount","confiscateAmount","penaltyBasis","content","otherMeasures"));
-        keys(p,fields);
+        Set<String> optionalFields=new HashSet<>();
+        if (!"MAINTAIN".equals(outcome)) {
+            fields.addAll(Set.of("decisionType","decisionNo","fineAmount","recoupAmount","confiscateAmount","penaltyBasis","content"));
+            optionalFields.add("otherMeasures");optionalFields.addAll(FACT_FIELDS);
+        }
+        allowedKeys(p,fields,optionalFields);
         long remedy=positiveId(p.get("remedyId"));
         var rows=jdbc.queryForList("select * from case_remedy where id=? and case_id=?",remedy,caseId);
         if (rows.isEmpty() || exists("select exists(select 1 from case_continuation_request where case_id="+caseId
@@ -260,6 +292,8 @@ public class CaseContinuationService {
         text(p.get("resultReference"),128,"结果文号");
         text(p.get("resultContent"),12000,"结果材料及人工确认结论");
         if ("MAINTAIN".equals(outcome)) return;
+        var facts=normalizedFacts(caseId,p);
+        if("CORRECT".equals(outcome) && !facts.isEmpty()) throw invalid("文字更正不能改变结构化认定事实；请按材料选择变更结果或独立事实更正");
         var previous=effectiveDecision(caseId,today());
         if (effective.isBefore(date(previous.get("effective_at")))) throw invalid("不得插入早于当前有效决定版本的结果，请核实历史版本顺序");
         String decision=choice(p.get("decisionType"),Set.of("PUNISH","NO_PUNISH","NOT_ESTABLISHED","TRANSFER_ADMIN","TRANSFER_JUDICIAL","REVOKED"),"有效决定类型");
@@ -275,7 +309,7 @@ public class CaseContinuationService {
         optional(p.get("otherMeasures"),512,"其他措施");
     }
 
-    private void apply(long caseId,long requestId,String type,Map<String,Object> p,String reason) {
+    private void apply(long caseId,long requestId,String type,Map<String,Object> p,String reason,String reference,String username) {
         switch(type) {
             case "EXECUTION" -> jdbc.update("""
                 insert into case_execution_continuation(case_id,request_id,kind,amount,paid_at,receipt_no,method,note)
@@ -312,9 +346,43 @@ public class CaseContinuationService {
                     values(?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,caseId,requestId,positiveId(p.get("remedyId")),p.get("outcome"),day(p.get("effectiveAt"),"生效日期"),p.get("decisionType"),p.get("decisionNo"),
                         money(p.get("fineAmount"),false),money(p.get("recoupAmount"),false),money(p.get("confiscateAmount"),false),p.get("penaltyBasis"),p.get("content"),p.get("otherMeasures"));
+                var facts=normalizedFacts(caseId,p);
+                if(!facts.isEmpty()) recordApprovedFacts(caseId,requestId,"APPROVED_RESULT",p,facts,reason,reference,username);
             }
+            case "FACT_CORRECTION" -> recordApprovedFacts(caseId,requestId,"APPROVED_FACT_CORRECTION",p,normalizedFacts(caseId,p),reason,reference,username);
             default -> throw invalid("不支持的续办类型");
         }
+    }
+
+    private void recordApprovedFacts(long caseId,long requestId,String type,Map<String,Object> p,Map<String,Object> facts,
+                                     String reason,String reference,String username) {
+        Map<String,Object> previous=jdbc.queryForMap("select * from case_effective_reporting_facts() where case_id=?",caseId);
+        factHistory.record(caseId,type,requestId,null,day(p.get("effectiveAt"),"生效日期"),facts,previous,reason,reference,username);
+    }
+
+    private Map<String,Object> normalizedFacts(long caseId,Map<String,Object> p) {
+        var result=new LinkedHashMap<String,Object>();
+        boolean institution=List.of("institutionCode","institutionOwnership","institutionGrade","institutionKind")
+                .stream().anyMatch(key->p.get(key)!=null && !"".equals(p.get(key)));
+        if(institution) {
+            String party=jdbc.queryForObject("select party_type from case_file where id=?",String.class,caseId);
+            var value=CaseService.normalizeInstitution(party,new CaseService.InstitutionReq(
+                    text(p.get("institutionCode"),64,"机构编码"),choice(p.get("institutionOwnership"),Set.of("PUBLIC","SOCIAL"),"机构性质"),
+                    choice(p.get("institutionGrade"),Set.of("TERTIARY","SECONDARY","PRIMARY","UNGRADED"),"机构等级"),
+                    p.get("institutionKind")==null?null:choice(p.get("institutionKind"),Set.of("MEDICAL","SINGLE_PHARMACY","CHAIN_PHARMACY"),"机构类型")));
+            result.put("institutionCode",value.code());result.put("institutionOwnership",value.ownership());result.put("institutionGrade",value.grade());
+            if(value.kind()!=null) result.put("institutionKind",value.kind());
+        }
+        boolean finding=List.of("confirmedViolationStart","confirmedViolationEnd","confirmedViolationFacts","confirmedViolationAmount")
+                .stream().anyMatch(key->p.get(key)!=null && !"".equals(p.get(key)));
+        if(finding) {
+            LocalDate start=day(p.get("confirmedViolationStart"),"违法开始日期"),end=day(p.get("confirmedViolationEnd"),"违法结束日期");
+            if(start.isAfter(end) || end.isAfter(day(p.get("effectiveAt"),"生效日期"))) throw invalid("违法期间须有效且不晚于结果生效日期");
+            result.put("confirmedViolationStart",start.toString());result.put("confirmedViolationEnd",end.toString());
+            result.put("confirmedViolationFacts",text(p.get("confirmedViolationFacts"),12000,"认定违法事实"));
+            result.put("confirmedViolationAmount",money(p.get("confirmedViolationAmount"),false));
+        }
+        return result;
     }
 
     private Map<String,Object> reversalSource(long caseId,Map<String,Object> p) {
@@ -398,6 +466,7 @@ public class CaseContinuationService {
                 select jsonb_build_object('case',to_jsonb(c),'decision',to_jsonb(d),
                   'executions',(select jsonb_agg(to_jsonb(e) order by id) from case_execution e where e.case_id=c.id),
                   'versions',(select jsonb_agg(to_jsonb(v) order by id) from case_decision_version v where v.case_id=c.id),
+                  'factVersions',(select jsonb_agg(to_jsonb(v) order by id) from case_fact_revision v where v.case_id=c.id),
                   'continuations',(select jsonb_agg(to_jsonb(e) order by id) from case_execution_continuation e where e.case_id=c.id),
                   'rounds',(select jsonb_agg(to_jsonb(r) order by id) from case_court_round r where r.case_id=c.id),
                   'receipts',(select jsonb_agg(to_jsonb(r) order by id) from case_court_receipt r where r.case_id=c.id),
@@ -411,7 +480,7 @@ public class CaseContinuationService {
         for (String name:List.of("status","reason","opinion")) result.put(name,row.get(name));
         result.put("sourceReference",row.get("source_reference"));result.put("requestedBy",row.get("requested_username"));result.put("requestedAt",row.get("requested_at"));
         result.put("reviewedBy",row.get("reviewed_username"));result.put("reviewedAt",row.get("reviewed_at"));
-        result.put("canReview","PENDING".equals(row.get("status")) && reviewer(actor) && !actor.id().equals(number(row.get("requested_by"))));
+        result.put("canReview","PENDING".equals(row.get("status")) && reviewer(actor) && (!needsFactReviewer(row) || factReviewer(actor)) && !actor.id().equals(number(row.get("requested_by"))));
         result.put("canCancel","PENDING".equals(row.get("status")) && (actor.id().equals(number(row.get("requested_by"))) || actor.roles().contains("LEADER")));
         return result;
     }
@@ -425,6 +494,16 @@ public class CaseContinuationService {
     private boolean exists(String sql,Object...args) { return Boolean.TRUE.equals(jdbc.queryForObject(sql,Boolean.class,args)); }
     private boolean writer(WorkflowUserAccess.User actor) { return actor.roles().stream().anyMatch(Set.of("HANDLER","LEADER","ADMIN")::contains); }
     private boolean reviewer(WorkflowUserAccess.User actor) { return actor.roles().contains("LEGAL") || actor.roles().contains("LEADER"); }
+    private boolean factReviewer(WorkflowUserAccess.User actor) {
+        return reviewer(actor) && "BUREAU".equals(actor.accountCategory()) && actor.deptId()!=null
+                && exists("select exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')",actor.deptId());
+    }
+    private boolean needsFactReviewer(Map<String,Object> request) {
+        if("FACT_CORRECTION".equals(request.get("request_type")))return true;
+        if(!"REMEDY_RESULT".equals(request.get("request_type")))return false;
+        var payload=object(request.get("payload"));
+        return FACT_FIELDS.stream().anyMatch(key->payload.get(key)!=null && !"".equals(payload.get(key)));
+    }
     private void requireReader(WorkflowUserAccess.User actor) {
         if (!Set.of("DISTRICT","BUREAU").contains(actor.accountCategory()==null?"":actor.accountCategory()) || actor.deptId()==null
                 || actor.roles().contains("AGENCY") || actor.roles().stream().noneMatch(Set.of("HANDLER","LEGAL","LEADER","ADMIN")::contains)) throw forbidden("须使用已归类的行政办案账号");
@@ -432,6 +511,11 @@ public class CaseContinuationService {
     private void requireWriter(WorkflowUserAccess.User actor) { requireReader(actor);if (!writer(actor)) throw forbidden("当前岗位无权提交续办事项"); }
     private void requireReviewer(WorkflowUserAccess.User actor) { requireReader(actor);if (!reviewer(actor)) throw forbidden("须由另一名法制或负责人复核；管理员须兼任相应岗位"); }
     private static void keys(Map<String,Object> body,Set<String> allowed) { if (body==null || !body.keySet().equals(allowed)) throw invalid("请求字段缺失或包含未支持的字段"); }
+    private static void allowedKeys(Map<String,Object> body,Set<String> required,Set<String> optional) {
+        var allowed=new HashSet<>(required);allowed.addAll(optional);
+        if(body==null || !body.keySet().containsAll(required) || !allowed.containsAll(body.keySet()))
+            throw invalid("请求字段缺失或包含未支持的字段");
+    }
     private static String text(Object value,int max,String label) { if (!(value instanceof String s) || s.isBlank() || s.codePointCount(0,s.length())>max || s.indexOf(0)>=0) throw invalid(label+"须为不超过"+max+"字的非空文本");return s.strip(); }
     private static String optional(Object value,int max,String label) { return value==null || value instanceof String s && s.isBlank()?null:text(value,max,label); }
     private static String choice(Object value,Set<String> choices,String label) { if (!(value instanceof String s) || !choices.contains(s)) throw invalid(label+"无效");return s; }

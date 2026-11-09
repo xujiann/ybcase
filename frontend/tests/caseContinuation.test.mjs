@@ -17,11 +17,11 @@ function fixture(t) {
   const auth = Vue.reactive({ token: 'token-one', user: { id: 1, roles: ['HANDLER'], accountCategory: 'DISTRICT' } })
   const reads = [], writes = [], warnings = [], success = [], teardown = [], listeners = new Map()
   const sessionExpiry = createSessionExpiry()
-  const client = { get: (url, config) => new Promise((resolve, reject) => reads.push({ url, config,
+  const client = { get: (url, config) => url.endsWith('/supplement-bundles') ? Promise.resolve({data:{data:{bundles:[]}}}) : new Promise((resolve, reject) => reads.push({ url, config,
     resolve: value => resolve({ data: { data: value } }), reject })),
   post: (url, body) => new Promise((resolve, reject) => writes.push({ url, body: JSON.parse(JSON.stringify(body)), resolve, reject })) }
   const scope = Vue.effectScope()
-  const result = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) + ';({state,loading,saving,failed,cutoff,formVisible,reviewVisible,draft,reason,sourceReference,opinion,requestKey,open,submit,openReview,submitReview,load})', {
+  const result = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) + ';({state,loading,saving,failed,cutoff,formVisible,reviewVisible,draft,reason,sourceReference,opinion,requestKey,withFinding,withInstitution,materialBundleId,formFields,open,submit,openReview,submitReview,load})', {
     ...Vue, defineProps: () => props, useAuthStore: () => auth, client, sessionExpiry, SESSION_EXPIRED_EVENT,
     crypto: webcrypto, ElMessage: { warning: message => warnings.push(message), success: message => success.push(message) },
     onMounted: fn => fn(), onBeforeUnmount: fn => teardown.push(fn),
@@ -110,4 +110,31 @@ test('continuation late mutation success does not clear or refresh a newly navig
   f.props.caseId = 202; await ready(f, 'new-case')
   const count = f.reads.length; f.writes[0].resolve({ data: { data: { id: 1 } } }); await request
   assert.equal(f.state.value.marker, 'new-case'); assert.equal(f.reads.length, count); assert.equal(f.success.length, 0)
+})
+
+test('independent fact correction submits complete selected facts and an explicit approved material bundle', async t => {
+  const f=fixture(t);await ready(f)
+  f.state.value.effectiveFacts={confirmed_violation_start:'2026-10-01',confirmed_violation_end:'2026-10-02',confirmed_violation_facts:'原认定事实',confirmed_violation_amount:10000}
+  f.open('FACT_CORRECTION')
+  assert.equal(f.draft.confirmedViolationFacts,'原认定事实')
+  Object.assign(f.draft,{effectiveAt:'2026-11-01',confirmedViolationFacts:'按结果核定新事实',confirmedViolationAmount:'6000'})
+  f.reason.value='核对原始结果材料';f.sourceReference.value='复议结果第2页';f.materialBundleId.value=7
+  const request=f.submit();assert.equal(f.writes.length,1)
+  assert.equal(f.writes[0].body.type,'FACT_CORRECTION');assert.equal(f.writes[0].body.materialBundleId,7)
+  assert.equal(f.writes[0].body.payload.confirmedViolationAmount,6000)
+  assert.equal('institutionCode' in f.writes[0].body.payload,false)
+  f.writes[0].reject(new Error('uncertain response'));await request
+  assert.equal(f.formVisible.value,true)
+})
+
+test('fact correction cannot submit an empty selection and remedy maintenance does not leak hidden fact fields', async t=>{
+  const f=fixture(t);await ready(f);f.open('FACT_CORRECTION');f.withFinding.value=false;f.withInstitution.value=false
+  f.draft.effectiveAt='2026-11-01';f.reason.value='核对';f.sourceReference.value='材料'
+  await f.submit();assert.equal(f.writes.length,0)
+  f.state.value.remedies=[{id:2,status:'OPEN',remedy_type:'RECONSIDERATION',reference:'受理'}]
+  f.open('REMEDY_RESULT');f.withFinding.value=true
+  Object.assign(f.draft,{remedyId:'2',outcome:'MAINTAIN',effectiveAt:'2026-11-01',resultReference:'结果文号',resultContent:'维持原决定',confirmedViolationAmount:'900'})
+  f.reason.value='核实维持结果';f.sourceReference.value='结果材料'
+  const request=f.submit();assert.equal(f.writes.length,1);assert.equal('confirmedViolationAmount' in f.writes[0].body.payload,false)
+  f.writes[0].reject(new Error('failure'));await request
 })

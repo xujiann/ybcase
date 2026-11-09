@@ -99,3 +99,19 @@ test('report and treasury tasks navigate only to their explicit scoped focus rou
   f.openTask(f.rows.value[0]);f.openTask(f.rows.value[1])
   assert.deepEqual(f.routes,['/case/stats?reportBatch=8','/system/integrations?treasuryItem=9'])
 })
+
+test('supplement and interview review tasks navigate without allowing arbitrary case queries', async t => {
+  const f = fixture(t)
+  const links = [
+    '/case/detail/1?supplementBundle=11',
+    '/case/interviews',
+    '/case/detail/1?supplementBundle=11&other=12',
+    '/case/detail/1?supplementBundle=invalid',
+    '/case/interviews?focus=11',
+  ]
+  const pending = f.refresh()
+  f.requests[0].resolve(links.map((link, index) => task(index + 1, link)))
+  await pending
+  f.rows.value.forEach(f.openTask)
+  assert.deepEqual(f.routes, links.slice(0, 2))
+})

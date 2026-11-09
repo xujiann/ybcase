@@ -17,8 +17,9 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class PenaltyReportService {
     private static final String PENALTY_SOURCE = """
-             from case_effective_decisions(?) d join case_file cf on cf.id = d.case_id
-             left join case_reporting_facts_at() rf on rf.case_id = cf.id
+             from (select cast(? as date) as cutoff) effective_period
+             cross join lateral case_effective_decisions(effective_period.cutoff) d join case_file cf on cf.id = d.case_id
+             left join lateral case_effective_reporting_facts(effective_period.cutoff) rf on rf.case_id = cf.id
             """;
     private static final String PENALTY_POPULATION = """
             d.decision_type = 'PUNISH' and cf.party_type in ('PROVIDER', 'INDIVIDUAL')

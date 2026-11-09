@@ -529,7 +529,7 @@ class StatisticsScopeIntegrationTest {
                     .put(endpoint + "/" + rowId).header("Authorization", "Bearer " + editor.token())
                     .contentType("application/json").content(mapper.writeValueAsString(record)))
                     .andReturn().getResponse();
-            assertEquals(editor.equals(handler) ? 0 : 403, mapper.readTree(changed.getContentAsString()).path("code").asInt(-1));
+            assertEquals(editor.equals(handler) ? 2196 : 403, mapper.readTree(changed.getContentAsString()).path("code").asInt(-1));
         }
         jdbc.update("""
                 insert into department_interview (dept_id, department_name, institution_code, institution_name,
@@ -563,7 +563,7 @@ class StatisticsScopeIntegrationTest {
                 assertEquals("基金监督管理处", reportCell(sheet, "B" + row).getTextContent());
                 assertEquals("inlineStr", reportCell(sheet, "D" + row).getAttribute("t"));
                 assertEquals("=定点机构", reportCell(sheet, "D" + row).getTextContent());
-                assertEquals("更新后的实际约谈内容", reportCell(sheet, "G" + row).getTextContent());
+                assertEquals("当面说明", reportCell(sheet, "G" + row).getTextContent());
                 assertEquals("甲、乙", reportCell(sheet, "H" + row).getTextContent());
                 assertEquals("19", reportCell(sheet, "I" + row).getAttribute("s"));
                 return;

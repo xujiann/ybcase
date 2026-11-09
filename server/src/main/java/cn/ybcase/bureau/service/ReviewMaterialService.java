@@ -63,6 +63,8 @@ public class ReviewMaterialService {
                 select c.id,c.clue_id,c.cause_id,c.enforce_item_id,c.procedure_type,
                        c.party_name,c.party_type,c.party_credit_no,c.party_address,c.party_legal_rep,c.party_contact,
                        c.summary,c.amount_involved,c.violation_end_date,c.health_harm,
+                       c.institution_code,c.institution_ownership,c.institution_grade,c.institution_kind,
+                       c.confirmed_violation_start,c.confirmed_violation_end,c.confirmed_violation_facts,c.confirmed_violation_amount,
                        c.jurisdiction_type,c.jurisdiction_basis,c.violation_place,c.treatment_place,c.insured_place,
                        c.designated_no,c.jurisdiction_dispute_note,
                        cause.subject_type as cause_subject_type,cause.category as cause_category,

@@ -18,7 +18,7 @@
       <el-table-column prop="participants" label="约谈人员" min-width="110" show-overflow-tooltip />
       <el-table-column label="操作" width="76">
         <template #default="{ row }">
-          <el-button v-if="canWrite && row.editable" link type="primary" :disabled="saving" @click="open(row)">编辑</el-button>
+          <span>更正和作废请用下方申请入口</span>
         </template>
       </el-table-column>
     </el-table>
@@ -43,9 +43,11 @@
       </template>
     </el-dialog>
   </el-card>
+  <InterviewChangesPanel />
 </template>
 
 <script setup lang="ts">
+import InterviewChangesPanel from '../../components/InterviewChangesPanel.vue'
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import client from '../../api/client'

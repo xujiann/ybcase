@@ -27,7 +27,7 @@ function fixture(t, props = {}) {
   }
   const sessionExpiry = createSessionExpiry(), scope = Vue.effectScope()
   const view = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) +
-    ';({form,batches,selected,previewRows,previewVisible,opinion,saving,loadList,generate,openBatch,confirm,openSource,changes,focusFailed})', {
+    ';({form,batches,selected,previewRows,previewVisible,opinion,saving,loadList,generate,openBatch,confirm,openSource,changes,focusFailed,transition,statusLabel})', {
     ...Vue, client, useAuthStore: () => auth, defineProps: () => props,
     useRouter: () => ({ push: path => navigation.push(path) }), sessionExpiry, SESSION_EXPIRED_EVENT,
     crypto: { randomUUID: () => 'request-' + ++uuid }, localDate: () => '2026-11-07',
@@ -124,4 +124,20 @@ test('task focus fetches the exact batch directly and reports inaccessible targe
   assert.equal(f.previewVisible.value, false)
   assert.equal(f.selected.value, undefined)
   assert.equal(f.focusFailed.value, true)
+})
+
+
+test('frozen terminal actions use eligibility, preserve reason for retry and stop after identity loss', async t => {
+  const f = fixture(t); await listReady(f)
+  await openReady(f, batch(40, { canReturn: false }))
+  f.opinion.value = '核对后退回'; await f.transition('RETURN'); assert.equal(f.writes.length, 0)
+  await openReady(f, batch(41, { canReturn: true }))
+  f.opinion.value = '范围选择错误'
+  const first=f.transition('RETURN'), duplicate=f.transition('RETURN')
+  assert.equal(f.writes.length,1); assert.deepEqual(f.writes[0].body,{action:'RETURN',opinion:'范围选择错误'})
+  f.writes[0].reject(new Error('response lost')); await Promise.all([first,duplicate])
+  assert.equal(f.opinion.value,'范围选择错误')
+  const retry=f.transition('RETURN'); f.expire(); f.writes[1].resolve(batch(41,{status:'REJECTED'})); await retry
+  assert.equal(f.selected.value,undefined); assert.equal(f.messages.length,0)
+  assert.equal(f.statusLabel('WITHDRAWN'),'已撤回'); assert.equal(f.statusLabel('VOIDED'),'已作废')
 })

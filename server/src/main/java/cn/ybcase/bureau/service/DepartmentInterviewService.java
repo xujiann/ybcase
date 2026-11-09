@@ -21,7 +21,7 @@ public class DepartmentInterviewService {
     private static final String SELECT = """
             select id, department_name, institution_code, institution_name, interview_type,
                    reason, content, participants, interview_date, dept_id, created_by, source_agreement_id
-            from department_interview
+            from effective_department_interviews()
             where interview_date >= ? and interview_date < ?
             """;
     private static final String ORDER = " order by interview_date, department_name, id";
@@ -50,7 +50,7 @@ public class DepartmentInterviewService {
         if (page < 1 || size < 1 || size > 100)
             throw new BizException(2100, "页码须大于零，每页须为1至100条");
         long total = jdbc.queryForObject("""
-                select count(*) from department_interview where interview_date >= ? and interview_date < ?
+                select count(*) from effective_department_interviews() where interview_date >= ? and interview_date < ?
                 """ + scope.deptFilter(), Long.class, scope.params(start, null, null));
         long offset = (page - 1L) * size;
         return new InterviewPage(offset >= total ? List.of() : rows(scope, start, size, offset), total);
@@ -83,14 +83,9 @@ public class DepartmentInterviewService {
     public void edit(long id, InterviewInput input, String username) {
         var actor = materialAccess.lockActor(username, true);
         requireDepartment(actor, category(actor.id()));
-        var value = validate(input);
-        int changed = jdbc.update("""
-                update department_interview set institution_code = ?, institution_name = ?, interview_type = ?,
-                    reason = ?, content = ?, participants = ?, interview_date = ?, updated_at = now()
-                where id = ? and dept_id = ? and (created_by = ? or ?) and source_agreement_id is null
-                """, value.institutionCode(), value.institutionName(), value.interviewType(), value.reason(),
-                value.content(), value.participants(), value.interviewDate(), id, actor.deptId(), actor.id(), canManageDepartment(actor));
-        if (changed == 0) throw new BizException(403, "约谈记录不存在或不在当前账号编辑范围内");
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from department_interview where id=? and dept_id=? and (created_by=? or ?))", Boolean.class,
+                id,actor.deptId(),actor.id(),canManageDepartment(actor)))) throw new BizException(403,"约谈不在当前编辑范围内");
+        throw new BizException(2196,"已登记约谈须通过更正申请并由另一人复核，原记录保留");
     }
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
@@ -123,7 +118,7 @@ public class DepartmentInterviewService {
                 new Object[]{"约谈日期范围", period.start() + " 至 " + period.end() + "（含首尾）"},
                 new Object[]{"统计截止日", period.cutoff()},
                 new Object[]{"合计数据行", rows.size()},
-                new Object[]{"取数来源", "按约谈台账登记的实际约谈日期筛选，采用已登记的部门名称和当前修订内容。"}
+                new Object[]{"取数来源", "按约谈台账登记的实际约谈日期筛选，采用取数时已批准的约谈更正版本，已批准作废记录不计入；原记录及旧冻结文件保留。"}
         ) : List.of();
         return new ReportExport(PenaltyReportWorkbook.write("department-interviews.xlsx", List.of(sheet), notes),
                 new ReportExport.Audit(ReportExport.Kind.INTERVIEWS, period.start(), period.end(), period.cutoff(), rows.size()), lines);

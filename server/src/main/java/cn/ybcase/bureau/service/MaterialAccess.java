@@ -109,7 +109,8 @@ public class MaterialAccess {
             args.add(department.deptId());
         }
         if (!privileged && selfScope()) {
-            sql.append(CaseService.SCOPE_SQL);
+            sql.append(ParticipantAuthorizationService.SCOPE_SQL);
+            args.add(username);
             args.add(username);
             args.add(username);
         }

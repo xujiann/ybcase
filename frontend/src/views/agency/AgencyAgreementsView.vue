@@ -90,9 +90,11 @@
       </template>
     </el-dialog>
   </el-card>
+  <InterviewChangesPanel />
 </template>
 
 <script setup lang="ts">
+import InterviewChangesPanel from '../../components/InterviewChangesPanel.vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'

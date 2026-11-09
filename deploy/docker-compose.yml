@@ -37,6 +37,8 @@ services:
       YBCASE_DB_USER: hip
       YBCASE_DB_PASSWORD: ${DB_PASSWORD}
       YBCASE_JWT_SECRET: ${JWT_SECRET}
+      # 模拟为默认；正式启用须具备真实CA和可验证回证材料。
+      YBCASE_RUNTIME_MODE: ${YBCASE_RUNTIME_MODE:-SIMULATION}
       # Optional exact proxy IP/CIDR allowlist; empty trusts no forwarding headers.
       YBCASE_AUDIT_TRUSTED_PROXIES: ${YBCASE_AUDIT_TRUSTED_PROXIES:-}
       # 空库初始化时 admin 的初始口令（首次登录强制修改）；pilot 下缺失或为 admin123 会拒绝启动

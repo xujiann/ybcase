@@ -5,6 +5,7 @@
       <h3>用户管理</h3>
       <div v-if="isAdmin">
         <el-button :disabled="loading || failed || !directoriesReady || directoryFailed || saving || rowAction !== null" @click="rosterVisible = true">批量导入账号名册</el-button>
+        <el-button :disabled="saving || rowAction !== null" @click="participantVisible = true">历史参办授权核对</el-button>
         <el-button :disabled="loading || failed || !directoriesReady || directoryFailed || saving || rowAction !== null" type="primary" @click="openCreate">新增用户</el-button>
       </div>
     </div>
@@ -51,6 +52,7 @@
                    @current-change="load" />
 
     <UserRosterDialog v-if="isAdmin && rosterVisible" @close="rosterVisible = false" @applied="load" />
+    <ParticipantAuthorizationPanel v-if="isAdmin && participantVisible" @close="participantVisible=false" />
 
     <el-dialog v-model="dialogVisible" :title="form.id ? '编辑用户' : '新增用户'" width="480px" :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
       <el-form :model="form" label-width="90px" :disabled="saving">
@@ -101,6 +103,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import UserRosterDialog from '../../components/UserRosterDialog.vue'
+import ParticipantAuthorizationPanel from '../../components/ParticipantAuthorizationPanel.vue'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import { adminOperationAccess } from '../../api/caseWriteAccess'
@@ -139,6 +142,7 @@ const saving = ref(false)
 const rowAction = ref<number | null>(null)
 const dialogVisible = ref(false)
 const rosterVisible = ref(false)
+const participantVisible=ref(false)
 const depts = ref<{ id: number; name: string; enabled?: boolean; orgKind?: string | null }[]>([])
 const roles = ref<{ code: string; name: string }[]>([])
 
@@ -177,6 +181,7 @@ function invalidate(clearDraft = true) {
   loadGeneration++; directoryGeneration++; saveGeneration++; actionGeneration++
   records.value = []; total.value = 0; loading.value = false; failed.value = false; saving.value = false; rowAction.value = null
   rosterVisible.value = false
+  participantVisible.value = false
   if (clearDraft) {
     dialogVisible.value = false; resetForm(); depts.value = []; roles.value = []; directoriesReady.value = false; directoryFailed.value = false
   }

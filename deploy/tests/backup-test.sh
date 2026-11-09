@@ -19,6 +19,10 @@ case "$*" in
     cat >/dev/null
     if [ "${MOCK_FAIL:-}" = verify ]; then exit 43; fi ;;
   *attachment_storage*) printf '%s\n' "${MOCK_STORAGE:-DB}" ;;
+  *json_agg*)
+    if [ "${MOCK_DB_COUNT:-0}" = 0 ]; then echo '[]'
+    elif [ "${MOCK_DB_COUNT:-0}" = 1 ]; then echo '[{"file_path":"./data/attachments/a.txt","size_bytes":10}]'
+    else echo '[{"file_path":"./data/attachments/a.txt","size_bytes":10},{"file_path":"./data/attachments/missing.txt","size_bytes":10}]'; fi ;;
   *'test -d'*)
     if [ "${MOCK_FAIL:-}" = mount ]; then exit 44; fi ;;
   *'tar -C'*)
@@ -41,6 +45,7 @@ run_case() {
     if [ "$expected" = success ]; then
         [ "$status" -eq 0 ] && grep -q 'Backup completed' "$WORK/$name.log"
         [ "$(find "$YBCASE_BACKUP_DIR" -name 'db-*.dump' | wc -l)" -eq 1 ]
+        python3 "$ROOT/deploy/backup-set.py" check --directory "$YBCASE_BACKUP_DIR" >/dev/null
         if [ "$MOCK_STORAGE" = FILE ] || [ "$MOCK_DB_COUNT" -gt 0 ]; then
             [ "$(find "$YBCASE_BACKUP_DIR" -name 'att-*.tar' | wc -l)" -eq 1 ]
         else
@@ -48,6 +53,8 @@ run_case() {
         fi
     else
         [ "$status" -ne 0 ] && ! grep -q 'Backup completed' "$WORK/$name.log"
+        ! python3 "$ROOT/deploy/backup-set.py" check --directory "$YBCASE_BACKUP_DIR" >/dev/null 2>&1
+        [ "$(find "$YBCASE_BACKUP_DIR" -name 'set-*.json' | wc -l)" -eq 0 ]
     fi
     echo "PASS: $name ($status)"
 }
@@ -83,6 +90,7 @@ export YBCASE_HOME="$WORK/rotation" YBCASE_BACKUP_DIR="$WORK/rotation/backup"
 mkdir -p "$YBCASE_BACKUP_DIR"
 for n in $(seq -w 1 20); do touch "$YBCASE_BACKUP_DIR/db-2000-01-$n.dump"; done
 bash "$ROOT/deploy/backup.sh" > "$WORK/rotation.log" 2>&1
-[ "$(find "$YBCASE_BACKUP_DIR" -name 'db-*.dump' | wc -l)" -eq 14 ]
+[ "$(find "$YBCASE_BACKUP_DIR" -name 'db-*.dump' | wc -l)" -eq 21 ]
+python3 "$ROOT/deploy/backup-set.py" check --directory "$YBCASE_BACKUP_DIR" >/dev/null
 grep -q 'Backup completed' "$WORK/rotation.log"
-echo 'PASS: rotation keeps latest 14 database dumps without attachment archives'
+echo 'PASS: completed sets are checked; unmanifested legacy dumps are preserved'

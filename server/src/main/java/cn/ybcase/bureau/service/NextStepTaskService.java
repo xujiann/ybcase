@@ -89,7 +89,8 @@ public class NextStepTaskService {
                            '核对电子送达失败或超时并按当前规则处理', '电子送达异常', null::date,
                            '/case/detail/' || c.id
                     from electronic_delivery e join visible_cases c on c.id=e.case_id
-                    where e.status in ('FAILED','TIMED_OUT') and c.archive_no is null and c.status<>'CLOSED' and
+                    where e.status in ('FAILED','TIMED_OUT') and e.superseded_at is null
+                      and (e.supplement_document_id is not null or (c.archive_no is null and c.status<>'CLOSED')) and
                     """ + assignment);
         }
         if (actor.privileged()) {
@@ -178,6 +179,25 @@ public class NextStepTaskService {
                            '报表批次 #' || b.id, '核对冻结报表来源并确认版本', '待报表确认', null::date,
                            '/case/stats?reportBatch=' || b.id
                     from report_frozen_batch b where b.status='GENERATED' and b.generated_by<>?
+                      and exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
+                    """);
+            arguments.add(actor.id());
+            arguments.add(actor.deptId());
+            parts.add("""
+                    select 'INTERVIEW_CHANGE:' || r.id, 'INTERVIEW_CHANGE', r.id, null::int,
+                           '约谈 #' || r.interview_id, '核对实际约谈更正或误建作废申请', '待约谈复核', null::date,
+                           '/case/interviews'
+                    from interview_change_request r where r.status='PENDING' and r.requested_by<>?
+                      and exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
+                    """);
+            arguments.add(actor.id());
+            arguments.add(actor.deptId());
+            parts.add("""
+                    select 'SUPPLEMENT_BUNDLE:' || b.id, 'SUPPLEMENT_BUNDLE', b.id, null::int, c.case_no,
+                           '核对后续材料包', '待后续材料复核', null::date,
+                           '/case/detail/' || c.id || '?supplementBundle=' || b.id
+                    from case_supplement_bundle b join visible_cases c on c.id=b.case_id
+                    where b.status='PENDING' and b.applicant_id<>?
                       and exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
                     """);
         }

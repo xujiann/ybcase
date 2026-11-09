@@ -5,10 +5,12 @@
 # 告警渠道可选：.env 里配 ALERT_WEBHOOK（企业微信/钉钉/飞书群机器人 URL）+ ALERT_WEBHOOK_TYPE（wecom|dingtalk|feishu），
 # 未配置时只写 /opt/ybcase/healthcheck.log——至少 `tail` 一眼能看出什么时候挂过。
 set -uo pipefail
-cd /opt/ybcase || exit 1
+YBCASE_HOME=${YBCASE_HOME:-/opt/ybcase}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$YBCASE_HOME" || exit 1
 
-LOG=/opt/ybcase/healthcheck.log
-STATE=/opt/ybcase/.health-state        # 上次结果：OK 或 FAIL:<epoch of last alert>
+LOG="$YBCASE_HOME/healthcheck.log"
+STATE="$YBCASE_HOME/.health-state"        # 上次结果：OK 或 FAIL:<epoch of last alert>
 # 不能 source .env：口令里一个 $ 就让 set -u 把整个脚本静默杀死（cron 下无人知晓），
 # 含 ( 或引号则其后所有行丢失。只按键名逐个提取，值原样取用（compose 对同一文件也是按字面处理）
 envval() { sed -n "s/^[[:space:]]*$1=//p" .env 2>/dev/null | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
@@ -44,13 +46,11 @@ done
 used=$(df -P / | awk 'NR==2{gsub("%","",$5); print $5}')
 [ "${used:-0}" -lt "$DISK_LIMIT" ] || problems+=("根分区已用 ${used}%（阈值 ${DISK_LIMIT}%）")
 
-# ⑤ 备份新鲜度：最近一份 db-*.dump 须在 N 小时内且非空（备份脚本失败会删半截文件，所以"没有新文件"即失败）
-latest=$(ls -1t backup/db-*.dump 2>/dev/null | head -1)
-if [ -z "$latest" ]; then
-    problems+=("backup/ 下没有任何数据库备份")
-else
-    age_h=$(( ( $(date +%s) - $(stat -c %Y "$latest") ) / 3600 ))
-    [ "$age_h" -le "$BACKUP_MAX_AGE_H" ] || problems+=("最近备份 $latest 已 ${age_h} 小时未更新（昨夜备份可能失败，查 backup/backup.log）")
+# ⑤ 最近尝试失败立即告警；只认可文件和摘要完整的同批次备份，不猜测 loose dump 成功。
+backup_status=$(python3 "$SCRIPT_DIR/backup-set.py" check --directory "${YBCASE_BACKUP_DIR:-$YBCASE_HOME/backup}" \
+    --max-age-hours "$BACKUP_MAX_AGE_H" 2>&1)
+if [ "$?" -ne 0 ]; then
+    problems+=("完整备份集异常：$backup_status")
 fi
 
 now=$(date '+%F %T')
