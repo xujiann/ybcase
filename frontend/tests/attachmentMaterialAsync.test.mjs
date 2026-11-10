@@ -11,6 +11,7 @@ import * as jurisdiction from '../src/api/jurisdiction.ts'
 import { createPreflightCheck } from '../src/api/preflight.ts'
 import { localDate, createTodayReset } from '../src/api/dates.ts'
 import { evidenceCatalogHtml } from '../src/api/evidenceCatalog.ts'
+import { createApprovalRequestKey } from '../src/api/approvalRequestKey.ts'
 
 // Run the actual SFC setup/handlers. Deferred HTTP and prompts control adverse
 // ordering without real accounts, files, or a database.
@@ -33,7 +34,7 @@ function fixture(file, exported, initialProps = {}) {
     success: text => successes.push(text), warning() {}, error() {}, info() {},
   })
   const context = { ...Vue, ...caseAccess, ...periods, ...jurisdiction, client, ElMessage,
-    canWritePrecase, canVoidPrecase, evidenceCatalogHtml, localDate, todayLocal: localDate, createTodayReset, createPreflightCheck,
+    canWritePrecase, canVoidPrecase, evidenceCatalogHtml, localDate, todayLocal: localDate, createTodayReset, createPreflightCheck, createApprovalRequestKey,
     useAuthStore: () => auth, useRoute: () => route, defineProps: () => props, defineEmits: () => () => {},
     onMounted() {}, onUnmounted: fn => unmounted.push(fn), LARGE_TRANSFER: { timeout: 600000 },
     ElMessageBox: { prompt: () => new Promise((resolve, reject) => prompts.push({ resolve, reject })), alert: async () => {} },

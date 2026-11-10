@@ -20,7 +20,7 @@ public class ExecutionDeadlines {
     private final BureauConfig config;
 
     record Delivery(Long id, LocalDate date) {}
-    record CourtRound(String status, LocalDate receivedAt, String receiptNo) {
+    record CourtRound(Long roundId, String status, LocalDate receivedAt, String receiptNo) {
         boolean accepted(LocalDate today) {
             return "ACCEPTED".equals(status) && receivedAt != null && !receivedAt.isAfter(today)
                     && receiptNo != null && !receiptNo.isBlank();
@@ -87,20 +87,13 @@ public class ExecutionDeadlines {
     CourtRound currentCourtRound(CaseFile c, Map<String,Object> decision, LocalDate day) {
         Long versionId = version(decision);
         var rows = jdbc.queryForList("""
-                select coalesce(p.status,'APPLIED') as status,p.received_at,p.receipt_no
-                from case_court_round r join case_continuation_request a on a.id=r.request_id and a.status='APPROVED'
-                left join case_court_receipt p on p.round_id=r.id and p.received_at<=?
-                where r.case_id=? and r.applied_at<=? and r.decision_version_id is not distinct from ?::bigint
+                select r.id,r.status,r.received_at,r.receipt_no from case_effective_court_receipt(?) r
+                where r.case_id=? and r.decision_version_id is not distinct from ?::bigint
                 order by r.round_no desc limit 1
-                """,day,c.getId(),day,versionId);
+                """,day,c.getId(),versionId);
         if (!rows.isEmpty()) {
             var row = rows.getFirst();
-            return new CourtRound((String)row.get("status"),date(row.get("received_at")),(String)row.get("receipt_no"));
-        }
-        if (versionId == null && Boolean.TRUE.equals(c.getCourtEnforceApplied())
-                && (c.getCourtAppliedAt() == null || !c.getCourtAppliedAt().isAfter(day))) {
-            String status = c.getCourtEnforceStatus();
-            return new CourtRound(status == null ? "APPLIED" : status,c.getCourtReceivedAt(),c.getCourtReceiptNo());
+            return new CourtRound((Long)row.get("id"),(String)row.get("status"),date(row.get("received_at")),(String)row.get("receipt_no"));
         }
         return null;
     }
@@ -213,7 +206,14 @@ public class ExecutionDeadlines {
         result.put("applicationDeadline",window.end());
         result.put("reliefPending",window.reliefPending());
         result.put("courtStatus",round == null ? null : round.status());
-        String state = round != null ? round.accepted(day) ? "ACCEPTED" : "APPLIED"
+        result.put("courtRoundId",round == null ? null : round.roundId());
+        result.put("courtReceivedAt",round == null ? null : round.receivedAt());
+        result.put("courtReceiptNo",round == null ? null : round.receiptNo());
+        String state = round != null ? switch (round.status()) {
+                    case "ACCEPTED" -> round.accepted(day) ? "ACCEPTED" : "APPLIED";
+                    case "RETURNED", "REJECTED" -> round.status();
+                    default -> "APPLIED";
+                }
                 : window.reliefPending() ? "RELIEF_PENDING"
                 : window.start() == null ? "UNCONFIRMED" : !day.isAfter(window.start()) ? "WAITING"
                 : day.isAfter(window.end()) ? "EXPIRED" : "OPEN";

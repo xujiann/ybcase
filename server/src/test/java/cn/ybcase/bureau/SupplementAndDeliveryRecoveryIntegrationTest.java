@@ -39,6 +39,45 @@ class SupplementAndDeliveryRecoveryIntegrationTest {
  long doc(Actor owner,long c,String type){return jdbc.queryForObject("insert into case_document(case_id,doc_type,title,content,made_at,maker) values(?,?,'合成送达文书','正文',current_date,?) returning id",Long.class,c,type,owner.name());}
  String delivery(long c){return "/bureau/cases/"+c+"/electronic-deliveries";}
  Map<String,Object> receipt(long id,String status,String event){return new LinkedHashMap<>(Map.of("deliveryId",id,"providerId","fixture-"+id,"eventId",event,"status",status,"occurredAt",OffsetDateTime.now().minusSeconds(1).toString(),"receiptNo","REC-"+event));}
+ @Test void electronicNoticeReceiptsRespectVersionPaperAndReplay()throws Exception{
+  var owner=actor("DISTRICT","HANDLER");var callback=actor(null,"INTEGRATION");CALLBACK.set(callback.name());
+  long c=caseFile(owner,false);jdbc.update("update case_file set status='REPORTED' where id=?",c);
+  String root="/bureau/cases/"+c,p=delivery(c),callbackPath="/integrations/delivery/receipts";
+  var body=new LinkedHashMap<String,Object>(Map.of("content","版本告知正文","proposedFine",100,"requireDelivery",true));
+  long first=post(owner,root+"/notice",body,0).path("id").asLong();
+  post(owner,p,Map.of("documentId",doc(owner,c,"NOTICE"),"requestKey",UUID.randomUUID().toString()),2193);
+  long firstEnvelope=sendNotice(owner,c,first);
+  body.put("previousNoticeId",first);
+  long second=post(owner,root+"/notice",body,0).path("id").asLong();
+  assertFalse(post(callback,callbackPath,receipt(firstEnvelope,"DELIVERED",UUID.randomUUID().toString()),0).path("accepted").asBoolean());
+  long secondEnvelope=sendNotice(owner,c,second);
+  var paper=Map.of("method","DIRECT","noticeId",second,"docKind","NOTICE","receiptNo","PAPER","receiver","实际受送达人",
+          "deliveredAt",LocalDate.now(ZoneId.of("Asia/Shanghai")).toString());
+  post(owner,root+"/doc-deliveries",paper,0);
+  assertFalse(post(callback,callbackPath,receipt(secondEnvelope,"DELIVERED",UUID.randomUUID().toString()),0).path("accepted").asBoolean());
+  body.put("previousNoticeId",second);
+  long third=post(owner,root+"/notice",body,0).path("id").asLong(),envelope=sendNotice(owner,c,third);
+  var event=receipt(envelope,"DELIVERED",UUID.randomUUID().toString());
+  assertTrue(post(callback,callbackPath,event,0).path("accepted").asBoolean());
+  assertTrue(post(callback,callbackPath,event,0).path("accepted").asBoolean());
+  assertFalse(post(callback,callbackPath,receipt(envelope,"DELIVERED",UUID.randomUUID().toString()),0).path("accepted").asBoolean());
+  var latePaper=new LinkedHashMap<>(paper);latePaper.put("noticeId",third);
+  post(owner,root+"/doc-deliveries",latePaper,2041);
+  assertEquals(List.of("DIRECT","ELECTRONIC"),jdbc.queryForList("select method from case_delivery where case_id=? order by id",String.class,c));
+  assertTrue(jdbc.queryForObject("""
+      select n.statement_deadline=d.delivered_at+n.statement_period_days
+          and n.hearing_request_deadline=d.delivered_at+n.hearing_period_days
+      from case_notice n join case_delivery d on d.notice_id=n.id where n.id=?
+      """,Boolean.class,third));
+ }
+ long sendNotice(Actor owner,long caseId,long notice)throws Exception{
+  String p=delivery(caseId),prepare=p+"/notices/"+notice+"/document";
+  long document=post(owner,prepare,Map.of(),0).path("id").asLong();
+  assertEquals(document,post(owner,prepare,Map.of(),0).path("id").asLong());
+  long id=post(owner,p,Map.of("documentId",document,"requestKey",UUID.randomUUID().toString()),0).path("id").asLong();
+  assertEquals("SENT",post(owner,p+"/"+id+"/send",Map.of(),0).path("status").asText());
+  return id;
+ }
  @Test void approvedMaterialsRemainIndependentImmutableAndExportable()throws Exception{
   var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");long c=caseFile(owner,true);String before=original(c);
   long b=bundle(owner,c);long f=upload(owner,c,b);assertEquals(f,upload(owner,c,b));post(owner,base(c)+"/"+b+"/submit",Map.of(),0);post(legal,base(c)+"/"+b+"/review",Map.of("approve",true,"opinion","材料核实\n另行复核原件"),0);

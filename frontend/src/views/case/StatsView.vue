@@ -89,9 +89,10 @@
       </el-col>
       <el-col :span="8">
         <el-card class="mb">
-          <h4>统计上报（{{ reportYear }} 年月报）
+          <h4>实时月度统计（{{ reportYear }} 年）
             <el-button size="small" :disabled="!reportResource.ready" style="float: right" @click="onReportExport">导出CSV</el-button>
           </h4>
+          <p v-if="canExportPenalties">正式报送可在上方报表版本中选择月度统计上报快照，复核后登记实际报送回执。</p>
           <el-table :data="report.monthly" size="small" border max-height="300">
             <el-table-column prop="month" label="月" width="55" />
             <el-table-column prop="filed" label="立案" width="60" align="right" />

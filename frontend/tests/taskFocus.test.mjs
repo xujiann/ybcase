@@ -7,6 +7,7 @@ import * as Vue from 'vue'
 import {parseTaskFocus,withoutTaskFocus} from '../src/api/taskFocus.ts'
 import {createResourceLoader,resourceState} from '../src/api/loadableResource.ts'
 import {createHistoryPagination,historyPageState} from '../src/api/historyPagination.ts'
+import {createApprovalRequestKey} from '../src/api/approvalRequestKey.ts'
 
 test('task focus only accepts one canonical positive safe integer and clears only its own query',()=>{
   assert.equal(parseTaskFocus(undefined),undefined)
@@ -31,7 +32,7 @@ function fixture(t,file,exports){
   }
   const code=readFileSync(new URL('../src/views/case/'+file+'.vue',import.meta.url),'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .+\r?\n/gm,'')
   const unmounts=[],scope=Vue.effectScope()
-  const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(code)+`;({${exports}})`,{...Vue,client,AbortController,resourceState,createResourceLoader,createHistoryPagination,historyPageState,useAuthStore:()=>auth,useRoute:()=>({query:{}}),useRouter:()=>({push(){}}),onMounted(){},onUnmounted:fn=>unmounts.push(fn),caseOperationAccess:()=>true,canWritePrecase:()=>true,ElMessage:{warning(){},success(){}},ElMessageBox:{},CLUE_STATUS:{},PARTY_TYPE:{},SOURCE:{},INSTITUTION_GRADE:{},fmtTime:value=>value}))
+  const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(code)+`;({${exports}})`,{...Vue,client,AbortController,resourceState,createResourceLoader,createHistoryPagination,historyPageState,createApprovalRequestKey,useAuthStore:()=>auth,useRoute:()=>({query:{}}),useRouter:()=>({push(){}}),onMounted(){},onUnmounted:fn=>unmounts.push(fn),caseOperationAccess:()=>true,canWritePrecase:()=>true,ElMessage:{warning(){},success(){}},ElMessageBox:{},CLUE_STATUS:{},PARTY_TYPE:{},SOURCE:{},INSTITUTION_GRADE:{},fmtTime:value=>value}))
   t.after(()=>{unmounts.forEach(fn=>fn());scope.stop()})
   return {...view,auth,requests,posts}
 }
@@ -54,6 +55,21 @@ test('handoff focus makes one scoped request and discards a previous identity re
   f.status.value='REJECTED';f.setTaskFocus(999);const pending=f.paging.load()
   assert.equal(f.requests[0].config.params.focusId,999);assert.equal('status' in f.requests[0].config.params,false)
   f.auth.user.id=2;f.requests[0].resolve({rows:[{id:999}],total:1,page:1,size:1});await pending
+  assert.equal(f.pagination.rows.length,0)
+})
+
+test('inspection focus loads only the requested check and refuses an invalid focus',async t=>{
+  const f=fixture(t,'InspectionsView','setTaskFocus,paging,pagination')
+  f.setTaskFocus(250001)
+  const pending=f.paging.load()
+  assert.equal(f.requests[0].path,'/bureau/inspections')
+  assert.equal(f.requests[0].config.params.focusId,250001)
+  f.requests[0].resolve({rows:[{id:250001}],total:1,page:1,size:1})
+  await pending
+  assert.equal(f.pagination.rows[0].id,250001)
+  f.setTaskFocus(0)
+  await f.paging.load()
+  assert.equal(f.requests.length,1)
   assert.equal(f.pagination.rows.length,0)
 })
 

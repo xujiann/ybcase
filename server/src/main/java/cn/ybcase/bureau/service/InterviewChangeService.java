@@ -22,16 +22,31 @@ public class InterviewChangeService {
 
     @Transactional(readOnly=true,isolation=Isolation.REPEATABLE_READ)
     public Map<String,Object> records(String username,int page,int size) {
+        return records(username,page,size,null);
+    }
+
+    @Transactional(readOnly=true,isolation=Isolation.REPEATABLE_READ)
+    public Map<String,Object> records(String username,int page,int size,Long focus) {
         var actor=access.readActor(username); requireReader(actor);bounds(page,size);
-        long total=jdbc.queryForObject("select count(*) from department_interview where (? or dept_id=?)",Long.class,supervisor(actor),actor.deptId());
+        long total=jdbc.queryForObject("""
+            select count(*) from department_interview where (? or dept_id=?) and (?::bigint is null or id=?)
+            """,Long.class,supervisor(actor),actor.deptId(),focus,focus);
         var rows=jdbc.queryForList("""
           select i.id,i.department_name,coalesce(e.institution_name,i.institution_name) institution_name,
-            e.institution_code,e.interview_type,e.reason,e.content,e.participants,e.interview_date,
+            coalesce(e.institution_code,i.institution_code) institution_code,
+            coalesce(e.interview_type,i.interview_type) interview_type,
+            coalesce(e.reason,i.reason) reason,coalesce(e.content,i.content) content,
+            coalesce(e.participants,i.participants) participants,coalesce(e.interview_date,i.interview_date) interview_date,
             e.id is null as voided,i.source_agreement_id,
-            i.dept_id=? and (i.created_by=? or ?) and ? as can_request
+            i.dept_id=? and (i.created_by=? or ?) and ? as can_request,
+            ? and replacement.interview_id is not null as can_replace,
+            replacement.institution_name as replacement_institution_name
           from department_interview i left join effective_department_interviews() e on e.id=i.id
-          where (? or i.dept_id=?) order by i.id desc limit ? offset ?
-          """,actor.deptId(),actor.id(),actor.privileged()||actor.roles().contains("AGENCY"),actor.roles().stream().anyMatch(Set.of("AGENCY","HANDLER","LEADER","ADMIN")::contains),supervisor(actor),actor.deptId(),size,(page-1L)*size);
+          left join eligible_interview_replacement replacement on replacement.interview_id=i.id and replacement.dept_id=?
+          where (? or i.dept_id=?) and (?::bigint is null or i.id=?) order by i.id desc limit ? offset ?
+          """,actor.deptId(),actor.id(),actor.privileged()||actor.roles().contains("AGENCY"),
+                actor.roles().stream().anyMatch(Set.of("AGENCY","HANDLER","LEADER","ADMIN")::contains),
+                agencyWriter(actor),actor.deptId(),supervisor(actor),actor.deptId(),focus,focus,size,(page-1L)*size);
         return Map.of("rows",rows,"total",total,"page",page,"size",size);
     }
 
@@ -43,18 +58,27 @@ public class InterviewChangeService {
 
     @Transactional(readOnly=true,isolation=Isolation.REPEATABLE_READ)
     public Map<String,Object> pending(String username,int page,int size) {
+        return pending(username,page,size,null);
+    }
+
+    @Transactional(readOnly=true,isolation=Isolation.REPEATABLE_READ)
+    public Map<String,Object> pending(String username,int page,int size,Long focus) {
         var actor=access.readActor(username); if(!reviewer(actor)) throw denied();
         bounds(page,size);
-        long total=jdbc.queryForObject("select count(*) from interview_change_request where status='PENDING'",Long.class);
-        return Map.of("rows",historyRows(jdbc.queryForList("select * from interview_change_request where status='PENDING' order by id limit ? offset ?",size,(page-1L)*size),actor),"total",total,"page",page,"size",size);
+        String filter=" from interview_change_request where status='PENDING' and (?::bigint is null or id=?)";
+        long total=jdbc.queryForObject("select count(*)"+filter,Long.class,focus,focus);
+        var rows=jdbc.queryForList("select *"+filter+" order by id limit ? offset ?",focus,focus,size,(page-1L)*size);
+        return Map.of("rows",historyRows(rows,actor),"total",total,"page",page,"size",size);
     }
 
     @Transactional
     public long request(long id,Request input,String username) {
-        lockSource(id);var actor=access.lockActor(username,false);requireWriter(source(id),actor);
-        if(input==null||input.requestKey()==null||!Set.of("CORRECT","VOID").contains(Objects.toString(input.kind(),""))) throw invalid("请选择更正或作废并提供请求号");
+        lockSource(id);var actor=access.lockActor(username,false);var original=source(id);requireWriter(original,actor);
+        if(input==null||input.requestKey()==null||!Set.of("CORRECT","VOID","REPLACE").contains(Objects.toString(input.kind(),""))) throw invalid("请选择更正、作废或替代并提供请求号");
         String reason=text(input.reason(),2000),reference=text(input.sourceReference(),1000);
-        String values="VOID".equals(input.kind())?"{}":json(DepartmentInterviewService.validate(input.values()));
+        boolean replacement = "REPLACE".equals(input.kind());
+        var interview = "VOID".equals(input.kind()) ? null : DepartmentInterviewService.validate(input.values());
+        String values=interview==null?"{}":json(interview);
         var old=jdbc.queryForList("select * from interview_change_request where requested_by=? and request_key=?",actor.id(),input.requestKey());
         if(!old.isEmpty()) {
             var row=old.getFirst();
@@ -63,7 +87,10 @@ public class InterviewChangeService {
             return ((Number)row.get("id")).longValue();
         }
         var effective=jdbc.queryForList("select * from effective_department_interviews() where id=?",id);
-        if(effective.isEmpty()) throw invalid("该约谈已作废，不可再次申请");
+        if (replacement) {
+            if (!effective.isEmpty()) throw invalid("仅可申请替代已作废的协议约谈");
+            validateReplacement(original, actor, interview);
+        } else if (effective.isEmpty()) throw invalid("该约谈已作废，须按适用条件申请替代");
         if("CORRECT".equals(input.kind())&&same(values,jsonValue(effective.getFirst()))) throw invalid("没有需要更正的约谈字段");
         if(Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from interview_change_request where interview_id=? and status='PENDING')",Boolean.class,id))) throw invalid("该约谈已有待复核申请");
         return jdbc.queryForObject("""
@@ -89,9 +116,13 @@ public class InterviewChangeService {
         if(actor.id().equals(request.get("requested_by"))) throw new BizException(403,"申请人不能复核本人约谈申请");
         if(approve) {
             var applicant=locked.get(request.get("requested_username"));
-            requireWriter(source(id),applicant);
+            var original=source(id);
+            requireWriter(original,applicant);
             if(!Objects.equals(applicant.deptId(),request.get("requester_dept_id"))||!Objects.equals(applicant.accountCategory(),request.get("requester_category"))
                ||!same(snapshot(id),request.get("source_snapshot"))) throw invalid("来源或申请人归属已变化，请驳回并重新申请");
+            if ("REPLACE".equals(request.get("request_kind"))) {
+                validateReplacement(original, applicant, replacementValues(request.get("proposed_values")));
+            }
         }
         finish(requestId,outcome,actor,note);
     }
@@ -114,6 +145,31 @@ public class InterviewChangeService {
     }
     private Map<String,Object> source(long id) {
         var rows=jdbc.queryForList("select * from department_interview where id=?",id);if(rows.isEmpty()) throw denied();return rows.getFirst();
+    }
+    private static boolean agencyWriter(WorkflowUserAccess.User actor) {
+        return "AGENCY".equals(actor.accountCategory()) && actor.roles().equals(Set.of("AGENCY"));
+    }
+    private void validateReplacement(Map<String,Object> original, WorkflowUserAccess.User actor,
+                                     DepartmentInterviewService.InterviewInput interview) {
+        if (!agencyWriter(actor) || original.get("source_agreement_id")==null) throw denied();
+        var eligible=jdbc.queryForList("""
+          select a.sent_at,c.party_name from agreement_action a join case_file c on c.id=a.case_id
+          where a.id=? and a.agency_cycle=? and a.agency_dept_id=? and a.action='INTERVIEW'
+             and a.agency_status='COMPLETED' and (a.agency_result_type='COMPLETED' or a.agency_result_type is null)
+             and c.party_type='PROVIDER'
+          """,original.get("source_agreement_id"),original.get("source_agency_cycle"),actor.deptId());
+        if (eligible.isEmpty()) throw invalid("仅可替代本部门当前轮次已落实的协议约谈");
+        var agreement=eligible.getFirst();
+        if (!Objects.equals(agreement.get("party_name"), interview.institutionName())
+                || interview.interviewDate().isBefore(((java.sql.Date)agreement.get("sent_at")).toLocalDate()))
+            throw invalid("替代约谈须使用当前协议对象，实际日期不得早于移交日期");
+    }
+    private DepartmentInterviewService.InterviewInput replacementValues(Object values) {
+        try {
+            return DepartmentInterviewService.validate(mapper.readValue(values.toString(), DepartmentInterviewService.InterviewInput.class));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException failure) {
+            throw invalid("替代约谈资料无效");
+        }
     }
     private String snapshot(long id) {
         return jdbc.queryForObject("""

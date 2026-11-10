@@ -330,18 +330,20 @@ public class DocumentService {
                     dt(m.get("held_at")), sv(m.get("attendees"))));
         }
         for (var h : jdbc.queryForList("""
-                select notice_sent_at, scheduled_at, held_at, host, host_dept, recorder, record, opinion, notice_id
+                select notice_sent_at, scheduled_at, held_at, host, host_dept, recorder, record, opinion, notice_id,
+                       hearing_notice_delivery_id
                 from case_hearing where case_id = ? and status <> 'CANCELLED' order by id""", caseId)) {
             out.add(entry("HEARING_RECORD", "听证笔录",
                     "通知送达：" + dt(h.get("notice_sent_at")) + "\n计划举行：" + dt(h.get("scheduled_at"))
                             + "\n实际举行：" + dt(h.get("held_at")) + "\n主持人：" + sv(h.get("host"))
                             + "（" + sv(h.get("host_dept")) + "）\n记录员：" + sv(h.get("recorder"))
                             + "\n笔录：" + sv(h.get("record")) + "\n听证意见：" + sv(h.get("opinion"))
-                            + (h.get("notice_id") == null ? "" : "\n告知版本：" + h.get("notice_id")),
+                            + (h.get("notice_id") == null ? "" : "\n告知版本：" + h.get("notice_id"))
+                            + (h.get("hearing_notice_delivery_id") == null ? "" : "\n听证通知回证记录号：" + h.get("hearing_notice_delivery_id")),
                     dt(h.get("held_at")), sv(h.get("recorder"))));
         }
         for (var d : jdbc.queryForList("""
-                select method, delivered_at, receiver, note, receipt_no, receipt_signed_at, notice_id
+                select id, method, delivered_at, receiver, note, receipt_no, receipt_signed_at, notice_id, hearing_notice_version_id
                 from case_delivery where case_id = ? order by id""", caseId)) {
             out.add(entry("DELIVERY_RECEIPT", "送达回证",
                     "送达方式：" + sv(d.get("method")) + "\n受送达人：" + sv(d.get("receiver"))
@@ -349,7 +351,9 @@ public class DocumentService {
                             + "\n回证编号：" + sv(d.get("receipt_no"))
                             + "\n回证签收日：" + dt(d.get("receipt_signed_at"))
                             + "\n备注：" + sv(d.get("note"))
-                            + (d.get("notice_id") == null ? "" : "\n告知版本：" + d.get("notice_id")),
+                            + (d.get("notice_id") == null ? "" : "\n告知版本：" + d.get("notice_id"))
+                            + (d.get("hearing_notice_version_id") == null ? "" : "\n听证通知回证记录号：" + d.get("id")
+                                + "\n对应告知版本：" + d.get("hearing_notice_version_id")),
                     dt(d.get("delivered_at")), sv(d.get("receiver"))));
         }
         return out;

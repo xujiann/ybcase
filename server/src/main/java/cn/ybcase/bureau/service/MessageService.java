@@ -128,26 +128,36 @@ public class MessageService {
                     "/case/detail/" + r.get("id"), "CASE-" + r.get("id") + "-" + today);
             n++;
         }
-        // 执行阶段（第52-55条/行政强制法53-54条）→ 承办人
-        // 办案期限那段把 DELIVERED 排除在外，决定书送达后系统就不再替办案人计时；
-        // 而强执申请期是全流程唯一"错过即失权、罚没款再也追不回"的期限，必须主动推送而非等人来看看板
-        for (var r : executionAlerts.rows(LocalDate.now())) {
+        for (var r : executionAlerts.rows(currentDay)) {
             LocalDate payment = ExecutionAlerts.date(r.get("pay_deadline"));
-            if (payment == null || !LocalDate.now().isAfter(payment) || r.get("owner_user") == null) continue;
+            String court = (String) r.get("active_court_status");
+            if (court == null && (payment == null || !currentDay.isAfter(payment))) continue;
             LocalDate application = ExecutionAlerts.date(r.get("apply_deadline"));
             Long daysLeft = r.get("days_left") == null ? null : ((Number)r.get("days_left")).longValue();
-            String title = daysLeft != null && daysLeft < 0 ? "【请法制核实】已过登记的申请期限 " + r.get("case_no")
-                    : daysLeft != null && daysLeft <= 30 ? "【临期】法院申请期限 " + r.get("case_no")
-                    : "【催缴】缴款期届满未缴清 " + r.get("case_no");
-            String body = "缴款期限 " + payment
+            String title = switch (court == null ? "" : court) {
+                case "RETURNED" -> "【法院退回】核对补正事项";
+                case "REJECTED" -> "【法院不予受理】请人工核处";
+                default -> daysLeft != null && daysLeft < 0 ? "【请法制核实】已过登记的申请期限"
+                        : daysLeft != null && daysLeft <= 30 ? "【临期】法院申请期限"
+                        : "【催缴】缴款期届满未缴清";
+            };
+            String body = "缴款期限 " + (payment == null ? "待核实" : payment)
                     + (application == null ? "；法定救济期限尚未确认或救济处理中，不推定已失权"
                                           : "；登记的法院申请期限 " + application)
                     + (r.get("urged_at") == null ? "；尚无催告送达记录" : "；催告送达日 " + r.get("urged_at"));
-            String dedup = daysLeft != null && daysLeft < 0 ? "EXEC-LAPSED-" + r.get("id")
-                    : "EXEC-" + r.get("id") + "-" + today;
-            sendOrEscalate((String)r.get("owner_user"),r.get("enabled"),leaders,"承办人","DEADLINE",
-                    title,body,"/case/detail/" + r.get("id"),dedup);
-            n++;
+            long caseId = ((Number) r.get("id")).longValue();
+            Long version = ExecutionDeadlines.version(r);
+            Number round = (Number) r.get("active_court_round_id");
+            String phase = court != null ? court : daysLeft != null && daysLeft < 0 ? "LAPSED" : "DUE";
+            String dedup = "EXEC-" + caseId + "-" + (version == null ? 0 : version) + "-"
+                    + (round == null ? 0 : round) + "-" + phase + ("DUE".equals(phase) ? "-" + today : "");
+            if (version == null && round == null && court == null)
+                dedup = "LAPSED".equals(phase) ? "EXEC-LAPSED-" + caseId : "EXEC-" + caseId + "-" + today;
+            for (String recipient : executionRecipients(caseId)) {
+                send(recipient,"DEADLINE",title + " " + r.get("case_no"),body,
+                        ExecutionAlerts.executionLink(caseId,version,round),dedup);
+                n++;
+            }
         }
         // 待批审批单 → 负责人
         for (String leader : leaders) {
@@ -184,6 +194,28 @@ public class MessageService {
         }
         log.info("期限提醒生成 {} 条", n);
         return n;
+    }
+
+    private List<String> executionRecipients(long caseId) {
+        return jdbc.queryForList("""
+                with recipients as (
+                    select u.username, min(case when u.username=c.owner_user then 0
+                                               when r.code='LEADER' then 1 else 2 end) as priority
+                    from case_file c cross join sys_user u
+                    left join sys_dept d on d.id=u.dept_id
+                    join sys_user_role ur on ur.user_id=u.id join sys_role r on r.id=ur.role_id
+                    where c.id=? and u.enabled and (u.dept_id is null or d.enabled)
+                      and (u.account_category is distinct from 'DISTRICT' or u.dept_id=c.owner_dept_id)
+                      and (not exists(select 1 from sys_user_role ar join sys_role role on role.id=ar.role_id
+                                      where ar.user_id=u.id and role.code in ('AGENCY','INTEGRATION')))
+                      and ((u.username=c.owner_user and r.code in ('HANDLER','LEADER','ADMIN'))
+                        or (r.code in ('LEADER','ADMIN') and
+                            (c.owner_dept_id is null or u.dept_id=c.owner_dept_id
+                              or u.account_category='BUREAU' and d.org_kind='BUREAU')))
+                    group by u.username
+                )
+                select username from recipients where priority=(select min(priority) from recipients) order by username
+                """, String.class, caseId);
     }
 
     private int remindClueDeadlines(int ahead, LocalDate today) {

@@ -219,7 +219,7 @@ class ReportingVersionsIntegrationTest {
         for (String type : new String[]{"PENALTIES", "ENFORCEMENT_WORK", "INTERVIEWS"}) {
             long id = api(bureau, post("/report-versions/batches"), criteria(type, date), 0).path("id").asLong();
             String route = "/report-versions/batches/" + id;
-            assertEquals("PENALTIES".equals(type) ? "PENALTIES_EFFECTIVE_DECISION_EXECUTION_V1" : "V48_BUSINESS_DATE_APPROVED_KNOWN_AT",
+            assertEquals("PENALTIES".equals(type) ? "PENALTIES_EFFECTIVE_DECISION_EXECUTION_V2" : "V48_BUSINESS_DATE_APPROVED_KNOWN_AT",
                     api(bureau, get(route), null, 0).path("rule_version").asText());
             var preview = api(bureau, get(route + "/rows?page=1&size=1"), null, 0);
             assertEquals(1, preview.path("rows").size());
@@ -229,6 +229,91 @@ class ReportingVersionsIntegrationTest {
             api(bureau, get(route + "/rows?size=101"), null, 2195);
             assertTrue(api(bureau, get(route + "/rows?page=2147483647"), null, 0).path("rows").isEmpty());
         }
+    }
+
+    @Test void reliefAndDeferUseOnlyTheEffectiveDecisionAndDatedExecutionBasis() throws Exception {
+        var handler = actor("DISTRICT", "HANDLER");
+        var bureau = actor("BUREAU", "LEADER");
+        var reviewer = actor("BUREAU", "LEGAL");
+        LocalDate original = LocalDate.of(2017, 6, 1);
+        long caseId = caseFile(handler, original);
+        jdbc.update("insert into biz_approval(kind,case_id,reason,applicant,applied_at) values('DEFER',?,'原决定暂缓',?,?::timestamptz)",
+                caseId, handler.name(), original + "T12:00:00+08:00");
+        long before = penaltyBatch(bureau, original, original.plusDays(1));
+        byte[] oldFile = download(bureau, before);
+        assertTrue(penaltyCells(bureau, before, caseId).get(15).asText().startsWith("是（未缴 "));
+
+        LocalDate effective = original.plusDays(2);
+        long version = decisionVersion(caseId, handler, reviewer, effective, 200);
+        long delivery = supplementDelivery(caseId, caseId, version, handler, "APPROVED", false, effective,
+                effective.plusDays(1), "DECISION");
+        LocalDate basisDate = effective.plusDays(2);
+        LocalDate deadline = effective.plusDays(3);
+        jdbc.update("""
+                insert into case_version_execution_basis(case_id,decision_version_id,delivery_id,relief_deadline,
+                    relief_pending,basis,defer_until,recorded_by,recorded_at)
+                values(?,?,?,?,false,'本版救济依据',?,?,?::timestamptz)
+                """, caseId, version, delivery, deadline, deadline.plusDays(8), handler.name(), basisDate + "T12:00:00+08:00");
+        var unknown = penaltyCells(bureau, penaltyBatch(bureau, original, effective.plusDays(1)), caseId);
+        assertTrue(unknown.get(15).isNumber(), "原决定暂缓申请不能沿用到新决定");
+        assertTrue(unknown.get(16).isNull(), "依据登记前历史救济状态须留空");
+        var pendingDeadline = penaltyCells(bureau, penaltyBatch(bureau, original, deadline), caseId);
+        assertTrue(pendingDeadline.get(15).asText().startsWith("是（未缴 "));
+        assertEquals("否", pendingDeadline.get(16).asText());
+        assertEquals("是", penaltyCells(bureau, penaltyBatch(bureau, original, deadline.plusDays(1)), caseId).get(16).asText());
+        assertArrayEquals(oldFile, download(bureau, before));
+    }
+
+    @Test void monthlySubmissionFreezesSourceAndReceiptAcrossApprovedCorrection() throws Exception {
+        var district = actor("DISTRICT", "HANDLER");
+        var generator = actor("BUREAU", "LEADER");
+        var reviewer = actor("BUREAU", "LEGAL");
+        var administrator = actor("BUREAU", "ADMIN");
+        LocalDate start = LocalDate.of(2007, 2, 1);
+        LocalDate end = start.withDayOfMonth(start.lengthOfMonth());
+        long source = caseFile(district, start);
+        caseFile(district, end.plusDays(1));
+        var request = criteria("MONTHLY_SUBMISSION", start);
+        api(generator, post("/report-versions/batches"), request, 2195);
+        request.put("end", end.toString());
+        request.put("cutoff", end.toString());
+        var generated = api(generator, post("/report-versions/batches"), request, 0);
+        long id = generated.path("id").asLong();
+        String route = "/report-versions/batches/" + id;
+        assertEquals("全局业务统计", generated.path("scope_label").asText());
+        assertEquals("MONTHLY_BUSINESS_CUTOFF_V1", generated.path("rule_version").asText());
+        assertEquals(id, api(generator, post("/report-versions/batches"), request, 0).path("id").asLong());
+        var csv = mvc.perform(get(route + "/download").header("Authorization", "Bearer " + generator.token()))
+                .andReturn().getResponse();
+        assertEquals("text/csv;charset=UTF-8", csv.getContentType());
+        assertEquals(generated.path("file_sha256").asText(), csv.getHeader("X-Content-SHA256"));
+        assertTrue(new String(csv.getContentAsByteArray(), java.nio.charset.StandardCharsets.UTF_8).contains("2007-02,1,1,100.00"));
+        var receipt = Map.of("submittedAt", LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).toString(),
+                "recipient", "上级统计接收岗", "receiptNo", "统计回执-01", "note", "外部渠道实收");
+        api(reviewer, post(route + "/receipt"), receipt, 2195);
+        api(district, get(route), null, 403);
+        api(generator, post(route + "/confirm"), Map.of("opinion", "本人不能复核"), 403);
+        api(reviewer, post(route + "/confirm"), Map.of("opinion", "已核对口径和摘要"), 0);
+        api(administrator, post(route + "/receipt"), receipt, 403);
+        var accepted = api(reviewer, post(route + "/receipt"), receipt, 0).path("submissionReceipt");
+        assertEquals("统计回执-01", accepted.path("receipt_no").asText());
+        assertEquals(accepted, api(reviewer, post(route + "/receipt"), receipt, 0).path("submissionReceipt"));
+        api(reviewer, post(route + "/receipt"), Map.of("submittedAt", receipt.get("submittedAt"),
+                "recipient", "上级统计接收岗", "receiptNo", "异号"), 2195);
+        assertThrows(org.springframework.dao.DataAccessException.class,
+                () -> jdbc.update("delete from report_submission_receipt where batch_id=?", id));
+
+        entry(source, district, reviewer, 7, end, "APPROVED", false, null);
+        api(reviewer, post(route + "/transition"), Map.of("action", "VOID", "opinion", "已报批次需关联更正"), 0);
+        request.put("requestKey", UUID.randomUUID().toString());
+        request.put("parentBatchId", id);
+        long second = api(generator, post("/report-versions/batches"), request, 0).path("id").asLong();
+        var difference = api(reviewer, get("/report-versions/batches/" + second + "/changes"), null, 0).path("rows").get(0);
+        assertEquals("MONTH:200702", difference.path("row_key").asText());
+        assertEquals(7, difference.path("current_cells").get(5).asInt());
+        assertEquals(accepted, api(reviewer, get(route), null, 0).path("submissionReceipt"));
+        assertArrayEquals(csv.getContentAsByteArray(), mvc.perform(get(route + "/download")
+                .header("Authorization", "Bearer " + generator.token())).andReturn().getResponse().getContentAsByteArray());
     }
 
     @Test void concurrentSameGenerationKeyStoresOneWorkbookAndRowsAndCanRetryAfterRollback() throws Exception {
@@ -290,11 +375,15 @@ class ReportingVersionsIntegrationTest {
     }
 
     private void assertEnforcement(Actor bureau, long batch, long caseId, int fine, String urged, String enforced) throws Exception {
-        var line = find(api(bureau, get("/report-versions/batches/" + batch + "/rows"), null, 0).path("rows"),
-                "row_key", "CASE:" + caseId).path("cells");
+        var line = penaltyCells(bureau, batch, caseId);
         assertEquals(fine, line.get(11).asInt(), "The expected decision version must be effective");
         assertEquals(urged, line.get(17).asText(), "催告送达");
         assertEquals(enforced, line.get(18).asText(), "申请法院强制执行");
+    }
+
+    private JsonNode penaltyCells(Actor bureau, long batch, long caseId) throws Exception {
+        return find(api(bureau, get("/report-versions/batches/" + batch + "/rows"), null, 0).path("rows"),
+                "row_key", "CASE:" + caseId).path("cells");
     }
 
     private long decisionVersion(long caseId, Actor owner, Actor reviewer, LocalDate effective, int fine) {
@@ -322,6 +411,11 @@ class ReportingVersionsIntegrationTest {
 
     private void supplementUrge(long documentCase, long bundleCase, long version, Actor owner, String status,
                                 boolean futureApproval, LocalDate madeAt, LocalDate deliveredAt) {
+        supplementDelivery(documentCase, bundleCase, version, owner, status, futureApproval, madeAt, deliveredAt, "URGE_LETTER");
+    }
+
+    private long supplementDelivery(long documentCase, long bundleCase, long version, Actor owner, String status,
+                                    boolean futureApproval, LocalDate madeAt, LocalDate deliveredAt, String documentType) {
         long bundle = jdbc.queryForObject("""
                 insert into case_supplement_bundle(case_id,request_key,title,source_reference,status,created_by,
                     applicant_id,source_snapshot,reviewed_at)
@@ -332,12 +426,12 @@ class ReportingVersionsIntegrationTest {
         long document = jdbc.queryForObject("""
                 insert into case_supplement_document(case_id,bundle_id,decision_version_id,request_key,doc_type,
                     title,content,content_sha256,made_at,created_by)
-                values(?,?,?,?,'URGE_LETTER','独立版本催告','催告全文',?,?,?) returning id
-                """, Long.class, documentCase, bundle, version, UUID.randomUUID().toString(), "0".repeat(64), madeAt, owner.name());
-        if (deliveredAt != null) jdbc.update("""
+                values(?,?,?,?,?,'独立版本文书','合成文书全文',?,?,?) returning id
+                """, Long.class, documentCase, bundle, version, UUID.randomUUID().toString(), documentType, "0".repeat(64), madeAt, owner.name());
+        return deliveredAt == null ? 0 : jdbc.queryForObject("""
                 insert into case_supplement_delivery(document_id,method,delivered_at,receiver,receipt_no,source_reference,recorded_by)
-                values(?,'DIRECT',?,'当事人',?,'测试回证原件',?)
-                """, document, deliveredAt, "URGE-" + UUID.randomUUID(), owner.name());
+                values(?,'DIRECT',?,'当事人',?,'测试回证原件',?) returning id
+                """, Long.class, document, deliveredAt, "DELIVERY-" + UUID.randomUUID(), owner.name());
     }
 
     private long continuation(long caseId, Actor owner, Actor reviewer, String type, String status, boolean futureApproval) {

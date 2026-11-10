@@ -365,6 +365,24 @@ public class CaseService {
         return items;
     }
 
+    @Transactional
+    public CaseFile convertToOrdinary(Long caseId, String reason, String username) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseRoles(caseId, "LEADER", "ADMIN");
+        CaseFile c = get(caseId);
+        String explanation = CaseFactService.text(reason, 512, "转普通程序原因");
+        if (!"INVESTIGATING".equals(c.getStatus()) || !"SUMMARY".equals(c.getProcedureType())
+                || c.getDecidedAt() != null || decisionRepository.findByCaseId(caseId).isPresent())
+            throw new BizException(2003, "仅尚未作出决定且处于调查中的简易程序案件可转为普通程序");
+        String batch = java.util.UUID.randomUUID().toString().replace("-", "");
+        jdbc.update("""
+                insert into case_correction (case_id,batch_no,field,old_value,new_value,reason,operator)
+                values (?,?,'procedureType','SUMMARY','NORMAL',?,?)
+                """, caseId, batch, explanation, username);
+        c.setProcedureType("NORMAL");
+        return caseRepository.save(c);
+    }
+
     /** 字段为空 = 不更正；传空串 = 清空（partyName 除外，不允许清空） */
     public record CorrectionReq(String partyName, String partyCreditNo, String partyAddress,
                                 String partyLegalRep, String partyContact, String summary,
@@ -899,19 +917,28 @@ public class CaseService {
             throw new BizException(2004, "调查终结后方可作出处罚告知（第36/41条）");
         if (req == null || req.content() == null || req.content().isBlank())
             throw new BizException(2006, "请填写处罚告知内容");
-        // 再次告知且金额高于此前：须载明改变原认定事实/证据/依据的理由，避免借重新告知规避"不得因申辩加重"
         CaseNotice prev = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId).orElse(null);
         if ((Boolean.TRUE.equals(req.requireDelivery()) || req.previousNoticeId() != null
                 || prev != null && prev.isDeliveryRequired())
                 && !java.util.Objects.equals(req.previousNoticeId(), prev == null ? null : prev.getId()))
             throw new BizException(2194, "告知版本已变化，请刷新后重新核对");
-        if (prev != null
-                && (nz(req.proposedFine()).compareTo(nz(prev.getProposedFine())) > 0
-                    || nz(req.proposedRecoup()).compareTo(nz(prev.getProposedRecoup())) > 0
-                    || nz(req.proposedConfiscate()).compareTo(nz(prev.getProposedConfiscate())) > 0)
-                && (req.changeReason() == null || req.changeReason().isBlank()))
-            throw new BizException(2077, "再次告知的拟处罚金额高于前次，须载明改变原认定事实、证据或依据的理由（辽52条）；"
-                    + "不得因当事人陈述申辩而加重处罚（第41条）");
+        BigDecimal fine = cn.ybcase.bureau.common.Money.nonNegative(req.proposedFine(), "拟罚款");
+        BigDecimal recoup = cn.ybcase.bureau.common.Money.nonNegative(req.proposedRecoup(), "拟追回金额");
+        BigDecimal confiscate = cn.ybcase.bureau.common.Money.nonNegative(req.proposedConfiscate(), "拟没收金额");
+        boolean tracked = Boolean.TRUE.equals(req.requireDelivery()) || prev != null && prev.isDeliveryRequired()
+                || config.bool("notice_delivery_required", false);
+        if (prev != null) {
+            var limit = noticeAmounts(caseId, prev);
+            if ((tracked || req.previousNoticeId() != null) && !limit.permits(fine, recoup, confiscate))
+                throw new BizException(2077, "再次告知的拟处罚金额不得超过" + limit.description());
+            if (!tracked && req.previousNoticeId() == null
+                    && (fine.compareTo(nz(prev.getProposedFine())) > 0
+                        || recoup.compareTo(nz(prev.getProposedRecoup())) > 0
+                        || confiscate.compareTo(nz(prev.getProposedConfiscate())) > 0)
+                    && (req.changeReason() == null || req.changeReason().isBlank()))
+                throw new BizException(2077, "再次告知的拟处罚金额高于前次，须载明改变原认定事实、证据或依据的理由（辽52条）；"
+                        + "不得因当事人陈述申辩而加重处罚（第41条）");
+        }
         CaseNotice n = new CaseNotice();
         // 再告知保留已提出的申请，听证笔录仍归属举行时的告知版本。
         if (prev != null && Boolean.TRUE.equals(prev.getHearingRequested())) n.setHearingRequested(true);
@@ -919,11 +946,9 @@ public class CaseService {
         n.setCaseId(caseId);
         n.setNotifiedAt(LocalDate.now());
         n.setContent(req.content());
-        n.setProposedFine(cn.ybcase.bureau.common.Money.nonNegative(req.proposedFine(), "拟罚款"));
-        n.setProposedRecoup(cn.ybcase.bureau.common.Money.nonNegative(req.proposedRecoup(), "拟追回金额"));
+        n.setProposedFine(fine);
+        n.setProposedRecoup(recoup);
         int stmtDays = Math.max(0, config.intVal("statement_deadline_days", 3));
-        boolean tracked = Boolean.TRUE.equals(req.requireDelivery()) || prev != null && prev.isDeliveryRequired()
-                || config.bool("notice_delivery_required", false);
         n.setDeliveryRequired(tracked);
         if (tracked) {
             n.setStatementPeriodDays(stmtDays);
@@ -932,7 +957,7 @@ public class CaseService {
             n.setStatementDeadline(n.getNotifiedAt().plusDays(stmtDays));
         }
         // 拟罚款达到听证标准（按当事人类型分档，辽46条）：告知听证权利
-        n.setProposedConfiscate(cn.ybcase.bureau.common.Money.nonNegative(req.proposedConfiscate(), "拟没收金额"));
+        n.setProposedConfiscate(confiscate);
         n.setHearingEntitled(punitiveAmount(nz(req.proposedFine()), nz(req.proposedConfiscate()))
                 .compareTo(config.byPartyType(c.getPartyType(),
                         "hearing_threshold_individual", "hearing_threshold_org", "100000")) >= 0);
@@ -957,6 +982,13 @@ public class CaseService {
                                      String receiptNo, LocalDate signedAt, String note) {
         CaseGuards.lockWritable(jdbc, caseId);
         materialAccess.requireCurrentCaseWriter(caseId);
+        if ("ELECTRONIC".equals(method)) throw new BizException(2041, "版本告知的电子送达须通过认证供应商回执登记");
+        applyNoticeDelivery(caseId, noticeId, null, method, deliveredAt, receiver, receiptNo, signedAt, note);
+    }
+
+    // Called under the case lock by the paper path or an authenticated electronic callback.
+    long applyNoticeDelivery(Long caseId, Long noticeId, Long documentId, String method, LocalDate deliveredAt,
+                             String receiver, String receiptNo, LocalDate signedAt, String note) {
         CaseNotice notice = currentNotice(caseId);
         if (!notice.isDeliveryRequired() || !"NOTIFIED".equals(get(caseId).getStatus()))
             throw new BizException(2041, "本案当前告知不支持登记版本送达");
@@ -967,25 +999,49 @@ public class CaseService {
                 || signedAt != null && (signedAt.isBefore(notice.getNotifiedAt()) || signedAt.isAfter(LocalDate.now())))
             throw new BizException(2041, "实际送达日期及回证签收日期须在告知登记日至今天之间");
         var existing = jdbc.queryForList("""
-                select method, delivered_at, receiver, receipt_no, receipt_signed_at, note
+                select id, document_id, method, delivered_at, receiver, receipt_no, receipt_signed_at, note
                 from case_delivery where notice_id=?""", noticeId);
         if (!existing.isEmpty()) {
             var receipt = existing.getFirst();
-            if (java.util.Objects.equals(method, receipt.get("method"))
+            if (java.util.Objects.equals(documentId, receipt.get("document_id"))
+                    && java.util.Objects.equals(method, receipt.get("method"))
                     && java.util.Objects.equals(java.sql.Date.valueOf(deliveredAt), receipt.get("delivered_at"))
                     && java.util.Objects.equals(receiver, receipt.get("receiver"))
                     && java.util.Objects.equals(receiptNo, receipt.get("receipt_no"))
                     && java.util.Objects.equals(signedAt == null ? null : java.sql.Date.valueOf(signedAt), receipt.get("receipt_signed_at"))
-                    && java.util.Objects.equals(note, receipt.get("note"))) return;
+                    && java.util.Objects.equals(note, receipt.get("note"))) return ((Number) receipt.get("id")).longValue();
             throw new BizException(2041, "本版本已有实际回证，请核对原记录");
         }
-        jdbc.update("""
+        long id = jdbc.queryForObject("""
                 insert into case_delivery(case_id, method, delivered_at, receiver, note, receipt_no,
-                                          receipt_signed_at, doc_kind, notice_id)
-                values (?,?,?,?,?,?,?,'NOTICE',?)""", caseId, method, deliveredAt, receiver, note, receiptNo, signedAt, noticeId);
+                                          receipt_signed_at, doc_kind, notice_id, document_id)
+                values (?,?,?,?,?,?,?,'NOTICE',?,?) returning id""",
+                Long.class, caseId, method, deliveredAt, receiver, note, receiptNo, signedAt, noticeId, documentId);
         notice.setStatementDeadline(procedureDeadline(deliveredAt, notice.getStatementPeriodDays()));
         notice.setHearingRequestDeadline(procedureDeadline(deliveredAt, notice.getHearingPeriodDays()));
         noticeRepository.save(notice);
+        return id;
+    }
+
+    private record NoticeAmounts(BigDecimal fine, BigDecimal recoup, BigDecimal confiscate) {
+        boolean permits(BigDecimal proposedFine, BigDecimal proposedRecoup, BigDecimal proposedConfiscate) {
+            return proposedFine.compareTo(fine) <= 0 && proposedRecoup.compareTo(recoup) <= 0
+                    && proposedConfiscate.compareTo(confiscate) <= 0;
+        }
+
+        String description() {
+            return "历次最低告知金额（罚款" + fine + "元／追回" + recoup + "元／没收" + confiscate + "元）";
+        }
+    }
+
+    private NoticeAmounts noticeAmounts(Long caseId, CaseNotice current) {
+        var notices = noticeRepository.findByCaseIdOrderByIdDesc(caseId);
+        return new NoticeAmounts(
+                notices.stream().map(CaseNotice::getProposedFine).filter(java.util.Objects::nonNull)
+                        .min(BigDecimal::compareTo).orElse(nz(current.getProposedFine())),
+                notices.stream().map(CaseNotice::getProposedRecoup).filter(java.util.Objects::nonNull)
+                        .min(BigDecimal::compareTo).orElse(nz(current.getProposedRecoup())),
+                notices.stream().map(n -> nz(n.getProposedConfiscate())).min(BigDecimal::compareTo).orElse(BigDecimal.ZERO));
     }
 
     private LocalDate procedureDeadline(LocalDate effectiveDate, Integer periodDays) {
@@ -1213,17 +1269,10 @@ public class CaseService {
                 out.check("notice_delivery", "本次处罚告知已实际送达",
                         !notice.isDeliveryRequired() || procedureService.noticeDeliveredAt(notice) != null,
                         2006, "请先登记当前告知版本的实际送达回证", "HANDLER");
-                List<CaseNotice> notices = noticeRepository.findByCaseIdOrderByIdDesc(caseId);
-                BigDecimal minFine = notices.stream().map(CaseNotice::getProposedFine).filter(java.util.Objects::nonNull)
-                        .min(BigDecimal::compareTo).orElse(nz(notice.getProposedFine()));
-                BigDecimal minRecoup = notices.stream().map(CaseNotice::getProposedRecoup).filter(java.util.Objects::nonNull)
-                        .min(BigDecimal::compareTo).orElse(nz(notice.getProposedRecoup()));
-                BigDecimal minConf = notices.stream().map(n -> nz(n.getProposedConfiscate())).min(BigDecimal::compareTo).orElse(BigDecimal.ZERO);
+                var limit = noticeAmounts(caseId, notice);
                 if (validAmounts)
-                    out.check("no_aggravation", "不得高于历次最低告知金额", fine.compareTo(minFine) <= 0
-                                    && recoup.compareTo(minRecoup) <= 0 && conf.compareTo(minConf) <= 0,
-                            2007, "决定金额不得高于告知金额（已告知最低 罚款" + minFine + "元/追回"
-                                    + minRecoup + "元/没收" + minConf + "元）——不得因陈述申辩而加重处罚（第41条）", "HANDLER");
+                    out.check("no_aggravation", "不得高于历次最低告知金额", limit.permits(fine, recoup, conf),
+                            2007, "决定金额不得高于" + limit.description() + "（第41条）", "HANDLER");
                 out.check("requested_hearing", "已申请听证的真实听证笔录", !Boolean.TRUE.equals(notice.getHearingRequested()) || heldHearing != null,
                         2075, "当事人已申请听证，应当组织听证并制作笔录后方可作出决定（第41条）", "HANDLER");
             }

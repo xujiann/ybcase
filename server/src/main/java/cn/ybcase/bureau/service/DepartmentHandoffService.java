@@ -25,6 +25,7 @@ public class DepartmentHandoffService {
     public record Decision(Boolean accept, String opinion) {}
     public record Cancellation(String opinion) {}
     public record InspectionAssignment(String username, Long expectedAssignedUserId, String reason) {}
+    public record ClueAssignment(String username, Long expectedAssignmentId, String reason) {}
 
     private enum Source {
         CLUE("case_clue", "clue_id", "clue_no"),
@@ -88,6 +89,9 @@ public class DepartmentHandoffService {
         rowArgs.add(actor.deptId());
         rowArgs.add(leader);
         rowArgs.add(actor.accountCategory());
+        rowArgs.add(actor.deptId());
+        rowArgs.add(leader);
+        rowArgs.add(actor.accountCategory());
         rowArgs.addAll(args);
         rowArgs.add(size);
         rowArgs.add((long) (page - 1) * size);
@@ -105,12 +109,19 @@ public class DepartmentHandoffService {
                            and i.clue_id is null and i.owner_dept_id=h.to_dept_id
                            and h.id=(select max(current_handoff.id) from department_handoff current_handoff
                                      where current_handoff.inspection_id=i.id and current_handoff.status='ACCEPTED'),
-                           false) as can_assign_inspection
+                           false) as can_assign_inspection,
+                       coalesce(h.to_dept_id=? and ? and dest.enabled and dest.org_kind=?
+                           and cl.status='PENDING' and cl.owner_dept_id=h.to_dept_id
+                           and not exists (select 1 from case_file cf where cf.clue_id=cl.id)
+                           and h.id=(select max(current_handoff.id) from department_handoff current_handoff
+                                     where current_handoff.clue_id=cl.id and current_handoff.status='ACCEPTED'),
+                           false) as can_assign_clue
                 from department_handoff h left join sys_dept src on src.id=h.from_dept_id
                 join sys_dept dest on dest.id=h.to_dept_id
                 join sys_user sender on sender.id=h.requested_by
                 left join sys_user receiver on receiver.id=h.decided_by
                 left join inspection i on i.id=h.inspection_id
+                left join case_clue cl on cl.id=h.clue_id
                 """ + where + " order by h.id desc limit ? offset ?", rowArgs.toArray());
         return Map.of("total", total, "rows", rows, "page", page, "size", size);
     }
@@ -188,23 +199,15 @@ public class DepartmentHandoffService {
         if (rows.isEmpty()) throw forbidden();
         var inspection = rows.getFirst();
         requireCurrentInspectionHandoff(id, inspectionId, record, inspection);
-        var candidates = jdbc.queryForList("""
-                select u.id, u.username, u.real_name from sys_user u
-                join sys_user_role ur on ur.user_id=u.id join sys_role r on r.id=ur.role_id
-                where u.enabled and u.dept_id=? and u.account_category=? and u.id<>? and r.code='HANDLER'
-                order by u.real_name,u.id
-                """, department, kind, actor.id());
         var result = new java.util.LinkedHashMap<String, Object>();
-        result.put("candidates", candidates);
+        result.put("candidates", receivingAssignees(department, kind, actor.id()));
         result.put("assignedUserId", inspection.get("assigned_user_id"));
         return result;
     }
 
     @Transactional
     public void assignInspection(long id, InspectionAssignment assignment, String username) {
-        if (assignment == null || assignment.username() == null || assignment.username().isBlank()
-                || assignment.username().length() > 64 || assignment.username().indexOf('\0') >= 0)
-            throw invalid("请选择接收机构的承办账号");
+        String assigneeName = assigneeName(assignment == null ? null : assignment.username());
         String reason = text(assignment.reason(), "指派原因");
         var initial = handoff(id, false);
         long inspectionId = inspectionId(initial);
@@ -213,14 +216,10 @@ public class DepartmentHandoffService {
         var record = handoff(id, true);
         long department = departmentId(record);
         String kind = requireTarget(department);
-        var locked = users.lockUsers(username, assignment.username());
+        var locked = users.lockUsers(username, assigneeName);
         var actor = materials.lockActor(username, true);
         requireReceivingLeader(actor, department, kind);
-        var assignee = locked.get(assignment.username());
-        if (assignee == null || !assignee.enabled() || !Objects.equals(assignee.deptId(), department)
-                || !kind.equals(assignee.accountCategory()) || !assignee.roles().contains("HANDLER")
-                || actor.id().equals(assignee.id()))
-            throw invalid("请选择本机构已启用的办案员，负责人可按原权限直接办理");
+        var assignee = requireAssignee(locked.get(assigneeName), actor.id(), department, kind);
         requireCurrentInspectionHandoff(id, inspectionId, record, inspection);
         Long previous = (Long) inspection.get("assigned_user_id");
         if (assignee.id().equals(previous)) return;
@@ -241,6 +240,97 @@ public class DepartmentHandoffService {
         if (!"ACCEPTED".equals(record.get("status")) || !Objects.equals(latest, id)
                 || !Objects.equals(owner(inspection), departmentId(record)) || inspection.get("clue_id") != null)
             throw invalid("仅当前已接收且未转线索的检查可指派");
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public Map<String, Object> clueAssignees(long id, String username) {
+        var actor = materials.readActor(username);
+        var record = handoff(id, false);
+        long clueId = clueId(record);
+        long department = departmentId(record);
+        String kind = targetKind(department, false);
+        requireReceivingLeader(actor, department, kind);
+        var rows = jdbc.queryForList("select * from case_clue where id=?", clueId);
+        if (rows.isEmpty()) throw forbidden();
+        var clue = rows.getFirst();
+        requireCurrentClueHandoff(id, clueId, record, clue);
+        var result = new java.util.LinkedHashMap<String, Object>();
+        result.put("candidates", receivingAssignees(department, kind, actor.id()));
+        result.put("handler", clue.get("handler"));
+        result.put("assignmentId", latestClueAssignment(id).get("id"));
+        return result;
+    }
+
+    @Transactional
+    public void assignClue(long id, ClueAssignment assignment, String username) {
+        String assigneeName = assigneeName(assignment == null ? null : assignment.username());
+        String reason = text(assignment.reason(), "指派原因");
+        long clueId = clueId(handoff(id, false));
+        var clue = lockSource(Source.CLUE, clueId);
+        var record = handoff(id, true);
+        long department = departmentId(record);
+        String kind = requireTarget(department);
+        var locked = users.lockUsers(username, assigneeName);
+        var actor = materials.lockActor(username, true);
+        requireReceivingLeader(actor, department, kind);
+        var assignee = requireAssignee(locked.get(assigneeName), actor.id(), department, kind);
+        requireCurrentClueHandoff(id, clueId, record, clue);
+
+        var current = latestClueAssignment(id);
+        if (Objects.equals(assignee.id(), current.get("assigned_user_id"))) return;
+        if (!Objects.equals(current.get("id"), assignment.expectedAssignmentId()))
+            throw invalid("承办人已变化，请刷新后核对");
+        jdbc.update("update case_clue set handler=? where id=?", assigneeName, clueId);
+        jdbc.update("""
+                insert into clue_assignment(clue_id,handoff_id,department_id,previous_handler,assigned_user_id,assigned_by,reason)
+                values (?,?,?,?,?,?,?)
+                """, clueId, id, department, clue.get("handler"), assignee.id(), actor.id(), reason);
+    }
+
+    private Map<String, Object> latestClueAssignment(long handoffId) {
+        var rows = jdbc.queryForList("""
+                select id, assigned_user_id from clue_assignment where handoff_id=? order by id desc limit 1
+                """, handoffId);
+        return rows.isEmpty() ? Map.of() : rows.getFirst();
+    }
+
+    private void requireCurrentClueHandoff(long id, long clueId, Map<String, Object> record, Map<String, Object> clue) {
+        Long latest = jdbc.queryForObject("""
+                select max(id) from department_handoff where clue_id=? and status='ACCEPTED'
+                """, Long.class, clueId);
+        if (!"ACCEPTED".equals(record.get("status")) || !Objects.equals(latest, id)
+                || !Objects.equals(owner(clue), departmentId(record)) || !"PENDING".equals(clue.get("status"))
+                || exists("select exists(select 1 from case_file where clue_id=?)", clueId))
+            throw invalid("仅当前已接收、待处理且未立案的线索可指派");
+    }
+
+    private List<Map<String, Object>> receivingAssignees(long department, String kind, long actorId) {
+        return jdbc.queryForList("""
+                select u.id, u.username, u.real_name from sys_user u
+                join sys_user_role ur on ur.user_id=u.id join sys_role r on r.id=ur.role_id
+                where u.enabled and u.dept_id=? and u.account_category=? and u.id<>? and r.code='HANDLER'
+                order by u.real_name,u.id
+                """, department, kind, actorId);
+    }
+
+    private static WorkflowUserAccess.User requireAssignee(WorkflowUserAccess.User assignee, long actorId,
+                                                            long department, String kind) {
+        if (assignee == null || !assignee.enabled() || !Objects.equals(assignee.deptId(), department)
+                || !kind.equals(assignee.accountCategory()) || !assignee.roles().contains("HANDLER")
+                || Objects.equals(actorId, assignee.id()))
+            throw invalid("请选择本机构已启用的办案员，负责人可按原权限直接办理");
+        return assignee;
+    }
+
+    private static String assigneeName(String name) {
+        if (name == null || name.isBlank() || name.length() > 64 || name.indexOf('\0') >= 0)
+            throw invalid("请选择接收机构的承办账号");
+        return name;
+    }
+
+    private static long clueId(Map<String, Object> record) {
+        if (!(record.get("clue_id") instanceof Number id)) throw forbidden();
+        return id.longValue();
     }
 
     private static long inspectionId(Map<String, Object> record) {

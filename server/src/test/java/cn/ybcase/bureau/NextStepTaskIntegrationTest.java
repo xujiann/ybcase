@@ -2,6 +2,7 @@ package cn.ybcase.bureau;
 
 import cn.ybcase.bureau.common.BizException;
 import cn.ybcase.bureau.service.NextStepTaskService;
+import cn.ybcase.bureau.service.MessageService;
 import cn.ybcase.bureau.service.ReportingSupplementService;
 import cn.ybcase.core.security.JwtService;
 import org.junit.jupiter.api.AfterEach;
@@ -29,6 +30,7 @@ class NextStepTaskIntegrationTest {
     @Autowired JdbcTemplate jdbc;
     @Autowired MockMvc mvc;
     @Autowired JwtService jwt;
+    @Autowired MessageService messages;
     private String previousScope;
 
     private record Actor(long id, String name, long department) {}
@@ -137,6 +139,74 @@ class NextStepTaskIntegrationTest {
         long selfCase=caseFile(reviewer,"CLOSED");
         long selfRequest=jdbc.queryForObject("insert into case_continuation_request(case_id,request_key,request_type,payload,source_snapshot,reason,source_reference,requested_by,requested_username) values(?,?,'EXECUTION','{}','{}','本人历史申请','合成凭据',?,?) returning id",Long.class,selfCase,unique(),reviewer.id(),reviewer.name());
         assertFalse(has(tasks.bureau(reviewer.name(),1,100),"CONTINUATION",selfRequest));
+    }
+
+    @Test void archivedEffectiveDecisionUsesItsOwnDeliveryAndCourtRoundForTasksAndReminders() {
+        var owner = actor("DISTRICT","HANDLER");
+        var legal = actor("BUREAU","LEGAL");
+        var outsider = actor("DISTRICT","LEADER");
+        long caseId = caseFile(owner,"CLOSED");
+        jdbc.update("insert into case_decision(case_id,decision_type,content,decided_at,fine_amount) values(?,'PUNISH','原决定',current_date-60,50)",caseId);
+        long remedy = jdbc.queryForObject("""
+                insert into case_remedy(case_id,request_key,remedy_type,accepted_at,reference,reason,source_reference,registered_by,registered_username)
+                values(?,?,'RECONSIDERATION',current_date-58,'原卷','登记','合成材料',?,?) returning id
+                """,Long.class,caseId,unique(),owner.id(),owner.name());
+        long result = approved(caseId, owner, legal, "REMEDY_RESULT", "{\"remedyId\":" + remedy + "}");
+        long version = jdbc.queryForObject("""
+                insert into case_decision_version(case_id,request_id,remedy_id,outcome,effective_at,decision_type,decision_no,
+                                                 fine_amount,recoup_amount,confiscate_amount,penalty_basis,content)
+                values(?,?,?,'CHANGE',current_date-50,'PUNISH',?,100,0,0,'合成依据','后续决定') returning id
+                """,Long.class,caseId,result,remedy,unique());
+        assertEquals("/case/detail/" + caseId + "?deliveryVersion=" + version, caseTask(owner,caseId).link());
+        assertFalse(has(tasks.bureau(outsider.name(),1,100),"CASE",caseId));
+        long bundle = jdbc.queryForObject("""
+                insert into case_supplement_bundle(case_id,request_key,title,source_reference,status,created_by,applicant_id,source_snapshot)
+                values(?,?,'后续材料','合成回证','APPROVED',?,?,'{}') returning id
+                """,Long.class,caseId,unique(),owner.name(),owner.id());
+        long document = jdbc.queryForObject("""
+                insert into case_supplement_document(case_id,bundle_id,decision_version_id,request_key,doc_type,title,content,
+                                                      content_sha256,made_at,created_by)
+                values(?,?,?,?,'DECISION','后续决定','后续决定',?,current_date-49,?) returning id
+                """,Long.class,caseId,bundle,version,unique(),"a".repeat(64),owner.name());
+        jdbc.update("""
+                insert into case_supplement_delivery(document_id,method,delivered_at,receiver,receipt_no,source_reference,recorded_by)
+                values(?,'DIRECT',current_date-45,'合成当事人',?,'合成回证',?)
+                """,document,unique(),owner.name());
+        assertEquals("待执行核对",caseTask(owner,caseId).stage());
+        long application = approved(caseId,owner,legal,"COURT_APPLY","{}");
+        long round = jdbc.queryForObject("""
+                insert into case_court_round(case_id,request_id,round_no,applied_at,application_reference,eligibility_basis,decision_version_id)
+                values(?,?,1,current_date-5,'合成申请','核定期限材料',?) returning id
+                """,Long.class,caseId,application,version);
+        assertEquals("待回执核对",caseTask(owner,caseId).stage());
+        long returned = approved(caseId,owner,legal,"COURT_RECEIPT","{}");
+        jdbc.update("""
+                insert into case_court_receipt(case_id,request_id,round_id,status,received_at,receipt_no)
+                values(?,?,?,'RETURNED',current_date-2,?)
+                """,caseId,returned,round,unique());
+        var task = caseTask(owner,caseId);
+        assertEquals("法院退回补正",task.stage());
+        assertEquals("/case/detail/" + caseId + "?executionVersion=" + version + "&courtRound=" + round,task.link());
+        messages.generateReminders();
+        messages.generateReminders();
+        assertEquals(1,jdbc.queryForObject("select count(*) from sys_message where username=? and link=?",Integer.class,owner.name(),task.link()));
+        assertEquals(0,jdbc.queryForObject("select count(*) from sys_message where username=? and link=?",Integer.class,outsider.name(),task.link()));
+        jdbc.update("insert into case_execution(case_id,kind,amount,paid_at,method) values(?,'FINE',100,current_date,'BANK')",caseId);
+        assertFalse(has(tasks.bureau(owner.name(),1,100),"CASE",caseId));
+        assertEquals("CLOSED",jdbc.queryForObject("select status from case_file where id=?",String.class,caseId));
+    }
+
+    private NextStepTaskService.TaskRow caseTask(Actor owner, long caseId) {
+        return tasks.bureau(owner.name(),1,100).rows().stream()
+                .filter(row -> row.sourceType().equals("CASE") && row.sourceId()==caseId).findFirst().orElseThrow();
+    }
+
+    private long approved(long caseId, Actor owner, Actor legal, String type, String payload) {
+        return jdbc.queryForObject("""
+                insert into case_continuation_request(case_id,request_key,request_type,payload,source_snapshot,reason,source_reference,
+                    requested_by,requested_username,status,reviewed_by,reviewed_username,reviewed_at,opinion)
+                values(?,?,?,?::jsonb,'{}','合成事项','合成材料',?,?,'APPROVED',?,?,current_timestamp,'已核对') returning id
+                """,Long.class,caseId,unique(),type,payload,owner.id(),owner.name(),legal.id(),legal.name());
     }
 
     @Test void generatedReportTaskRequiresAnotherFormalBureauReviewer() {

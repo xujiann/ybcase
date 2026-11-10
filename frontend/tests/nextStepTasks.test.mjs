@@ -115,3 +115,23 @@ test('supplement and interview review tasks navigate without allowing arbitrary 
   f.rows.value.forEach(f.openTask)
   assert.deepEqual(f.routes, links.slice(0, 2))
 })
+
+test('workflow tasks open the matching version, court round and source form within their own domain', async t => {
+  const links = [
+    '/case/detail/1?executionVersion=17&courtRound=23',
+    '/case/detail/1?deliveryVersion=17',
+    '/case/detail/1#report-supplement',
+    '/case/inspections?focus=25',
+    '/case/interviews?interviewRequest=13',
+    '/agency/agreements?interview=55',
+    '/case/detail/1?executionVersion=17&courtRound=23&other=1',
+  ]
+  for (const domain of ['bureau', 'agency']) {
+    const f = fixture(t, domain)
+    const pending = f.refresh()
+    f.requests[0].resolve(links.map((link, index) => task(index + 1, link)))
+    await pending
+    f.rows.value.forEach(f.openTask)
+    assert.deepEqual(f.routes, domain === 'agency' ? links.slice(5, 6) : links.slice(0, 5))
+  }
+})

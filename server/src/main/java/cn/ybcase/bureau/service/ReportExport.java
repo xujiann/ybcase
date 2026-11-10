@@ -29,7 +29,7 @@ public record ReportExport(byte[] workbook, Audit audit, List<Line> lines) {
     public static final String AUDIT_ATTRIBUTE = "ybcaseReportExport";
     public static final java.util.concurrent.Semaphore GENERATION_SLOTS = new java.util.concurrent.Semaphore(2);
 
-    public enum Kind { PENALTIES, ENFORCEMENT_WORK, INTERVIEWS }
+    public enum Kind { PENALTIES, ENFORCEMENT_WORK, INTERVIEWS, MONTHLY_SUBMISSION }
 
     public record Audit(Kind kind, LocalDate start, LocalDate end, LocalDate cutoff, int rowCount) {}
 

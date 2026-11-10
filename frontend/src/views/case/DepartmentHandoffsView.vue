@@ -32,7 +32,9 @@
           <el-button v-if="row.can_decide" type="primary" text :disabled="saving" @click="openDecision(row, 'accept')">接收</el-button>
           <el-button v-if="row.can_decide" text :disabled="saving" @click="openDecision(row, 'reject')">驳回</el-button>
           <el-button v-if="row.can_cancel" type="warning" text :disabled="saving" @click="openDecision(row, 'cancel')">撤回</el-button>
-          <el-button v-if="row.can_assign_inspection" type="primary" text :disabled="saving" @click="openAssignment(row)">指派承办</el-button>
+          <el-button v-if="row.can_assign_inspection || row.can_assign_clue" type="primary" text :disabled="saving" @click="openAssignment(row)">指派承办</el-button>
+          <router-link v-if="row.status === 'ACCEPTED' && (row.can_assign_inspection || row.can_assign_clue)"
+            :to="{ path: '/case/' + SOURCES[row.source_type as SourceType].path, query: { focus: row.source_id } }">查看来源</router-link>
         </template>
       </el-table-column>
     </el-table>
@@ -74,7 +76,7 @@
         <el-button type="primary" :loading="saving" @click="submitDecision">确认{{ ACTIONS[decision.action] }}</el-button>
       </template>
     </el-dialog>
-    <el-dialog v-model="assignmentVisible" title="指派检查承办人" width="min(500px, 94vw)"
+    <el-dialog v-model="assignmentVisible" :title="'指派' + SOURCES[assignment.sourceType].label + '承办人'" width="min(500px, 94vw)"
       :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
       <p>{{ assignment.number }}</p>
       <el-alert v-if="assignmentReady && !assignees.length" type="info" :closable="false"
@@ -118,7 +120,7 @@ const ACTIONS = { accept: '接收交接', reject: '驳回交接', cancel: '撤�
 type SourceType = keyof typeof SOURCES
 type Status = keyof typeof STATES
 type Action = keyof typeof ACTIONS
-interface Handoff { id: number; source_no: string; source_type: SourceType; status: Status; can_decide: boolean; can_cancel: boolean; can_assign_inspection?: boolean }
+interface Handoff { id: number; source_id: number; source_no: string; source_type: SourceType; status: Status; can_decide: boolean; can_cancel: boolean; can_assign_inspection?: boolean; can_assign_clue?: boolean }
 interface Department { id: number; name: string; enabled: boolean; orgKind: string }
 interface SourceOption { id: number; number: string }
 interface Assignee { id: number; username: string; real_name: string }
@@ -150,7 +152,8 @@ const sources = ref<SourceOption[]>([])
 const request = reactive({ sourceType: 'CLUE' as SourceType, sourceId: undefined as number | undefined,
   targetDeptId: undefined as number | undefined, reason: '' })
 const decision = reactive({ id: 0, number: '', action: 'accept' as Action, opinion: '' })
-const assignment = reactive({ id: 0, number: '', username: '', reason: '', expectedAssignedUserId: null as number | null })
+const assignment = reactive({ id: 0, number: '', username: '', reason: '', sourceType: 'INSPECTION' as 'INSPECTION' | 'CLUE',
+  expectedAssignedUserId: null as number | null, expectedAssignmentId: null as number | null })
 let sourceSearch: AbortController | undefined
 let assignmentSearch: AbortController | undefined
 let disposed = false
@@ -242,22 +245,28 @@ async function submitDecision() {
 }
 
 async function openAssignment(row: Handoff) {
-  if (saving.value || !row.can_assign_inspection) return
+  if (saving.value || (!row.can_assign_inspection && !row.can_assign_clue)) return
+  const sourceType = row.can_assign_clue ? 'CLUE' : 'INSPECTION'
+  const kind = sourceType.toLowerCase()
   assignmentSearch?.abort()
   const current = assignmentSearch = new AbortController()
   const identity = readIdentity()
-  Object.assign(assignment, { id: row.id, number: row.source_no, username: '', reason: '', expectedAssignedUserId: null })
+  Object.assign(assignment, { id: row.id, number: row.source_no, username: '', reason: '', sourceType,
+    expectedAssignedUserId: null, expectedAssignmentId: null })
   assignees.value = []
   assignmentReady.value = false
   assignmentLoading.value = true
   assignmentVisible.value = true
   try {
-    const { data } = await client.get<{ data: { candidates: Assignee[]; assignedUserId: number | null } }>(
-      `${endpoint}/${row.id}/inspection-assignees`, { signal: current.signal })
+    const { data } = await client.get<{ data: { candidates: Assignee[]; assignedUserId?: number | null;
+      assignmentId?: number | null; handler?: string | null } }>(
+      `${endpoint}/${row.id}/${kind}-assignees`, { signal: current.signal })
     if (disposed || current.signal.aborted || !assignmentVisible.value || identity !== readIdentity()) return
     assignees.value = data.data.candidates
-    assignment.expectedAssignedUserId = data.data.assignedUserId
-    assignment.username = assignees.value.find(person => person.id === assignment.expectedAssignedUserId)?.username ?? ''
+    assignment.expectedAssignedUserId = data.data.assignedUserId ?? null
+    assignment.expectedAssignmentId = data.data.assignmentId ?? null
+    assignment.username = assignees.value.find(person => sourceType === 'CLUE'
+      ? person.username === data.data.handler : person.id === assignment.expectedAssignedUserId)?.username ?? ''
     assignmentReady.value = true
   } catch {
     // An unsuccessful lookup leaves the dialog read-only.
@@ -268,10 +277,11 @@ async function openAssignment(row: Handoff) {
 
 async function submitAssignment() {
   if (saving.value || !assignmentVisible.value || !assignmentReady.value) return
-  const { id, username, expectedAssignedUserId, reason } = assignment
+  const { id, username, expectedAssignedUserId, expectedAssignmentId, reason, sourceType } = assignment
   if (!assignees.value.some(person => person.username === username) || !reason.trim()) return
-  await submit(`${endpoint}/${id}/inspection-assignment`, { username, expectedAssignedUserId, reason: reason.trim() },
-    assignmentVisible, '检查承办人已指派', paging.load)
+  const expected = sourceType === 'CLUE' ? { expectedAssignmentId } : { expectedAssignedUserId }
+  await submit(`${endpoint}/${id}/${sourceType.toLowerCase()}-assignment`, { username, ...expected, reason: reason.trim() },
+    assignmentVisible, SOURCES[sourceType].label + '承办人已指派', paging.load)
 }
 
 async function submit(path: string, body: object, visible: typeof requestVisible, message: string,

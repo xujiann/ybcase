@@ -36,7 +36,10 @@
             <div v-if="row.recoveredAmount != null" class="hint">实际追回 {{ row.recoveredAmount }} 元</div>
             <div v-if="row.effectiveAt" class="hint">{{ row.effectiveAt }}<span v-if="row.endAt"> 至 {{ row.endAt }}</span></div>
             <div v-if="row.reference" class="hint">回执 {{ row.reference }}</div>
-            <div v-if="row.interviewId" class="hint">实际约谈已入台账</div>
+            <div v-if="row.interviewVoided" class="hint">实际约谈已作废。
+              <RouterLink :to="{ path: '/agency/agreements', query: { interview: String(row.interviewId) } }">查看约谈及替代申请</RouterLink>
+            </div>
+            <div v-else-if="row.interviewId" class="hint">实际约谈已入台账</div>
           </div>
           <div v-else-if="row.returnedAt">{{ row.returnReason }}<div class="hint">退回 {{ row.returnedAt }}</div></div>
         </template>
@@ -128,6 +131,7 @@ interface Handoff {
   endAt: string | null
   reference: string | null
   interviewId?: number | null
+  interviewVoided?: boolean
   autoRemindedAt?: string | null
 }
 

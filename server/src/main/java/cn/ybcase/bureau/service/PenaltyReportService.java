@@ -32,25 +32,13 @@ public class PenaltyReportService {
             case when coalesce(d.penalty_basis,'') ~ '[^[:space:]]' then d.penalty_basis else rf.penalty_basis end
             """;
     private static final String MISSING_PENALTIES = """
-            with period as (select cast(? as date) as starts, cast(? as date) as ends),
-            checked as (
-                select cf.id, cf.case_no, cf.party_name, d.decided_at, array_remove(array[
-                    case when coalesce((%s), '') !~ '[^[:space:]]' then
-                        case when cf.party_type = 'PROVIDER' then '机构编码' else '参保人证件号码' end end,
-                    case when cf.party_type = 'PROVIDER' and rf.institution_ownership is null then '机构性质' end,
-                    case when cf.party_type = 'PROVIDER' and rf.institution_grade is null then '机构等级' end,
-                    case when rf.confirmed_violation_start is null or rf.confirmed_violation_end is null then '违法发生期间' end,
-                    case when coalesce(rf.confirmed_violation_facts, '') !~ '[^[:space:]]' then '认定违法事实' end,
-                    case when rf.confirmed_violation_amount is null then '认定违法违规金额' end,
-                    case when coalesce((%s), '') !~ '[^[:space:]]' then '处罚依据' end
-                ], null) as missing_fields
-                %s cross join period t where %s
-            )
-            """.formatted(PARTY_CODE, PENALTY_BASIS, PENALTY_SOURCE, PENALTY_POPULATION);
+             from case_penalty_missing_fields(?) where decided_at between ? and ?
+            """;
     private final JdbcTemplate jdbc;
     private final MaterialAccess materialAccess;
 
-    public record MissingPenalty(String caseNo, String partyName, LocalDate decidedAt, List<String> missingFields) {}
+    public record MissingPenalty(long caseId, String caseNo, String partyName, LocalDate decidedAt,
+                                 List<String> missingFields) {}
 
     public record MissingPenalties(List<MissingPenalty> rows, long total, LocalDate start, LocalDate end, LocalDate cutoff) {}
 
@@ -61,22 +49,21 @@ public class PenaltyReportService {
         if (page < 1 || size < 1 || size > 100)
             throw new BizException(2100, "页码须大于零，每页须为1至100条");
 
-        String missingOnly = " from checked where cardinality(missing_fields) > 0 ";
-        long total = jdbc.queryForObject(MISSING_PENALTIES + "select count(*)" + missingOnly,
-                Long.class, period.start(), period.end(), period.cutoff());
+        long total = jdbc.queryForObject("select count(*)" + MISSING_PENALTIES,
+                Long.class, period.cutoff(), period.start(), period.end());
         long offset = (page - 1L) * size;
         List<MissingPenalty> rows = offset >= total ? List.of() : jdbc.query(
-                MISSING_PENALTIES + "select case_no, party_name, decided_at, missing_fields" + missingOnly
-                        + " order by decided_at, id limit ? offset ?",
+                "select case_id, case_no, party_name, decided_at, missing_fields" + MISSING_PENALTIES
+                        + " order by decided_at, case_id limit ? offset ?",
                 (rs, index) -> {
                     var fields = rs.getArray("missing_fields");
                     try {
-                        return new MissingPenalty(rs.getString("case_no"), rs.getString("party_name"),
+                        return new MissingPenalty(rs.getLong("case_id"), rs.getString("case_no"), rs.getString("party_name"),
                                 rs.getObject("decided_at", LocalDate.class), List.of((String[]) fields.getArray()));
                     } finally {
                         fields.free();
                     }
-                }, period.start(), period.end(), period.cutoff(), size, offset);
+                }, period.cutoff(), period.start(), period.end(), size, offset);
         return new MissingPenalties(rows, total, period.start(), period.end(), period.cutoff());
     }
 
@@ -116,11 +103,16 @@ public class PenaltyReportService {
                        coalesce(p.late_fee_paid, 0) as late_fee_paid,
                        coalesce(p.positive_collected,0) as positive_collected,
                        coalesce(p.reversed_refunded,0) as reversed_refunded,
-                       (t.current_state and cf.defer_approved) or exists (
+                       case when d.version_id is not null then vb.defer_until is not null
+                         else (t.current_state and cf.defer_approved) or exists (
                            select 1 from biz_approval a where a.case_id = cf.id and a.kind = 'DEFER'
                              and (t.legacy or (a.applied_at at time zone 'Asia/Shanghai')::date <= t.cutoff)
-                       ) as defer_requested,
-                       case when t.current_state and not cf.relief_pending and nullif(btrim(cf.relief_basis), '') is not null
+                       ) end as defer_requested,
+                       case when d.version_id is not null then
+                              case when vb.relief_deadline is not null and not vb.relief_pending and not rm.open
+                                   then t.cutoff > vb.relief_deadline end
+                            when t.current_state and not cf.relief_pending and not rm.open
+                                 and nullif(btrim(cf.relief_basis), '') is not null
                             then t.cutoff > cf.relief_deadline end as relief_expired,
                        case when d.version_id is null then exists (
                            select 1 from case_delivery del join case_document doc on doc.id = del.document_id
@@ -148,6 +140,41 @@ public class PenaltyReportService {
                             when t.current_state then cf.court_enforce_applied end as enforced,
                        d.publish_withdrawn and (d.withdrawn_at at time zone 'Asia/Shanghai')::date <= t.cutoff as withdrawn
                 %s cross join period t
+                left join lateral (
+                    select delivery.id
+                    from case_supplement_delivery delivery
+                    join case_supplement_document doc on doc.id=delivery.document_id
+                    join case_supplement_bundle b on b.id=doc.bundle_id and b.case_id=doc.case_id
+                    where doc.case_id=cf.id and doc.decision_version_id=d.version_id
+                      and doc.doc_type='DECISION' and b.status='APPROVED'
+                      and b.reviewed_at<=least(current_timestamp,statement_timestamp())
+                      and delivery.recorded_at<=least(current_timestamp,statement_timestamp())
+                      and delivery.delivered_at between d.effective_at and t.cutoff
+                    order by delivery.delivered_at,delivery.id limit 1
+                ) vd on true
+                left join lateral (
+                    select v.relief_deadline,v.relief_pending,v.defer_until
+                    from case_version_execution_basis v
+                    where v.case_id=cf.id and v.decision_version_id=d.version_id and v.delivery_id=vd.id
+                      and v.recorded_at<=least(current_timestamp,statement_timestamp())
+                      and (v.recorded_at at time zone 'Asia/Shanghai')::date<=t.cutoff
+                    order by v.id desc limit 1
+                ) vb on true
+                cross join lateral (
+                    select exists (
+                        select 1 from case_remedy m where m.case_id=cf.id and m.accepted_at<=t.cutoff
+                          and m.registered_at<=least(current_timestamp,statement_timestamp())
+                          and not exists (
+                            select 1 from case_continuation_request r
+                            left join case_decision_version v on v.request_id=r.id and v.remedy_id=m.id
+                            where r.case_id=m.case_id and r.status='APPROVED'
+                              and r.request_type in ('REMEDY_RESULT','REMEDY_VOID')
+                              and (v.id is not null or (r.payload->>'remedyId')::bigint=m.id)
+                              and r.reviewed_at<=least(current_timestamp,statement_timestamp())
+                              and coalesce(v.effective_at,(r.reviewed_at at time zone 'Asia/Shanghai')::date)<=t.cutoff
+                          )
+                    ) as open
+                ) rm
                 left join lateral (
                     select sum(amount) filter (where kind = 'FINE') as fine_paid,
                            sum(amount) filter (where kind = 'RECOUP') as recoup_paid,

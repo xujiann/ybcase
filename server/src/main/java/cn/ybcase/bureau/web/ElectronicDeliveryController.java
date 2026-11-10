@@ -15,6 +15,11 @@ public class ElectronicDeliveryController {
     private final ElectronicDeliveryService service;
     @GetMapping("/api/bureau/cases/{caseId}/electronic-deliveries")
     public R<?> list(Authentication auth,@PathVariable long caseId) {return R.ok(service.list(auth.getName(),caseId));}
+    @PostMapping("/api/bureau/cases/{caseId}/electronic-deliveries/notices/{noticeId}/document")
+    @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
+    public R<?> prepareNotice(Authentication auth,@PathVariable long caseId,@PathVariable long noticeId) {
+        return R.ok(java.util.Map.of("id",service.prepareNotice(auth.getName(),caseId,noticeId)));
+    }
     @PostMapping("/api/bureau/cases/{caseId}/electronic-deliveries")
     @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     public R<?> create(Authentication auth,@PathVariable long caseId,@RequestBody JsonNode body) {return R.ok(java.util.Map.of("id",service.create(auth.getName(),caseId,positive(body.path("documentId")),text(body,"requestKey"))));}

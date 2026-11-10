@@ -1,6 +1,8 @@
 package cn.ybcase.bureau.service;
 
 import cn.ybcase.bureau.common.BizException;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -19,6 +21,8 @@ public class NextStepTaskService {
     private final JdbcTemplate jdbc;
     private final MaterialAccess materials;
     private final SourceAttachmentAccess sources;
+    private final ExecutionAlerts execution;
+    private final ObjectMapper mapper;
 
     public record TaskRow(String taskKey, String sourceType, long sourceId, Integer cycle,
                           String sourceNo, String title, String stage, LocalDate dueAt,
@@ -34,13 +38,35 @@ public class NextStepTaskService {
         var caseScope = sources.caseReadPredicate("c.id", username);
         var arguments = new ArrayList<Object>(caseScope.args());
         var parts = new ArrayList<String>();
+        String ctes = "with visible_cases as (select c.* from case_file c where " + caseScope.sql() + "), ";
         boolean writer = actor.roles().stream().anyMatch(Set.of("HANDLER", "LEADER", "ADMIN")::contains);
+        boolean reviewer = actor.roles().contains("LEGAL") || actor.roles().contains("LEADER");
+        boolean bureauReviewer = reviewer && "BUREAU".equals(actor.accountCategory()) && actor.deptId() != null
+                && Boolean.TRUE.equals(jdbc.queryForObject("""
+                    select exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
+                    """, Boolean.class, actor.deptId()));
         if (writer) {
             String assignment = actor.privileged() ? "true" : """
                     (c.owner_user=? or exists (select 1 from case_officer o left join enforcer e on e.cert_no=o.cert_no
                       where o.case_id=c.id and coalesce(o.user_id,e.user_id)=? and not o.avoided))
                     """;
-            if (!actor.privileged()) { arguments.add(username); arguments.add(actor.id()); }
+            List<Object> assignmentArgs = actor.privileged() ? List.of() : List.of(username, actor.id());
+            var work = execution.work(ExecutionDeadlines.today(),caseScope.sql(),caseScope.args(),assignment,assignmentArgs);
+            ctes += """
+                    execution_tasks as (select * from jsonb_to_recordset(?::jsonb)
+                      as w("caseId" bigint,"taskKey" text,title text,stage text,"dueAt" date,link text)),
+                    """;
+            try {
+                arguments.add(mapper.writeValueAsString(work));
+            } catch (JsonProcessingException ex) {
+                throw new IllegalStateException("Unable to encode current execution tasks", ex);
+            }
+            parts.add("""
+                    select w."taskKey", 'CASE', c.id, null::int, c.case_no,
+                           w.title, w.stage, w."dueAt", w.link
+                    from execution_tasks w join visible_cases c on c.id=w."caseId"
+                    """);
+            arguments.addAll(assignmentArgs);
             parts.add("""
                     select 'CASE:' || c.id || ':' || c.status as task_key, 'CASE' as source_type,
                            c.id as source_id, null::int as cycle, c.case_no as source_no,
@@ -63,6 +89,7 @@ public class NextStepTaskService {
                            '/case/detail/' || c.id as link
                     from visible_cases c where c.archive_no is null
                       and c.status in ('INVESTIGATING','REPORTED','NOTIFIED','DECIDED','DELIVERED','SUSPENDED','TERMINATED')
+                      and not exists(select 1 from execution_tasks w where w."caseId"=c.id)
                       and
                     """ + assignment);
 
@@ -73,8 +100,45 @@ public class NextStepTaskService {
                            null::int as cycle, cl.clue_no as source_no, '核查线索并决定后续处理' as title,
                            '待核查' as stage, cl.deadline_at as due_at,
                            '/case/clues?focus=' || cl.id as link
-                    from case_clue cl where cl.status='PENDING' and
+                    from case_clue cl where cl.status='PENDING'
+                      and not exists(select 1 from case_file f where f.clue_id=cl.id)
+                      and not exists(select 1 from department_handoff h where h.clue_id=cl.id and h.status='PENDING')
+                      and not exists (
+                         select 1 from department_handoff h where h.id=(
+                            select max(a.id) from department_handoff a where a.clue_id=cl.id and a.status='ACCEPTED')
+                           and h.to_dept_id=cl.owner_dept_id
+                           and not exists(select 1 from clue_assignment ca where ca.handoff_id=h.id)
+                      ) and
                     """ + clueScope.sql());
+
+            var inspectionScope = sources.inspectionReadPredicate("i", username);
+            arguments.addAll(inspectionScope.args());
+            parts.add("""
+                    select 'INSPECTION:' || i.id || case when i.done_at is null then ':CHECK' else ':CONVERT' end,
+                           'INSPECTION', i.id, null::int, i.insp_no,
+                           case when i.done_at is null then '办理检查并登记结果' else '核对检查结果并转线索' end,
+                           case when i.done_at is null then '待检查' else '待转线索' end,
+                           null::date, '/case/inspections?focus=' || i.id
+                    from inspection i where i.clue_id is null
+                      and (i.done_at is null or i.violation_found)
+                      and not exists(select 1 from department_handoff h where h.inspection_id=i.id
+                             and (h.status='PENDING' or (h.status='ACCEPTED' and i.assigned_user_id is null)))
+                      and
+                    """ + inspectionScope.sql());
+
+            arguments.add(ExecutionDeadlines.today());
+            arguments.addAll(assignmentArgs);
+            parts.add("""
+                    select 'REPORT_MISSING:' || c.id, 'REPORT_MISSING', c.id, null::int, c.case_no,
+                           '核对报表缺项：' || array_to_string(issue.missing_fields, '、'),
+                           '待补齐报表资料', null::date, '/case/detail/' || c.id || '#report-supplement'
+                    from case_penalty_missing_fields(?) issue join visible_cases c on c.id=issue.case_id
+                    where cardinality(issue.missing_fields)>0
+                      and c.status in ('DECIDED','DELIVERED','CLOSED')
+                      and not exists(select 1 from case_reporting_supplement_request s
+                                     where s.case_id=c.id and s.status='PENDING')
+                      and
+                    """ + assignment);
 
             parts.add("""
                     select 'AGENCY_RETURN:' || a.id || ':' || a.agency_cycle, 'AGREEMENT', a.id,
@@ -120,14 +184,22 @@ public class NextStepTaskService {
                                      where o.case_id=c.id and (o.user_id=? or e.user_id=?))
                     """);
         }
-        if (actor.roles().contains("LEGAL") || actor.roles().contains("LEADER")) {
+        if (reviewer && actor.deptId()!=null && Set.of("BUREAU","DISTRICT").contains(
+                actor.accountCategory()==null ? "" : actor.accountCategory())) {
             arguments.add(actor.id());
+            arguments.add(bureauReviewer);
             parts.add("""
                     select 'CONTINUATION:' || r.id, 'CONTINUATION', r.id, null::int, c.case_no,
                            '复核救济、后续缴款或退款申请并保留原卷', '待后续事项复核', null::date,
                            '/case/detail/' || c.id
                     from case_continuation_request r join visible_cases c on c.id=r.case_id
                     where r.status='PENDING' and r.requested_by<>?
+                      and (?::boolean or (r.request_type not in ('FACT_CORRECTION','COURT_RECEIPT_CORRECTION')
+                         and not (r.request_type='REMEDY_RESULT' and exists (
+                            select 1 from jsonb_each_text(r.payload) field
+                            where field.key in ('institutionCode','institutionOwnership','institutionGrade','institutionKind',
+                                'confirmedViolationStart','confirmedViolationEnd','confirmedViolationFacts','confirmedViolationAmount')
+                              and coalesce(field.value,'')<>''))))
                     """);
         }
 
@@ -159,9 +231,29 @@ public class NextStepTaskService {
                            '/case/department-handoffs?focus=' || h.id
                     from department_handoff h where h.status='PENDING' and h.to_dept_id=?
                     """);
+            arguments.add(actor.deptId());
+            arguments.add(actor.accountCategory());
+            parts.add("""
+                    select 'HANDOFF:' || h.id || ':ASSIGN', 'HANDOFF', h.id, null::int, h.source_no,
+                           case when h.inspection_id is not null then '指派接收检查的承办人' else '指派接收线索的承办人' end,
+                           '接收后待指派', null::date, '/case/department-handoffs?focus=' || h.id
+                    from department_handoff h
+                    join sys_dept d on d.id=h.to_dept_id and d.enabled
+                    left join inspection i on i.id=h.inspection_id
+                    left join case_clue cl on cl.id=h.clue_id
+                    where h.status='ACCEPTED' and h.to_dept_id=? and d.org_kind=?
+                      and ((i.id is not null and i.owner_dept_id=h.to_dept_id and i.clue_id is null
+                            and (i.done_at is null or i.violation_found) and i.assigned_user_id is null
+                            and h.id=(select max(a.id) from department_handoff a where a.inspection_id=i.id and a.status='ACCEPTED')
+                            and not exists(select 1 from department_handoff p where p.inspection_id=i.id and p.status='PENDING'))
+                        or (cl.id is not null and cl.owner_dept_id=h.to_dept_id and cl.status='PENDING'
+                            and h.id=(select max(a.id) from department_handoff a where a.clue_id=cl.id and a.status='ACCEPTED')
+                            and not exists(select 1 from case_file f where f.clue_id=cl.id)
+                            and not exists(select 1 from department_handoff p where p.clue_id=cl.id and p.status='PENDING')
+                            and not exists(select 1 from clue_assignment ca where ca.handoff_id=h.id)))
+                    """);
         }
-        if ("BUREAU".equals(actor.accountCategory()) && actor.deptId() != null
-                && (actor.roles().contains("LEGAL") || actor.roles().contains("LEADER"))) {
+        if (bureauReviewer) {
             arguments.add(actor.id());
             arguments.add(actor.deptId());
             parts.add("""
@@ -186,7 +278,7 @@ public class NextStepTaskService {
             parts.add("""
                     select 'INTERVIEW_CHANGE:' || r.id, 'INTERVIEW_CHANGE', r.id, null::int,
                            '约谈 #' || r.interview_id, '核对实际约谈更正或误建作废申请', '待约谈复核', null::date,
-                           '/case/interviews'
+                           '/case/interviews?interviewRequest=' || r.id
                     from interview_change_request r where r.status='PENDING' and r.requested_by<>?
                       and exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
                     """);
@@ -201,8 +293,7 @@ public class NextStepTaskService {
                       and exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')
                     """);
         }
-        return query("with visible_cases as (select c.* from case_file c where " + caseScope.sql() + "), ",
-                parts, arguments, page, size);
+        return query(ctes, parts, arguments, page, size);
     }
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
@@ -228,8 +319,14 @@ public class NextStepTaskService {
                   and (a.agency_status in ('PENDING','ACCEPTED') or (
                     a.agency_status='COMPLETED' and a.action='INTERVIEW' and (a.agency_result_type is null or a.agency_result_type='COMPLETED')
                     and not exists(select 1 from department_interview i where i.source_agreement_id=a.id)))
+                """, """
+                select 'INTERVIEW_REPLACEMENT:' || r.interview_id, 'INTERVIEW_REPLACEMENT', r.interview_id,
+                       r.agency_cycle, c.case_no, '核对作废约谈并按实际情况申请替代', '待核对约谈替代',
+                       null::date, '/agency/agreements?interview=' || r.interview_id
+                from eligible_interview_replacement r join case_file c on c.id=r.case_id
+                where r.dept_id=?
                 """);
-        return query("with ", parts, new ArrayList<>(List.of(actor.deptId())), page, size);
+        return query("with ", parts, new ArrayList<>(List.of(actor.deptId(),actor.deptId())), page, size);
     }
 
     private TaskPage query(String prefix, List<String> parts, List<Object> arguments, int page, int size) {

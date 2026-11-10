@@ -12,6 +12,9 @@
       <el-table-column label="缺项" min-width="250">
         <template #default="{ row }">{{ row.missingFields.join('、') }}</template>
       </el-table-column>
+      <el-table-column label="办理入口" width="130">
+        <template #default="{ row }"><RouterLink :to="{path: `/case/detail/${row.caseId}`, hash: '#report-supplement'}">打开案卷核对</RouterLink></template>
+      </el-table-column>
     </el-table>
     <el-pagination v-if="result" class="pagination" :current-page="page" :page-size="pageSize" :total="result.total"
                    :disabled="loading" layout="total, prev, pager, next" @current-change="changePage" />
@@ -29,6 +32,7 @@ import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../../api/sessionExpiry'
 import { useAuthStore } from '../../stores/auth'
 
 interface MissingPenalty {
+  caseId: number
   caseNo: string
   partyName: string
   decidedAt: string

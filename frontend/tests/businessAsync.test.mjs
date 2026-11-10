@@ -8,6 +8,7 @@ import {createResourceLoader,resourceState} from '../src/api/loadableResource.ts
 import {createBlobPreview} from '../src/api/blobPreview.ts'
 import {createSessionExpiry,SESSION_EXPIRED_EVENT} from '../src/api/sessionExpiry.ts'
 import {parseTaskFocus} from '../src/api/taskFocus.ts'
+import {createApprovalRequestKey} from '../src/api/approvalRequestKey.ts'
 
 // Execute the actual SFC setup and handlers; HTTP completions are controlled so
 // stale results, failures and closing panels can be tested without production data.
@@ -15,7 +16,7 @@ function view(file,client,exports,overrides={}) {
   const source=readFileSync(new URL('../src/views/'+file,import.meta.url),'utf8')
   const script=source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const unmount=[]
-  const ctx={...Vue,client,URL,createResourceLoader,resourceState,createBlobPreview,
+  const ctx={...Vue,client,URL,createResourceLoader,resourceState,createBlobPreview,createApprovalRequestKey,
     sessionExpiry:createSessionExpiry(),SESSION_EXPIRED_EVENT,window:{addEventListener(){},removeEventListener(){}},
     onMounted(){},onUnmounted(fn){unmount.push(fn)},watch(){},
     useRoute:()=>({query:{}}),useRouter:()=>({push(){}}),

@@ -244,6 +244,14 @@ public class CaseController {
         return R.ok(r);
     }
 
+    @PostMapping("/{id}/convert-to-ordinary")
+    @PreAuthorize("hasAnyRole('LEADER','ADMIN')")
+    public R<CaseFile> convertToOrdinary(@PathVariable Long id, @RequestBody Map<String, Object> body,
+                                         Authentication auth) {
+        return R.ok(caseService.convertToOrdinary(id,
+                body == null || !(body.get("reason") instanceof String value) ? null : value, auth.getName()));
+    }
+
     @PostMapping("/{id}/report")
     @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
     public R<CaseFile> report(@PathVariable Long id, @RequestBody CaseService.ReportReq body,

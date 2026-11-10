@@ -6,6 +6,7 @@ import { webcrypto } from 'node:crypto'
 import vm from 'node:vm'
 import * as Vue from 'vue'
 import { createSessionExpiry, SESSION_EXPIRED_EVENT } from '../src/api/sessionExpiry.ts'
+import { parseTaskFocus } from '../src/api/taskFocus.ts'
 
 const source = readFileSync(new URL('../src/components/CaseContinuationPanel.vue', import.meta.url), 'utf8')
 const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .+\r?\n/gm, '')
@@ -14,6 +15,7 @@ const initial = marker => ({ eligible: true, canRequest: true, canRegisterRemedy
   originalCaseStatus: 'CLOSED', effectiveDecision: {}, balances: {}, executions: [], courtRounds: [], remedies: [], requests: [] })
 function fixture(t) {
   const props = Vue.reactive({ caseId: 101 })
+  const route = Vue.reactive({ query: {} })
   const auth = Vue.reactive({ token: 'token-one', user: { id: 1, roles: ['HANDLER'], accountCategory: 'DISTRICT' } })
   const reads = [], writes = [], warnings = [], success = [], teardown = [], listeners = new Map()
   const sessionExpiry = createSessionExpiry()
@@ -21,14 +23,14 @@ function fixture(t) {
     resolve: value => resolve({ data: { data: value } }), reject })),
   post: (url, body) => new Promise((resolve, reject) => writes.push({ url, body: JSON.parse(JSON.stringify(body)), resolve, reject })) }
   const scope = Vue.effectScope()
-  const result = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) + ';({state,loading,saving,failed,cutoff,formVisible,reviewVisible,draft,reason,sourceReference,opinion,requestKey,withFinding,withInstitution,materialBundleId,formFields,open,submit,openReview,submitReview,load})', {
-    ...Vue, defineProps: () => props, useAuthStore: () => auth, client, sessionExpiry, SESSION_EXPIRED_EVENT,
+  const result = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) + ';({state,loading,saving,failed,cutoff,formVisible,reviewVisible,draft,reason,sourceReference,opinion,requestKey,withFinding,withInstitution,materialBundleId,formFields,open,submit,openReview,submitReview,load,focusedExecution,focusUnavailable,courtRowClass})', {
+    ...Vue, defineProps: () => props, useAuthStore: () => auth, useRoute: () => route, parseTaskFocus, client, sessionExpiry, SESSION_EXPIRED_EVENT,
     crypto: webcrypto, ElMessage: { warning: message => warnings.push(message), success: message => success.push(message) },
     onMounted: fn => fn(), onBeforeUnmount: fn => teardown.push(fn),
     window: { addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: name => listeners.delete(name) },
   }))
   t.after(() => { teardown.forEach(fn => fn()); scope.stop() })
-  return { ...result, props, auth, reads, writes, warnings, success, expire: () => {
+  return { ...result, props, route, auth, reads, writes, warnings, success, expire: () => {
     sessionExpiry.expire(sessionExpiry.capture(auth.token), auth.token); listeners.get(SESSION_EXPIRED_EVENT)()
   } }
 }
@@ -48,6 +50,42 @@ test('continuation suppresses duplicate submit and preserves request key for an 
   assert.equal(f.formVisible.value, true); assert.equal(f.draft.amount, '40.25')
   const retry = f.submit(); assert.equal(f.writes[1].body.requestKey, key)
   f.writes[1].reject(new Error('still disconnected')); await retry
+})
+
+test('execution task highlights only the exact active decision and court round without opening a form', async t => {
+  const f=fixture(t);await ready(f)
+  f.state.value.executionDeadline={decisionVersionId:12,courtRoundId:9}
+  f.state.value.courtRounds=[{id:8},{id:9}]
+  f.route.query={executionVersion:'12',courtRound:'9'}
+  assert.equal(f.focusUnavailable.value,false)
+  assert.equal(f.focusedExecution.value,true)
+  assert.equal(f.courtRowClass({row:{id:9}}),'task-highlight')
+  assert.equal(f.courtRowClass({row:{id:8}}),'')
+  f.route.query={executionVersion:'11',courtRound:'9'}
+  assert.equal(f.focusUnavailable.value,true)
+  assert.equal(f.courtRowClass({row:{id:9}}),'')
+  f.route.query={executionVersion:'12',courtRound:'404'}
+  assert.equal(f.focusUnavailable.value,true)
+  f.state.value.executionDeadline={decisionVersionId:null}
+  f.route.query={executionVersion:'0'}
+  assert.equal(f.focusUnavailable.value,false)
+  f.route.query={executionVersion:['0']}
+  assert.equal(f.focusUnavailable.value,true)
+  assert.equal(f.formVisible.value,false)
+  assert.equal(f.writes.length,0)
+})
+
+test('actual remedy intake can be recorded while an ordinary continuation is pending', async t => {
+  const f=fixture(t);await ready(f)
+  f.state.value.canRequest=false
+  f.open('EXECUTION')
+  assert.equal(f.formVisible.value,false)
+  f.open('REGISTER_REMEDY')
+  Object.assign(f.draft,{remedyType:'LITIGATION',acceptedAt:'2026-11-01',reference:'法院收件文号'})
+  f.reason.value='实际收到';f.sourceReference.value='受理通知书'
+  const action=f.submit()
+  assert.equal(f.writes[0].url,'/bureau/cases/101/continuations/remedies')
+  f.writes[0].reject(new Error('uncertain response'));await action
 })
 
 test('continuation ignores stale case reads and clears sensitive drafts on navigation', async t => {

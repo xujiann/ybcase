@@ -9,11 +9,14 @@
           <el-option v-for="(label, type) in types" :key="type" :value="type" :label="label" />
         </el-select>
       </el-form-item>
-      <el-form-item v-if="form.type !== 'ENFORCEMENT_WORK'" label="年度">
+      <el-form-item v-if="form.type === 'MONTHLY_SUBMISSION'" label="报送月份">
+        <el-date-picker v-model="form.month" type="month" value-format="YYYY-MM" />
+      </el-form-item>
+      <el-form-item v-else-if="form.type !== 'ENFORCEMENT_WORK'" label="年度">
         <el-input-number v-model="form.year" :min="1900" :max="currentYear" :precision="0" />
       </el-form-item>
-      <el-form-item label="起始日"><el-date-picker v-model="form.start" value-format="YYYY-MM-DD" /></el-form-item>
-      <el-form-item label="结束日"><el-date-picker v-model="form.end" value-format="YYYY-MM-DD" /></el-form-item>
+      <el-form-item v-if="form.type !== 'MONTHLY_SUBMISSION'" label="起始日"><el-date-picker v-model="form.start" value-format="YYYY-MM-DD" /></el-form-item>
+      <el-form-item v-if="form.type !== 'MONTHLY_SUBMISSION'" label="结束日"><el-date-picker v-model="form.end" value-format="YYYY-MM-DD" /></el-form-item>
       <el-form-item v-if="form.type !== 'ENFORCEMENT_WORK'" label="业务截至日"><el-date-picker v-model="form.cutoff" value-format="YYYY-MM-DD" /></el-form-item>
       <el-form-item><el-button type="primary" :loading="saving" @click="generate">生成待确认版本</el-button></el-form-item>
     </el-form>
@@ -40,7 +43,7 @@
         <template #default="{ row }">
           <el-button link type="primary" :disabled="saving" @click="openBatch(row)">预览／核对</el-button>
           <el-button link :disabled="saving || downloading" @click="download(row)">原样下载</el-button>
-          <el-button v-if="row.status === 'CONFIRMED'" link :disabled="saving" @click="reissue(row)">更正重报</el-button>
+          <el-button v-if="row.canReissue || row.status === 'CONFIRMED'" link :disabled="saving" @click="reissue(row)">更正重报</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -56,6 +59,7 @@
           <el-descriptions-item label="口径版本">{{ selected.rule_version }}</el-descriptions-item>
           <el-descriptions-item label="生成时点">{{ selected.known_at }}</el-descriptions-item>
           <el-descriptions-item label="生成者">{{ selected.generated_username }}</el-descriptions-item>
+          <el-descriptions-item v-if="selected.scope_label" label="报送数据范围" :span="2">{{ selected.scope_label }}</el-descriptions-item>
           <el-descriptions-item label="文件 SHA-256" :span="2"><code>{{ selected.file_sha256 }}</code></el-descriptions-item>
           <el-descriptions-item label="模板 SHA-256" :span="2"><code>{{ selected.template_sha256 }}</code></el-descriptions-item>
           <el-descriptions-item label="确认人">{{ selected.confirmed_username || '—' }}</el-descriptions-item>
@@ -67,8 +71,11 @@
             <el-button :loading="rowsLoading" @click="loadRows()">刷新预览</el-button>
             <el-table v-loading="rowsLoading" :data="previewRows" border size="small" max-height="430">
               <el-table-column label="来源" fixed width="185">
-                <template #default="{ row }"><el-button link @click="openSource(row)">{{ row.source_number || row.row_key }}</el-button>
-                  <div>工作表 {{ row.sheet_index + 1 }}，第 {{ row.row_number }} 行</div>
+                <template #default="{ row }">
+                  <el-button v-if="row.link" link @click="openSource(row)">{{ row.source_number || row.row_key }}</el-button>
+                  <span v-else>{{ row.source_number || row.row_key }}</span>
+                  <div v-if="selected.report_type === 'MONTHLY_SUBMISSION'">CSV 第 {{ row.row_number }} 行</div>
+                  <div v-else>工作表 {{ row.sheet_index + 1 }}，第 {{ row.row_number }} 行</div>
                 </template>
               </el-table-column>
               <el-table-column v-for="(column, index) in selected.columns" :key="index" :label="column" min-width="140" show-overflow-tooltip>
@@ -83,7 +90,10 @@
             <el-button :loading="changesLoading" @click="loadChanges()">刷新差异</el-button>
             <el-table v-loading="changesLoading" :data="changes" border size="small" max-height="430">
               <el-table-column label="来源" width="180">
-                <template #default="{ row }"><el-button link @click="openSource(row)">{{ row.source_number || row.row_key }}</el-button></template>
+                <template #default="{ row }">
+                  <el-button v-if="row.link" link @click="openSource(row)">{{ row.source_number || row.row_key }}</el-button>
+                  <span v-else>{{ row.source_number || row.row_key }}</span>
+                </template>
               </el-table-column>
               <el-table-column label="变化" width="90"><template #default="{ row }">{{ changeLabel(row.change_type) }}</template></el-table-column>
               <el-table-column label="字段差异" min-width="400" show-overflow-tooltip>
@@ -94,6 +104,19 @@
                            layout="total, prev, pager, next" @current-change="loadChanges" />
           </el-tab-pane>
         </el-tabs>
+        <el-descriptions v-if="selected.submissionReceipt" title="实际报送回执" :column="2" border size="small">
+          <el-descriptions-item label="报送日期">{{ selected.submissionReceipt.submitted_at }}</el-descriptions-item>
+          <el-descriptions-item label="接收单位">{{ selected.submissionReceipt.recipient }}</el-descriptions-item>
+          <el-descriptions-item label="回执编号">{{ selected.submissionReceipt.receipt_no }}</el-descriptions-item>
+          <el-descriptions-item label="登记人">{{ selected.submissionReceipt.recorded_username }}</el-descriptions-item>
+          <el-descriptions-item label="说明" :span="2">{{ selected.submissionReceipt.note || '—' }}</el-descriptions-item>
+        </el-descriptions>
+        <el-form v-else-if="selected.canRecordReceipt" label-width="100px" :disabled="saving">
+          <el-form-item label="实际报送日期" required><el-date-picker v-model="receiptForm.submittedAt" value-format="YYYY-MM-DD" /></el-form-item>
+          <el-form-item label="接收单位" required><el-input v-model="receiptForm.recipient" maxlength="256" /></el-form-item>
+          <el-form-item label="回执编号" required><el-input v-model="receiptForm.receiptNo" maxlength="128" /></el-form-item>
+          <el-form-item label="说明"><el-input v-model="receiptForm.note" maxlength="2000" type="textarea" /></el-form-item>
+        </el-form>
         <el-table v-if="selected.events?.length" :data="selected.events" border size="small">
           <el-table-column prop="actor_username" label="处理人" /><el-table-column prop="resulting_status" label="终态" />
           <el-table-column prop="opinion" label="处理理由" /><el-table-column prop="created_at" label="时间" />
@@ -108,6 +131,7 @@
         <el-button v-if="selected?.canReturn" :loading="saving" @click="transition('RETURN')">退回批次</el-button>
         <el-button v-if="selected?.canVoid" type="danger" :loading="saving" @click="transition('VOID')">作废批次</el-button>
         <el-button v-if="selected?.canConfirm" type="primary" :loading="saving" @click="confirm">确认冻结批次</el-button>
+        <el-button v-if="selected?.canRecordReceipt" type="primary" :loading="saving" @click="recordReceipt">登记实际报送回执</el-button>
       </template>
     </el-dialog>
   </el-card>
@@ -122,12 +146,14 @@ import { useAuthStore } from '../stores/auth'
 import { localDate } from '../api/dates'
 import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../api/sessionExpiry'
 
-type Kind = 'PENALTIES' | 'ENFORCEMENT_WORK' | 'INTERVIEWS'
+type Kind = 'PENALTIES' | 'ENFORCEMENT_WORK' | 'INTERVIEWS' | 'MONTHLY_SUBMISSION'
 interface Batch {
   id: number; report_type: Kind; status: string; period_start: string; period_end: string; business_cutoff: string
   known_at: string; generated_username: string; row_count: number; parent_batch_id?: number; canConfirm: boolean; canWithdraw?: boolean; canReturn?: boolean; canVoid?: boolean; events?: Record<string, unknown>[]
   template_version: string; rule_version: string; file_sha256: string; template_sha256: string; filename: string
   confirmed_username?: string; confirmation_note?: string; columns: string[]; criteria: { year?: number }
+  scope_label?: string; canReissue?: boolean; canRecordReceipt?: boolean
+  submissionReceipt?: { submitted_at: string; recipient: string; receipt_no: string; recorded_username: string; note?: string }
 }
 interface PreviewRow { row_key: string; source_number: string; sheet_index: number; row_number: number; cells: unknown[]; link: string }
 interface Change extends PreviewRow { change_type: string; previous_cells: unknown[] | null; current_cells: unknown[] | null }
@@ -136,10 +162,11 @@ const auth = useAuthStore(), router = useRouter()
 const allowed = computed(() => auth.user?.accountCategory === 'BUREAU'
   && auth.user.roles.some(role => ['LEGAL', 'LEADER', 'ADMIN'].includes(role)))
 const identity = computed(() => JSON.stringify([auth.token, auth.user?.id, auth.user?.roles, auth.user?.accountCategory]))
-const types: Record<Kind, string> = { PENALTIES: '行政处罚情况', ENFORCEMENT_WORK: '执法人员办理情况', INTERVIEWS: '部门约谈台账' }
+const types: Record<Kind, string> = { PENALTIES: '行政处罚情况', ENFORCEMENT_WORK: '执法人员办理情况', INTERVIEWS: '部门约谈台账', MONTHLY_SUBMISSION: '月度统计上报快照' }
 const currentYear = new Date().getFullYear()
 const form = reactive({ type: props.initialType || 'PENALTIES' as Kind, year: currentYear,
-  start: currentYear + '-01-01', end: localDate(), cutoff: localDate(), parentBatchId: undefined as number | undefined })
+  start: currentYear + '-01-01', end: localDate(), cutoff: localDate(), month: '', parentBatchId: undefined as number | undefined })
+const receiptForm = reactive({ submittedAt: '', recipient: '', receiptNo: '', note: '' })
 const filter = ref<Kind>()
 const batches = ref<Batch[]>([]), total = ref(0), page = ref(1)
 const loading = ref(false), failed = ref(false), saving = ref(false), downloading = ref(false)
@@ -162,6 +189,7 @@ function clear() {
   selected.value = undefined; previewVisible.value = false; previewRows.value = []; changes.value = []
   loading.value = false; rowsLoading.value = false; changesLoading.value = false; failed.value = false
   opinion.value = ''; requestKey = undefined
+  clearReceipt()
   focusFailed.value = false
 }
 async function loadList(next = page.value) {
@@ -180,17 +208,25 @@ async function loadList(next = page.value) {
 }
 function changePage(next: number) { if (!loading.value && next !== page.value) void loadList(next) }
 function clearParent() { form.parentBatchId = undefined }
+function clearReceipt() { Object.assign(receiptForm, { submittedAt: '', recipient: '', receiptNo: '', note: '' }) }
 function reissue(row: Batch) {
-  if (!allowed.value || saving.value || row.status !== 'CONFIRMED' || !batches.value.some(item => item.id === row.id)) return
+  if (!allowed.value || saving.value || !(row.canReissue || row.status === 'CONFIRMED') || !batches.value.some(item => item.id === row.id)) return
   form.type = row.report_type; form.year = row.criteria.year || Number(row.period_start.slice(0, 4))
   form.start = row.period_start; form.end = row.period_end; form.cutoff = row.business_cutoff; form.parentBatchId = row.id
+  form.month = row.period_start.slice(0, 7)
 }
 async function generate() {
   if (disposed || !allowed.value || saving.value) return
+  const monthly = form.type === 'MONTHLY_SUBMISSION'
+  if (monthly && !/^\d{4}-(0[1-9]|1[0-2])$/.test(form.month || '')) { ElMessage.warning('请选择已结束的报送月份'); return }
+  const year = monthly ? Number(form.month.slice(0, 4)) : form.year
+  const month = monthly ? Number(form.month.slice(5)) : 0
+  const start = monthly ? form.month + '-01' : form.start
+  const end = monthly ? form.month + '-' + new Date(year, month, 0).getDate() : form.end
   const context = capture()
   requestKey ||= crypto.randomUUID()
-  const body = { type: form.type, year: form.type === 'ENFORCEMENT_WORK' ? null : form.year,
-    start: form.start || null, end: form.end || null, cutoff: form.type === 'ENFORCEMENT_WORK' ? form.end : form.cutoff || null,
+  const body = { type: form.type, year: form.type === 'ENFORCEMENT_WORK' ? null : year,
+    start: start || null, end: end || null, cutoff: form.type === 'ENFORCEMENT_WORK' ? form.end : form.cutoff || null,
     parentBatchId: form.parentBatchId || null, requestKey }
   saving.value = true
   try {
@@ -208,7 +244,7 @@ async function openBatch(row: Batch, generated = false, focused = false) {
   const run = ++selectionSequence, context = capture()
   previewRows.value = []; changes.value = []; selected.value = undefined
   rowSequence++; changeSequence++; rowPage.value = 1; changePageNumber.value = 1; changeTotal.value = 0
-  rowsFailed.value = false; changesFailed.value = false; opinion.value = ''; previewVisible.value = true; tab.value = 'rows'
+  rowsFailed.value = false; changesFailed.value = false; opinion.value = ''; clearReceipt(); previewVisible.value = true; tab.value = 'rows'
   try {
     const { data } = await client.get(base + '/' + row.id)
     if (run !== selectionSequence || !previewVisible.value || !current(context)) return
@@ -278,6 +314,22 @@ async function transition(action: 'WITHDRAW' | 'RETURN' | 'VOID') {
   } catch { /* Preserve reason for a safe retry. */ }
   finally { saving.value = false }
 }
+async function recordReceipt() {
+  const batch = selected.value
+  if (!batch?.canRecordReceipt || !previewVisible.value || !allowed.value || saving.value) return
+  const body = { ...receiptForm, recipient: receiptForm.recipient.trim(), receiptNo: receiptForm.receiptNo.trim(), note: receiptForm.note.trim() }
+  if (!body.submittedAt || !body.recipient || !body.receiptNo) { ElMessage.warning('请填写实际报送日期、接收单位和回执编号'); return }
+  const context = capture()
+  saving.value = true
+  try {
+    const { data } = await client.post(base + '/' + batch.id + '/receipt', body)
+    if (!current(context) || selected.value?.id !== batch.id) return
+    selected.value = data.data
+    clearReceipt()
+    ElMessage.success('已登记实际报送回执')
+  } catch { /* Preserve the receipt form for retry. */ }
+  finally { saving.value = false }
+}
 async function download(batch: Batch) {
   if (disposed || !allowed.value || downloading.value
     || selected.value?.id !== batch.id && !batches.value.some(row => row.id === batch.id)) return
@@ -307,7 +359,7 @@ function describeChange(row: Change) {
 function openSource(row: PreviewRow) {
   if (disposed || !allowed.value || !previewVisible.value
     || !previewRows.value.includes(row) && !changes.value.some(change => change === row)
-    || !/^\/case\/(detail\/\d+|inspections\?focus=\d+|interviews\?focus=\d+)$/.test(row.link)) return
+    || !/^\/case\/(detail\/\d+|inspections\?focus=\d+|interviews\?interview=\d+)$/.test(row.link)) return
   void router.push(row.link)
 }
 watch(identity, () => { clear(); void loadList(1) }, { immediate: true, flush: 'sync' })

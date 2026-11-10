@@ -5,7 +5,6 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -43,16 +42,15 @@ public class SourceAttachmentAccess {
         return rows.isEmpty() ? null : ((Number) rows.get(0).get("id")).longValue();
     }
 
-    private void assertOwn(Map<String, Object> source, String username, boolean allowLegal) {
-        var department = materials.departmentScope(username);
-        if (department.district() && (department.deptId() == null
-                || !(source.get("owner_dept_id") instanceof Number owner)
-                || department.deptId().longValue() != owner.longValue()))
-            throw new BizException(2080, "该来源材料不在当前区市县机构范围内");
+    private void assertClueOwner(Long id, String username, boolean allowLegal) {
         boolean privileged = allowLegal ? hasRole(username, "LEADER", "ADMIN", "LEGAL") : hasRole(username, "LEADER", "ADMIN");
-        boolean handler = source.get("handler") instanceof String names
-                && Arrays.stream(names.split("[、,，;；\\s]+" )).anyMatch(username::equals);
-        if (!privileged && !username.equals(source.get("created_by")) && !handler)
+        var scope = clueOwnerPredicate("cl", username, privileged, materials.departmentScope(username));
+        var args = new java.util.ArrayList<Object>();
+        args.add(id);
+        args.addAll(scope.args());
+        if (!Boolean.TRUE.equals(jdbc.queryForObject(
+                "select exists (select 1 from case_clue cl where cl.id=? and " + scope.sql() + ")",
+                Boolean.class, args.toArray())))
             throw new BizException(2080, "该来源材料不在您的办理范围内");
     }
 
@@ -73,19 +71,37 @@ public class SourceAttachmentAccess {
                     + clueIdExpression + ")", List.of());
         // assertRead/caseForClue use the first adopted case if historical duplicates exist.
         ReadPredicate adopted = caseReadPredicate("(select min(adopted.id) from case_file adopted where adopted.clue_id=access_clue.id)", username);
-        var source = sourceDepartmentPredicate("access_clue.owner_dept_id", department);
-        var args = new java.util.ArrayList<Object>();
-        args.addAll(source.args());
-        String own = "";
-        if (!privileged) {
-            own = " and (access_clue.created_by=? or ?=any(regexp_split_to_array(coalesce(access_clue.handler,''),?)))";
-            args.add(username); args.add(username); args.add("[、,，;；\\s]+");
-        }
+        var source = clueOwnerPredicate("access_clue", username, privileged, department);
+        var args = new java.util.ArrayList<Object>(source.args());
         args.addAll(adopted.args());
         return new ReadPredicate("exists (select 1 from case_clue access_clue where access_clue.id=" + clueIdExpression
                 + " and ((not exists (select 1 from case_file unadopted where unadopted.clue_id=access_clue.id)"
-                + " and " + source.sql() + own + ")"
+                + " and " + source.sql() + ")"
                 + " or " + adopted.sql() + "))", List.copyOf(args));
+    }
+
+    private ReadPredicate clueOwnerPredicate(String alias, String username, boolean privileged,
+                                               MaterialAccess.DepartmentScope department) {
+        var organization = sourceDepartmentPredicate(alias + ".owner_dept_id", department);
+        if (privileged) return organization;
+        var args = new java.util.ArrayList<Object>(organization.args());
+        args.add(username);
+        args.add(username);
+        args.add("[、,，;；\\s]+");
+        args.add(username);
+        String ownership = """
+                %1$s and (((%2$s.created_by=? or ?=any(regexp_split_to_array(coalesce(%2$s.handler,''),?)))
+                    and not exists (select 1 from department_handoff h where h.clue_id=%2$s.id and h.status='ACCEPTED'))
+                    or exists (select 1 from sys_user u join sys_dept d on d.id=u.dept_id
+                               join sys_user_role ur on ur.user_id=u.id join sys_role r on r.id=ur.role_id
+                               where u.id=(select a.assigned_user_id from clue_assignment a
+                                           where a.handoff_id=(select max(h.id) from department_handoff h
+                                               where h.clue_id=%2$s.id and h.status='ACCEPTED')
+                                           order by a.id desc limit 1)
+                                 and u.username=? and u.enabled and d.enabled
+                                 and d.id=%2$s.owner_dept_id and d.org_kind=u.account_category and r.code='HANDLER'))
+                """.formatted(organization.sql(), alias);
+        return new ReadPredicate(ownership, List.copyOf(args));
     }
 
     public ReadPredicate inspectionReadPredicate(String inspectionAlias, String username) {
@@ -172,7 +188,7 @@ public class SourceAttachmentAccess {
         Long caseId = "CLUE".equals(source) ? caseForClue(id) : null;
         if (caseId != null) assertCaseScope(caseId, username);
         else if ("INSPECTION".equals(source)) assertInspectionOwner(id, username, true);
-        else assertOwn(r, username, true);
+        else assertClueOwner(id, username, true);
     }
 
     public void lockWritable(String source, Long id, String username) {
@@ -183,7 +199,7 @@ public class SourceAttachmentAccess {
 
     private void assertWritable(String source, Long id, Map<String, Object> r, String username) {
         if ("CLUE".equals(source)) {
-            assertOwn(r, username, false);
+            assertClueOwner(id, username, false);
             if (!"PENDING".equals(r.get("status")) || caseForClue(id) != null)
                 throw new BizException(2146, "线索已办结或已立案，请在对应案件办理附件");
         } else {
@@ -202,17 +218,17 @@ public class SourceAttachmentAccess {
 
     /** Scope for clue business actions, including receipts after transfer. Caller checks lifecycle. */
     public void lockClueForHandling(Long id, String username) {
-        Map<String, Object> clue = row("CLUE", id, true);
+        row("CLUE", id, true);
         // General clue actions may lock linked existing cases next. Only attachment-specific
         // paths hold actor locks; keeping this check non-locking avoids user -> case inversion.
         requireWriter(username);
-        assertOwn(clue, username, false);
+        assertClueOwner(id, username, false);
     }
 
     /** Create and approval share this check, so arbitrary clue IDs cannot be used to acquire other source files. */
     public void clueForFiling(Long id, String username, boolean lock) {
         Map<String, Object> clue = row("CLUE", id, lock);
-        assertOwn(clue, username, false);
+        assertClueOwner(id, username, false);
         if (!"PENDING".equals(clue.get("status")) || caseForClue(id) != null)
             throw new BizException(2021, "线索已办结，不可重复立案");
     }

@@ -106,10 +106,18 @@ function changePage(next: number) {
       || next > Math.ceil(total.value / PAGE_SIZE)) return
   return load(next)
 }
+const agencyLinks = /^\/agency\/agreements\?(focus=\d+&cycle=\d+|interview=\d+)$/
+const bureauLinks = [
+  /^\/case\/detail\/\d+(#report-supplement|\?(supplementBundle=\d+|deliveryVersion=\d+|executionVersion=\d+(&courtRound=\d+)?))?$/,
+  /^\/case\/(clues|inspections|approvals|department-handoffs)\?focus=\d+$/,
+  /^\/case\/interviews(\?interviewRequest=\d+)?$/,
+  /^\/case\/stats\?reportBatch=\d+$/,
+  /^\/system\/integrations\?treasuryItem=\d+$/,
+]
 function openTask(row: TaskRow) {
   if (!active() || !rows.value.includes(row)) return
-  if (props.domain === 'agency' ? !/^\/agency\/agreements\?focus=\d+&cycle=\d+$/.test(row.link)
-    : !/^(\/case\/(detail\/\d+(\?supplementBundle=\d+)?|interviews|clues\?focus=\d+|approvals\?focus=\d+|department-handoffs\?focus=\d+|stats\?reportBatch=\d+)|\/system\/integrations\?treasuryItem=\d+)$/.test(row.link)) return
+  const allowed = props.domain === 'agency' ? agencyLinks.test(row.link) : bureauLinks.some(pattern => pattern.test(row.link))
+  if (!allowed) return
   void router.push(row.link)
 }
 onMounted(() => { window.addEventListener(SESSION_EXPIRED_EVENT, invalidate); void refresh() })

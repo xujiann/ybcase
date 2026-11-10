@@ -313,6 +313,9 @@ class DistrictScopeIntegrationTest {
         write(receiver, assignment, firstAssignment, 0);
         write(receiver, assignment, firstAssignment, 0); // same request must not leave a duplicate event
         assertEquals(Set.of(inspection), ids(read(handler, listings, 0).path("rows")));
+        String focus = "/inspections?focusId=" + inspection + "&q=ignored&page=19";
+        assertEquals(Set.of(inspection), ids(read(handler, focus, 0).path("rows")));
+        assertTrue(read(original, focus, 0).path("rows").isEmpty());
         assertTrue(ids(read(replacement, listings, 0).path("rows")).isEmpty());
         assertTrue(ids(read(original, listings, 0).path("rows")).isEmpty());
         read(replacement, inspectionPath + "/attachments", 2080);
@@ -371,6 +374,154 @@ class DistrictScopeIntegrationTest {
         assertFalse(targets.contains(original.name()));
         assertFalse(targets.contains(sender.name()));
         assertFalse(targets.contains(city.name()));
+    }
+
+    @Test void currentReceiverCanAssignTransferredClueAndFileWithItsOriginalEvidence() throws Exception {
+        long source = department(), target = department();
+        var creator = actor("HANDLER", "DISTRICT", source);
+        var sender = actor("LEADER", "DISTRICT", source);
+        var receiver = actor("LEADER", "DISTRICT", target);
+        var handler = actor("HANDLER", "DISTRICT", target);
+        var replacement = actor("HANDLER", "DISTRICT", target);
+        long clueId = clue(creator, "跨机构指派与立案");
+        String cluePath = "/clues/" + clueId;
+        var uploaded = mvc.perform(multipart("/api/bureau" + cluePath + "/attachments")
+                        .file(new MockMultipartFile("file", "clue.pdf", "application/pdf",
+                                "%PDF-1.4\nclue fixture".getBytes(StandardCharsets.UTF_8)))
+                        .header("Authorization", "Bearer " + creator.token()))
+                .andReturn().getResponse();
+        JsonNode attachment = mapper.readTree(uploaded.getContentAsString());
+        assertEquals(0, attachment.path("code").asInt(-1), attachment.toString());
+        long file = attachment.path("data").path("id").asLong();
+        long handoff = write(sender, "/department-handoffs", Map.of("sourceType", "CLUE", "sourceId", clueId,
+                "targetDeptId", target, "reason", "跨区接续"), 0).path("id").asLong();
+        String handoffPath = "/department-handoffs/" + handoff;
+        write(receiver, handoffPath + "/decision", Map.of("accept", true, "opinion", "接收"), 0);
+        assertTrue(read(receiver, "/department-handoffs?focusId=" + handoff, 0).path("rows")
+                .get(0).path("can_assign_clue").asBoolean());
+        String options = handoffPath + "/clue-assignees", assignment = handoffPath + "/clue-assignment";
+        read(sender, options, 2080);
+        assertEquals(2, read(receiver, options, 0).path("candidates").size());
+        read(handler, cluePath + "/attachments", 2080);
+        write(receiver, assignment, Map.of("username", creator.name(), "reason", "不同机构"), 2190);
+        var firstAssignment = Map.<String, Object>of("username", handler.name(), "reason", "继续核查");
+        write(receiver, assignment, firstAssignment, 0);
+        write(receiver, assignment, firstAssignment, 0);
+        assertEquals(Set.of(file), ids(read(handler, cluePath + "/attachments", 0)));
+        String focus = "/clues?focusId=" + clueId + "&page=1";
+        assertEquals(Set.of(clueId), ids(read(handler, focus, 0).path("rows")));
+        jdbc.update("update sys_user set dept_id=? where username=?", target, creator.name());
+        assertTrue(read(creator, focus, 0).path("rows").isEmpty());
+        read(creator, cluePath + "/attachments", 2080);
+        write(receiver, assignment, Map.of("username", replacement.name(), "reason", "过期页面"), 2190);
+        long current = read(receiver, options, 0).path("assignmentId").asLong();
+        write(receiver, assignment, Map.of("username", replacement.name(), "expectedAssignmentId", current,
+                "reason", "交接改派"), 0);
+        read(handler, cluePath + "/attachments", 2080);
+        assertEquals(Set.of(file), ids(read(replacement, cluePath + "/attachments", 0)));
+        assertEquals(2, jdbc.queryForObject("select count(*) from clue_assignment where clue_id=?", Integer.class, clueId));
+        assertEquals(creator.name(), jdbc.queryForObject("select created_by from case_clue where id=?", String.class, clueId));
+
+        long cause = jdbc.queryForObject("select min(id) from case_cause where subject_type='PROVIDER'", Long.class);
+        var payload = Map.of("clueId", clueId, "causeId", cause, "procedureType", "NORMAL", "partyType", "PROVIDER",
+                "partyName", "交接立案测试机构", "amountInvolved", 100, "institution",
+                Map.of("code", "V64-TEST", "ownership", "PUBLIC", "grade", "SECONDARY"), "officers", List.of(
+                        Map.of("name", "王办案", "certNo", "YB001", "duty", "LEAD"),
+                        Map.of("name", "张协办", "certNo", "YB002", "duty", "MEMBER")));
+        var filing = Map.<String, Object>of("kind", "FILE_CASE", "clueId", clueId, "payload", payload,
+                "reason", "已完成核查", "requestKey", "clue-filing-" + System.nanoTime());
+        write(handler, "/approvals", filing, 2080);
+        long approval = write(replacement, "/approvals", filing, 0).path("id").asLong();
+        write(receiver, "/approvals/" + approval + "/decide", Map.of("approve", true, "opinion", "同意立案"), 0);
+        long caseId = jdbc.queryForObject("select id from case_file where clue_id=?", Long.class, clueId);
+        assertEquals(target, jdbc.queryForObject("select owner_dept_id from case_file where id=?", Long.class, caseId));
+        assertEquals(caseId, jdbc.queryForObject("select case_id from case_attachment where id=?", Long.class, file));
+        write(receiver, assignment, firstAssignment, 2190);
+    }
+
+    @Test void summaryConversionKeepsCaseIdentityAttachmentsAndAnAuditedReason() throws Exception {
+        long department = department();
+        var handler = actor("HANDLER", "DISTRICT", department);
+        var leader = actor("LEADER", "DISTRICT", department);
+        var elsewhere = actor("LEADER", "DISTRICT", department());
+        long clueId = clue(handler, "简易程序保留材料");
+        long caseId = caseFile(handler, "简易程序转普通", clueId);
+        jdbc.update("update case_file set procedure_type='SUMMARY' where id=?", caseId);
+        String number = jdbc.queryForObject("select case_no from case_file where id=?", String.class, caseId);
+        String path = "/cases/" + caseId;
+        var upload = mvc.perform(multipart("/api/bureau" + path + "/attachments")
+                        .file(new MockMultipartFile("file", "proof.pdf", "application/pdf",
+                                "%PDF-1.4\ncase fixture".getBytes(StandardCharsets.UTF_8)))
+                        .header("Authorization", "Bearer " + handler.token()))
+                .andReturn().getResponse();
+        JsonNode uploaded = mapper.readTree(upload.getContentAsString());
+        assertEquals(0, uploaded.path("code").asInt(-1), uploaded.toString());
+        Set<Long> files = ids(read(handler, path + "/attachments", 0));
+        assertEquals(1, files.size());
+        String convert = path + "/convert-to-ordinary";
+        var reason = Map.<String, Object>of("reason", "需要补充调查");
+        write(handler, convert, reason, 403);
+        write(elsewhere, convert, reason, 2080);
+        write(leader, convert, Map.of("reason", " "), 2194);
+        JsonNode changed = write(leader, convert, reason, 0);
+        assertEquals(number, changed.path("caseNo").asText());
+        assertEquals("NORMAL", changed.path("procedureType").asText());
+        assertEquals(clueId, changed.path("clueId").asLong());
+        assertEquals(files, ids(read(handler, path + "/attachments", 0)));
+        var history = read(leader, path + "/corrections", 0).get(0);
+        assertEquals("procedureType", history.path("field").asText());
+        assertEquals("SUMMARY", history.path("old_value").asText());
+        assertEquals("NORMAL", history.path("new_value").asText());
+        assertEquals("需要补充调查", history.path("reason").asText());
+        assertEquals(leader.name(), history.path("operator").asText());
+        write(leader, convert, reason, 2003);
+    }
+
+    @Test void ordinaryApprovalUsesRequestKeysAndOnlyOneConcurrentTerminalAction() throws Exception {
+        long department = department();
+        var handler = actor("HANDLER", "DISTRICT", department);
+        var leader = actor("LEADER", "DISTRICT", department);
+        long caseId = caseFile(handler, "普通审批撤回", null);
+        var body = new java.util.HashMap<String, Object>(Map.of("kind", "EXTEND", "caseId", caseId,
+                "reason", "补齐材料", "payload", Map.of("days", 15), "requestKey", "extend-approval-" + System.nanoTime()));
+        long approval = write(handler, "/approvals", body, 0).path("id").asLong();
+        assertEquals(approval, write(handler, "/approvals", body, 0).path("id").asLong());
+        String path = "/approvals/" + approval;
+        var cancellation = Map.<String, Object>of("reason", "核对后改报");
+        write(leader, path + "/withdraw", cancellation, 403);
+        body.put("requestKey", "extend-retry-" + System.nanoTime());
+        write(handler, "/approvals", body, 2071);
+        write(handler, path + "/withdraw", cancellation, 0);
+        write(handler, path + "/withdraw", cancellation, 0);
+        JsonNode old = read(handler, "/approvals/mine?focusId=" + approval, 0).get(0);
+        assertEquals("CANCELLED", old.path("status").asText());
+        assertEquals("补齐材料", old.path("reason").asText());
+        assertEquals("核对后改报", old.path("withdraw_reason").asText());
+        assertTrue(old.hasNonNull("withdrawn_at"));
+        assertTrue(old.path("payload").asText().contains("15"));
+        assertFalse(ids(read(leader, "/approvals/pending", 0)).contains(approval));
+        long retried = write(handler, "/approvals", body, 0).path("id").asLong();
+        assertNotEquals(approval, retried);
+
+        String race = "/approvals/" + retried;
+        var start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var withdrawal = executor.submit(() -> {
+                start.await();
+                try { write(handler, race + "/withdraw", cancellation, 0); return true; }
+                catch (AssertionError rejected) { assertTrue(rejected.getMessage().contains("2072")); return false; }
+            });
+            var rejection = executor.submit(() -> {
+                start.await();
+                try { write(leader, race + "/decide", Map.of("approve", false, "opinion", "需复核"), 0); return true; }
+                catch (AssertionError rejected) { assertTrue(rejected.getMessage().contains("2072")); return false; }
+            });
+            start.countDown();
+            boolean withdrew = withdrawal.get(15, TimeUnit.SECONDS), rejected = rejection.get(15, TimeUnit.SECONDS);
+            assertNotEquals(withdrew, rejected);
+            assertEquals(withdrew ? "CANCELLED" : "REJECTED",
+                    jdbc.queryForObject("select status from biz_approval where id=?", String.class, retried));
+        }
     }
 
     @Test void legacySourceNeedsExplicitReconciliationAndDisabledTargetCannotReceive() throws Exception {

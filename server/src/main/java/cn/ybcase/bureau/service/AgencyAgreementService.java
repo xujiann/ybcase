@@ -33,7 +33,7 @@ public class AgencyAgreementService {
                           LocalDate receivedAt, LocalDate returnedAt, String returnReason, LocalDate remindedAt,
                           LocalDate repliedAt, String result, String resultType, BigDecimal recoveredAmount,
                           LocalDate effectiveAt, LocalDate endAt, String reference, Long interviewId,
-                          LocalDate autoRemindedAt) {}
+                          LocalDate autoRemindedAt, boolean interviewVoided) {}
     public record Reply(Integer cycle, String result, String resultType, BigDecimal recoveredAmount,
                         LocalDate effectiveAt, LocalDate endAt, String reference,
                         AgencyInterviewService.ActualInterview interview) {}
@@ -133,8 +133,10 @@ public class AgencyAgreementService {
                        a.agency_returned_at, a.agency_return_reason, a.agency_reminded_at, a.agency_result_type,
                        a.agency_recovered_amount, a.agency_result_effective_at, a.agency_result_end_at,
                        a.agency_result_reference, a.agency_auto_reminded_at,
-                       (select i.id from department_interview i where i.source_agreement_id=a.id) as interview_id
+                       i.id as interview_id, i.id is not null and e.id is null as interview_voided
                 from agreement_action a join case_file c on c.id = a.case_id
+                left join department_interview i on i.source_agreement_id=a.id
+                left join effective_department_interviews() e on e.id=i.id
                 where a.agency_dept_id = ? and c.party_type = 'PROVIDER'
                 order by (a.agency_status not in ('PENDING', 'ACCEPTED')), a.agency_due_at nulls last,
                          a.sent_at desc, a.id desc
@@ -147,7 +149,7 @@ public class AgencyAgreementService {
                 rs.getString("result"), rs.getString("agency_result_type"), rs.getBigDecimal("agency_recovered_amount"),
                 rs.getObject("agency_result_effective_at", LocalDate.class), rs.getObject("agency_result_end_at", LocalDate.class),
                 rs.getString("agency_result_reference"), rs.getObject("interview_id", Long.class),
-                rs.getObject("agency_auto_reminded_at", LocalDate.class)), deptId);
+                rs.getObject("agency_auto_reminded_at", LocalDate.class), rs.getBoolean("interview_voided")), deptId);
     }
 
     @Transactional

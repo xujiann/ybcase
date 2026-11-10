@@ -31,7 +31,7 @@ public class CaseContinuationService {
     private final CaseFileRepository caseRepository;
     private final ExecutionDeadlines executionDeadlines;
     private static final Set<String> TYPES = Set.of("EXECUTION", "REVERSAL", "REFUND", "COURT_APPLY", "COURT_RECEIPT",
-            "REMEDY_RESULT", "REMEDY_VOID", "FACT_CORRECTION");
+            "REMEDY_RESULT", "REMEDY_VOID", "FACT_CORRECTION", "COURT_RECEIPT_CORRECTION");
     private static final Set<String> FACT_FIELDS=Set.of("institutionCode","institutionOwnership","institutionGrade","institutionKind",
             "confirmedViolationStart","confirmedViolationEnd","confirmedViolationFacts","confirmedViolationAmount");
     private static final Set<String> KINDS = Set.of("FINE", "RECOUP", "CONFISCATE", "LATE_FEE");
@@ -49,7 +49,7 @@ public class CaseContinuationService {
         var result = new LinkedHashMap<String, Object>();
         result.put("eligible", eligible(source));
         result.put("canRequest", eligible(source) && writer(actor) && !pending);
-        result.put("canRegisterRemedy", eligible(source) && writer(actor) && !pending);
+        result.put("canRegisterRemedy", eligible(source) && writer(actor));
         result.put("canReview", reviewer(actor));
         result.put("cutoff", cutoff);
         result.put("originalCaseStatus", source.get("status"));
@@ -95,7 +95,6 @@ public class CaseContinuationService {
                 return number(row.get("id"));
             throw invalid("请求号已用于其他登记内容");
         }
-        noPending(caseId);
         return jdbc.queryForObject("""
                 insert into case_remedy(case_id,request_key,remedy_type,accepted_at,reference,reason,source_reference,
                    registered_by,registered_username) values(?,?,?,?,?,?,?,?,?) returning id
@@ -204,7 +203,7 @@ public class CaseContinuationService {
         requireReviewer(actor);
         access.assertCaseScope(caseId,actor);
         if(factReview && (!Objects.equals(observedDepartment,actor.deptId()) || !factReviewer(actor)))
-            throw forbidden("有效事实变更须由另一名所属机构已启用并归类的局机关法制或负责人复核；请核对当前机构归属");
+            throw forbidden("本项更正须由另一名所属机构已启用并归类的局机关法制或负责人复核；请核对当前机构归属");
         if (actor.id().equals(number(request.get("requested_by")))) throw forbidden("申请人不能复核本人申请");
         pending(request);
         if (approve) {
@@ -315,6 +314,7 @@ public class CaseContinuationService {
                 if (day(p.get("receivedAt"),"回执日期").isBefore(date(rounds.getFirst().get("applied_at")))) throw invalid("回执日期不得早于本轮申请日期");
                 text(p.get("receiptNo"),128,"法院回执文号");
             }
+            case "COURT_RECEIPT_CORRECTION" -> validateCourtReceiptCorrection(caseId,p);
             case "REMEDY_RESULT" -> validateRemedy(caseId,p);
             case "REMEDY_VOID" -> {
                 keys(p,Set.of("remedyId"));
@@ -328,6 +328,36 @@ public class CaseContinuationService {
             }
             default -> throw invalid("不支持的续办类型");
         }
+    }
+
+    private Long correctionRound(Map<String,Object> payload) {
+        return "LEGACY".equals(payload.get("round")) ? null : positiveId(payload.get("round"));
+    }
+
+    private void validateCourtReceiptCorrection(long caseId, Map<String,Object> payload) {
+        keys(payload,Set.of("round","status","receivedAt","receiptNo"));
+        Long round = correctionRound(payload);
+        String status = choice(payload.get("status"),Set.of("ACCEPTED","RETURNED","REJECTED"),"法院回执结果");
+        LocalDate received = day(payload.get("receivedAt"),"回执日期");
+        String receiptNo = text(payload.get("receiptNo"),128,"法院回执文号");
+        var rounds = jdbc.queryForList("""
+                select * from case_effective_court_receipt(?)
+                where case_id=? and id is not distinct from ?::bigint and status in ('ACCEPTED','RETURNED','REJECTED')
+                """,today(),caseId,round);
+        if (rounds.isEmpty()) throw invalid("仅可更正本案已登记的法院回执");
+        var current = rounds.getFirst();
+        LocalDate applied = date(current.get("applied_at"));
+        if (applied == null) applied = date(source(caseId).get("decided_at"));
+        if (received.isBefore(applied)) throw invalid("回执日期不得早于本轮申请日期");
+        if (status.equals(current.get("status")) && received.equals(date(current.get("received_at")))
+                && receiptNo.equals(current.get("receipt_no"))) throw invalid("请填写有变化的法院回执信息");
+        var next = jdbc.queryForList("""
+                select applied_at from case_court_round
+                where case_id=? and round_no>? and decision_version_id is not distinct from ?::bigint
+                order by round_no limit 1
+                """,caseId,current.get("round_no"),current.get("decision_version_id"));
+        if (!next.isEmpty() && (!"RETURNED".equals(status) || received.isAfter(date(next.getFirst().get("applied_at")))))
+            throw invalid("本决定已有下一轮申请，更正仍须支持其退回补正依据和日期顺序");
     }
 
     private void validateRemedy(long caseId,Map<String,Object> p) {
@@ -400,6 +430,11 @@ public class CaseContinuationService {
             case "COURT_RECEIPT" -> jdbc.update("""
                 insert into case_court_receipt(case_id,request_id,round_id,status,received_at,receipt_no) values(?,?,?,?,?,?)
                 """,caseId,requestId,positiveId(p.get("roundId")),p.get("status"),day(p.get("receivedAt"),"回执日期"),p.get("receiptNo"));
+            case "COURT_RECEIPT_CORRECTION" -> jdbc.update("""
+                insert into case_court_receipt_correction(case_id,request_id,round_id,status,received_at,receipt_no)
+                values(?,?,?,?,?,?)
+                """,caseId,requestId,correctionRound(p),p.get("status"),day(p.get("receivedAt"),"回执日期"),
+                text(p.get("receiptNo"),128,"法院回执文号"));
             case "REMEDY_RESULT" -> {
                 if (!"MAINTAIN".equals(p.get("outcome"))) jdbc.update("""
                     insert into case_decision_version(case_id,request_id,remedy_id,outcome,effective_at,decision_type,decision_no,
@@ -505,17 +540,7 @@ public class CaseContinuationService {
     }
     private BigDecimal total(long id,String kind) { return jdbc.queryForObject("select coalesce(sum(amount),0) from case_effective_executions(?,clock_timestamp()) where case_id=? and kind=?",BigDecimal.class,today(),id,kind); }
     private List<Map<String,Object>> courtRounds(long id) {
-        var rows=new ArrayList<>(jdbc.queryForList("""
-                select r.id,r.round_no,r.applied_at,r.application_reference,coalesce(p.status,'APPLIED') as status,p.received_at,p.receipt_no,
-                       r.decision_version_id
-                from case_court_round r left join case_court_receipt p on p.round_id=r.id where r.case_id=? order by r.round_no desc
-                """,id));
-        rows.addAll(jdbc.queryForList("""
-                select null::bigint as id,1 as round_no,court_applied_at as applied_at,null::text as application_reference,
-                 court_enforce_status as status,court_received_at as received_at,court_receipt_no as receipt_no,null::bigint as decision_version_id
-                from case_file where id=? and court_enforce_applied
-                """,id));
-        return rows;
+        return jdbc.queryForList("select * from case_effective_court_receipt(?) where case_id=? order by round_no desc",today(),id);
     }
     private String snapshot(long caseId,String type,Map<String,Object> payload) {
         String original = snapshot(caseId);
@@ -539,14 +564,16 @@ public class CaseContinuationService {
     }
     private String snapshot(long id) {
         return jdbc.queryForObject("""
-                select jsonb_build_object('case',to_jsonb(c),'decision',to_jsonb(d),
+                select (jsonb_build_object('case',to_jsonb(c),'decision',to_jsonb(d),
                   'executions',(select jsonb_agg(to_jsonb(e) order by id) from case_execution e where e.case_id=c.id),
                   'versions',(select jsonb_agg(to_jsonb(v) order by id) from case_decision_version v where v.case_id=c.id),
                   'factVersions',(select jsonb_agg(to_jsonb(v) order by id) from case_fact_revision v where v.case_id=c.id),
                   'continuations',(select jsonb_agg(to_jsonb(e) order by id) from case_execution_continuation e where e.case_id=c.id),
                   'rounds',(select jsonb_agg(to_jsonb(r) order by id) from case_court_round r where r.case_id=c.id),
                   'receipts',(select jsonb_agg(to_jsonb(r) order by id) from case_court_receipt r where r.case_id=c.id),
-                  'remedies',(select jsonb_agg(to_jsonb(m) order by id) from case_remedy m where m.case_id=c.id))::text
+                  'remedies',(select jsonb_agg(to_jsonb(m) order by id) from case_remedy m where m.case_id=c.id))
+                  || coalesce((select jsonb_build_object('receiptCorrections',jsonb_agg(to_jsonb(v) order by id))
+                    from case_court_receipt_correction v where v.case_id=c.id having count(*)>0),'{}'::jsonb))::text
                 from case_file c join case_decision d on d.case_id=c.id where c.id=?
                 """,String.class,id);
     }
@@ -575,7 +602,7 @@ public class CaseContinuationService {
                 && exists("select exists(select 1 from sys_dept where id=? and enabled and org_kind='BUREAU')",actor.deptId());
     }
     private boolean needsFactReviewer(Map<String,Object> request) {
-        if("FACT_CORRECTION".equals(request.get("request_type")))return true;
+        if(Set.of("FACT_CORRECTION","COURT_RECEIPT_CORRECTION").contains(request.get("request_type")))return true;
         if(!"REMEDY_RESULT".equals(request.get("request_type")))return false;
         var payload=object(request.get("payload"));
         return FACT_FIELDS.stream().anyMatch(key->payload.get(key)!=null && !"".equals(payload.get(key)));

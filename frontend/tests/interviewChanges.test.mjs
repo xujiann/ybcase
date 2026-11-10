@@ -14,7 +14,7 @@ function fixture(t,category='DISTRICT'){
  const reads=[],writes=[],messages=[],listeners=new Map(),cleanup=[];let uuid=0
  const client={get:(url,config)=>new Promise((resolve,reject)=>reads.push({url,config,resolve:data=>resolve({data:{data}}),reject})),post:(url,body)=>new Promise((resolve,reject)=>writes.push({url,body:plain(body),resolve,reject}))}
  const sessionExpiry=createSessionExpiry(),scope=Vue.effectScope()
- const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(script)+';({records,pending,history,visible,historyVisible,inspected,saving,form,reason,reference,opinion,open,submit,inspect,decide,load,changePage,failed})',{
+ const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(script)+';({records,pending,history,visible,historyVisible,inspected,saving,form,reason,reference,opinion,open,submit,inspect,decide,load,changePage,failed,focusRecord,focusReview})',{
   ...Vue,client,useAuthStore:()=>auth,sessionExpiry,SESSION_EXPIRED_EVENT,localDate:()=> '2026-11-08',
   crypto:{randomUUID:()=> 'request-'+ ++uuid},window:{addEventListener:(e,fn)=>listeners.set(e,fn),removeEventListener:e=>listeners.delete(e)},
   onBeforeUnmount:fn=>cleanup.push(fn),ElMessage:{success:x=>messages.push(x),warning:x=>messages.push(x)}
@@ -50,4 +50,14 @@ test('review obeys server eligibility and discards a successful response after r
 })
 test('records pagination uses bounded server parameters',async t=>{
  const f=fixture(t);await ready(f);f.changePage(3);assert.deepEqual(plain(f.reads.at(-1).config.params),{page:3,size:20});await ready(f,[])
+})
+test('agency replacement uses the focused voided source and new actual facts',async t=>{
+ const f=fixture(t,'AGENCY');await ready(f);f.focusRecord(8)
+ assert.deepEqual(plain(f.reads.at(-1).config.params),{page:1,size:20,focus:8})
+ await ready(f,[{...row(),voided:true,can_replace:true,replacement_institution_name:'协议现行机构'}])
+ f.open(f.records.value[0],'REPLACE');assert.equal(f.form.institutionName,'协议现行机构');assert.equal(f.form.interviewDate,'')
+ f.reason.value='原登记误建';f.reference.value='新约谈记录';await f.submit();assert.equal(f.writes.length,0)
+ Object.assign(f.form,{reason:'实际约谈事由',content:'实际约谈事实',participants:'丙丁',interviewDate:'2026-11-02'})
+ const save=f.submit();assert.equal(f.writes[0].body.kind,'REPLACE');assert.equal(f.writes[0].body.values.content,'实际约谈事实')
+ f.writes[0].reject(new Error('offline'));await save
 })

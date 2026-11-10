@@ -27,7 +27,7 @@ function fixture(t, props = {}) {
   }
   const sessionExpiry = createSessionExpiry(), scope = Vue.effectScope()
   const view = scope.run(() => vm.runInNewContext(stripTypeScriptTypes(script) +
-    ';({form,batches,selected,previewRows,previewVisible,opinion,saving,loadList,generate,openBatch,confirm,openSource,changes,focusFailed,transition,statusLabel})', {
+    ';({form,batches,selected,previewRows,previewVisible,opinion,saving,loadList,generate,openBatch,confirm,openSource,changes,focusFailed,transition,statusLabel,recordReceipt,receiptForm,reissue})', {
     ...Vue, client, useAuthStore: () => auth, defineProps: () => props,
     useRouter: () => ({ push: path => navigation.push(path) }), sessionExpiry, SESSION_EXPIRED_EVENT,
     crypto: { randomUUID: () => 'request-' + ++uuid }, localDate: () => '2026-11-07',
@@ -63,6 +63,25 @@ test('report version generation retries with same identity key and suppresses du
   const changed = f.generate()
   assert.notEqual(f.writes[2].body.requestKey, key)
   f.writes[2].reject(new Error('offline')); await changed
+})
+
+test('monthly correction retains exact calendar criteria and sends receipt only with server eligibility', async t => {
+  const f = fixture(t)
+  const old = batch(81, { report_type: 'MONTHLY_SUBMISSION', status: 'VOIDED', canReissue: true,
+    period_start: '2024-02-01', period_end: '2024-02-29', business_cutoff: '2024-03-04' })
+  await listReady(f, [old]); f.reissue(f.batches.value[0])
+  const generate = f.generate()
+  assert.deepEqual(f.writes[0].body, { type: 'MONTHLY_SUBMISSION', year: 2024, start: '2024-02-01',
+    end: '2024-02-29', cutoff: '2024-03-04', parentBatchId: 81, requestKey: 'request-1' })
+  f.writes[0].reject(new Error('offline')); await generate
+  await openReady(f, old); await f.recordReceipt(); assert.equal(f.writes.length, 1)
+  await openReady(f, batch(82, { report_type: 'MONTHLY_SUBMISSION', status: 'CONFIRMED', canRecordReceipt: true }))
+  Object.assign(f.receiptForm, { submittedAt: '2026-11-07', recipient: ' 接收单位 ', receiptNo: ' 回执82 ' })
+  const pending = f.recordReceipt(), duplicate = f.recordReceipt()
+  assert.equal(f.writes[1].url, '/bureau/report-versions/batches/82/receipt')
+  assert.equal(f.writes[1].body.receiptNo, '回执82'); assert.equal(f.writes.length, 2)
+  f.auth.user.accountCategory = 'AGENCY'; f.writes[1].resolve({}); await Promise.all([pending, duplicate])
+  assert.equal(f.selected.value, undefined); assert.equal(f.saving.value, false)
 })
 
 test('report version confirmation obeys server eligibility and discards success after role loss', async t => {

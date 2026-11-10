@@ -68,6 +68,8 @@
         <template #default="{ row }">
           <strong>{{ STATUS[row.status] || row.status }}</strong>
           <div v-if="row.opinion">{{ row.opinion }}</div>
+          <div v-if="row.withdraw_reason">{{ row.withdraw_reason }}</div>
+          <div v-if="row.withdrawn_at" class="hint">{{ fmtTime(row.withdrawn_at) }}</div>
           <div v-if="row.previous_approval_id" class="hint">续自 #{{ row.previous_approval_id }}</div>
         </template>
       </el-table-column>
@@ -82,6 +84,9 @@
             <el-button v-if="canRefile && row.kind === 'FILE_CASE' && row.status === 'REJECTED' && !row.resubmitted && pl(row).__resumable"
                        link type="primary" @click="router.push({ path: '/case/list', query: { fromApproval: row.id } })">按原申请续填</el-button>
             <span v-if="row.resubmitted" class="hint">已续填提交</span>
+            <el-button v-if="canRefile && row.status === 'PENDING'" link type="warning"
+              :loading="deciding === row.id" :disabled="!approvalState.ready || deciding !== null"
+              @click="onWithdraw(row)">撤回申请</el-button>
           </template>
           <template v-else-if="isLeader">
             <el-button size="small" type="success" :loading="deciding === row.id" :disabled="!approvalState.ready || deciding !== null || pl(row).__invalid" @click="onDecide(row, true)">批准</el-button>
@@ -109,7 +114,7 @@ import { caseOperationAccess } from '../../api/caseWriteAccess'
 import { PARTY_TYPE, fmtTime } from './labels'
 
 const KIND: Record<string, string> = { FILE_CASE: '立案', CLUE_EXTEND: '线索延期', EXTEND: '延期', SUSPEND: '中止', TERMINATE: '终止', DEFER: '暂缓分期' }
-const STATUS: Record<string, string> = { PENDING: '待裁决', APPROVED: '已批准', REJECTED: '已驳回' }
+const STATUS: Record<string, string> = { PENDING: '待裁决', APPROVED: '已批准', REJECTED: '已驳回', CANCELLED: '已撤回' }
 const causes = ref<any[]>([])
 
 /** payload 是 jsonb 文本列，可能为 null；解析失败不能让整页白屏 */
@@ -209,6 +214,30 @@ async function onDecide(row: any, approve: boolean) {
   } catch {
     // The API interceptor already reports request errors; cancel is also an expected result.
     if (submitted && !disposed) await load()
+  } finally {
+    deciding.value = null
+  }
+}
+
+async function onWithdraw(row: any) {
+  const approvalId = row.id, generation = listGeneration
+  const current = () => !disposed && showMine.value && canRefile.value && generation === listGeneration
+    && approvalState.ready && rows.value.some((item: any) => item.id === approvalId && item.status === 'PENDING')
+  if (deciding.value !== null || !current()) return
+  deciding.value = approvalId
+  let submitted = false
+  try {
+    const { value } = await ElMessageBox.prompt('填写撤回原因', '撤回申请', {
+      inputValidator: reason => reason.trim() && Array.from(reason.trim()).length <= 512 || '请填写 512 字以内的撤回原因',
+    })
+    if (!current()) return
+    submitted = true
+    await client.post('/bureau/approvals/' + approvalId + '/withdraw', { reason: value.trim() })
+    if (!current()) return
+    ElMessage.success('申请已撤回，原单保留')
+    await load()
+  } catch {
+    if (submitted && current()) await load()
   } finally {
     deciding.value = null
   }

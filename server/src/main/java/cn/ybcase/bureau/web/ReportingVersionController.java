@@ -87,10 +87,17 @@ public class ReportingVersionController {
         var file = versions.download(id, auth.getName());
         request.setAttribute(ReportExport.AUDIT_ATTRIBUTE, file.audit());
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
-                .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .contentType(MediaType.parseMediaType(file.audit().kind() == ReportExport.Kind.MONTHLY_SUBMISSION
+                        ? "text/csv;charset=UTF-8" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
                 .header("X-Content-SHA256", file.sha256())
                 .header("Content-Disposition", ContentDisposition.attachment().filename(file.filename(), StandardCharsets.UTF_8).build().toString())
                 .body(file.bytes());
+    }
+
+    @PostMapping("/{id}/receipt")
+    public ResponseEntity<R<Map<String,Object>>> recordReceipt(@PathVariable long id,
+            @RequestBody ReportingVersionService.Receipt body, Authentication auth) {
+        return response(versions.recordReceipt(id,body,auth.getName()));
     }
 
     private static ResponseEntity<R<Map<String, Object>>> response(Map<String, Object> body) {

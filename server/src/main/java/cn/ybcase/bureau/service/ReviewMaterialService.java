@@ -110,6 +110,13 @@ public class ReviewMaterialService {
                     select id,notice_id,notice_sent_at,scheduled_at,held_at,status
                     from case_hearing where case_id=? and notice_id is not null order by id""", caseId));
         }
+        var hearingReceipts = jdbc.queryForList("""
+                select h.id as hearing_id,d.id as receipt_id,d.hearing_notice_version_id,d.method,d.delivered_at,
+                    d.receiver,d.receipt_no,d.receipt_signed_at,d.document_id
+                from case_hearing h join case_delivery d on d.id=h.hearing_notice_delivery_id
+                where h.case_id=? order by h.id
+                """,caseId);
+        if (!hearingReceipts.isEmpty()) bundle.put("hearingReceipts", hearingReceipts);
         bundle.put("expertReviews", jdbc.queryForList("""
                 select id,experts,opinion from expert_review
                 where case_id=? and ended_at is not null and coalesce(btrim(opinion),'')<>'' order by id""", caseId));

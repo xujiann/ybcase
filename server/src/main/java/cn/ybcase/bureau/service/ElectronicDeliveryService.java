@@ -20,6 +20,7 @@ public class ElectronicDeliveryService {
     private final ElectronicDeliveryTimeoutService timeouts;
     private final SupplementBundleService supplements;
     private final RuntimePolicy runtime;
+    private final CaseService cases;
     private static final Set<String> DELIVERABLE=Set.of("NOTICE","HEARING_NOTICE","DECISION","ORDER_CORRECT","URGE_LETTER","SUSPEND_DECISION","RESUME_NOTICE","TERMINATE_DECISION");
     public record Receipt(long deliveryId,String providerId,String eventId,String status,String occurredAt,String receiptNo,
                           String evidenceBase64,String evidenceSha256,String evidenceContentType) {
@@ -32,18 +33,60 @@ public class ElectronicDeliveryService {
         var c=jdbc.queryForMap("select e_delivery_consent,e_delivery_receiver,e_delivery_channel,status,archive_no from case_file where id=?",caseId);
         // Show the recorded recipient to case readers only; operational diagnostics never contain it.
         c.put("gatewayConfigured",gateway.configured("delivery"));
-        c.put("documents",jdbc.queryForList("select id,doc_type,title from case_document where case_id=? and doc_type in ('NOTICE','HEARING_NOTICE','DECISION','ORDER_CORRECT','URGE_LETTER','SUSPEND_DECISION','RESUME_NOTICE','TERMINATE_DECISION') order by id desc",caseId));
+        var notice=currentTrackedNotice(caseId);
+        c.put("trackedNoticeId",notice==null ? null : notice.get("id"));
+        c.put("activeNotice", "NOTIFIED".equals(c.get("status")) && c.get("archive_no")==null ? notice : null);
+        c.put("documents",jdbc.queryForList("""
+                select id,doc_type,title,notice_id from case_document where case_id=?
+                  and doc_type in ('NOTICE','HEARING_NOTICE','DECISION','ORDER_CORRECT','URGE_LETTER','SUSPEND_DECISION','RESUME_NOTICE','TERMINATE_DECISION')
+                order by id desc
+                """,caseId));
         c.put("supplementDocuments",jdbc.queryForList("select d.id,d.doc_type,d.title,coalesce(s.receiver,'') receiver,coalesce(s.channel,'') channel from case_supplement_document d left join lateral(select receiver,channel from case_supplement_consent where document_id=d.id order by id desc limit 1)s on true where d.case_id=? and d.doc_type in ('NOTICE','DECISION','URGE_LETTER') order by d.id desc",caseId));
-        c.put("deliveries",jdbc.queryForList("select e.*,coalesce(d.title,s.title) title from electronic_delivery e left join case_document d on d.id=e.document_id left join case_supplement_document s on s.id=e.supplement_document_id where e.case_id=? order by e.id desc",caseId));
+        c.put("deliveries",jdbc.queryForList("select e.*,coalesce(d.title,s.title) title,d.notice_id,d.doc_type from electronic_delivery e left join case_document d on d.id=e.document_id left join case_supplement_document s on s.id=e.supplement_document_id where e.case_id=? order by e.id desc",caseId));
         c.put("events",jdbc.queryForList("select ev.*,proof.sha256 evidence_sha256,proof.content_type evidence_content_type from electronic_delivery_event ev join electronic_delivery e on e.id=ev.envelope_id left join electronic_delivery_receipt_evidence proof on proof.event_id=ev.id where e.case_id=? order by ev.id desc",caseId));
         return c;
     }
+    private Map<String,Object> currentTrackedNotice(long caseId) {
+        var rows=jdbc.queryForList("""
+                select n.id,n.delivery_required,d.id as document_id,p.id as delivery_id
+                from case_notice n left join case_document d on d.notice_id=n.id
+                left join case_delivery p on p.notice_id=n.id
+                where n.case_id=? order by n.id desc limit 1
+                """,caseId);
+        return rows.isEmpty() || !Boolean.TRUE.equals(rows.getFirst().get("delivery_required")) ? null : rows.getFirst();
+    }
+    @Transactional
+    public long prepareNotice(String username,long caseId,long noticeId) {
+        CaseGuards.lockWritable(jdbc,caseId);
+        bureau(access.requireCaseWriter(caseId,username));
+        var notice=currentTrackedNotice(caseId);
+        if(notice==null || !Objects.equals(notice.get("id"),noticeId)
+                || !"NOTIFIED".equals(jdbc.queryForObject("select status from case_file where id=?",String.class,caseId)))
+            throw invalid("仅可制作本案当前待送达的告知版本");
+        if(notice.get("document_id") instanceof Number existing) return existing.longValue();
+        if(notice.get("delivery_id")!=null) throw invalid("本告知版本已有实际回证");
+        return jdbc.queryForObject("""
+                insert into case_document(case_id,doc_type,title,content,made_at,maker,notice_id)
+                select case_id,'NOTICE',?,content,?,?,id from case_notice where case_id=? and id=?
+                returning id
+                """,Long.class,"行政处罚告知书（版本 #"+noticeId+"）",ExecutionDeadlines.today(),username,caseId,noticeId);
+    }
     private Map<String,Object> document(long caseId,long documentId) {
-        var rows=jdbc.queryForList("select id,doc_type,title,content from case_document where id=? and case_id=?",documentId,caseId);
+        var rows=jdbc.queryForList("select id,doc_type,title,content,notice_id from case_document where id=? and case_id=?",documentId,caseId);
         if(rows.isEmpty()) throw invalid("所选文书不属于本案");
         var doc=rows.getFirst();
         if(!DELIVERABLE.contains(doc.get("doc_type"))) throw invalid("该文书类型不支持电子送达");
         return doc;
+    }
+    private void requireCurrentNotice(long caseId,Map<String,Object> doc,String status) {
+        if(!"NOTICE".equals(doc.get("doc_type")))return;
+        var notice=currentTrackedNotice(caseId);
+        Object version=doc.get("notice_id");
+        if(notice==null && version==null)return; // An untracked historical case retains the original route.
+        if(notice==null || !"NOTIFIED".equals(status) || version==null || !version.equals(notice.get("id"))
+                || !Objects.equals(doc.get("id"),notice.get("document_id")))
+            throw invalid("电子告知文书未绑定当前告知版本，回执不得用于该版本");
+        if(notice.get("delivery_id")!=null) throw invalid("当前告知版本已有实际回证，电子轮次不得覆盖");
     }
     private String fingerprint(Map<String,Object> doc) {
         var text=new StringBuilder();
@@ -67,6 +110,7 @@ public class ElectronicDeliveryService {
         }
         var c=jdbc.queryForMap("select status,archive_no,e_delivery_consent,e_delivery_receiver,e_delivery_channel from case_file where id=?",caseId);
         if("CLOSED".equals(c.get("status")) || c.get("archive_no")!=null) throw new BizException(2031,"案件已封卷，不可追加电子送达材料");
+        requireCurrentNotice(caseId,doc,(String)c.get("status"));
         if(!Boolean.TRUE.equals(c.get("e_delivery_consent"))) throw new BizException(2054,"须先登记当事人电子送达确认书");
         if(!(c.get("e_delivery_receiver") instanceof String receiver) || receiver.isBlank()
                 || !(c.get("e_delivery_channel") instanceof String channel) || channel.isBlank())
@@ -190,6 +234,13 @@ public class ElectronicDeliveryService {
         if(envelope.get("superseded_at")!=null){outcome="REJECTED";reason="旧发送轮次已失效，回执不得污染替代轮次";}
         if(envelope.get("sent_at")==null || occurred.toInstant().isBefore(((java.sql.Timestamp)envelope.get("sent_at")).toInstant().minusSeconds(300))) {outcome="REJECTED";reason="回执早于发送记录";}
         if("DELIVERED".equals(envelope.get("status")) || "REJECTED".equals(envelope.get("status"))) {outcome="REJECTED";reason="送达已是终态，不得覆盖";}
+        if("APPLIED".equals(outcome) && envelope.get("document_id") instanceof Number documentId) {
+            try {
+                var doc=document(caseId,documentId.longValue());
+                if("NOTICE".equals(doc.get("doc_type")))
+                    requireCurrentNotice(caseId,doc,jdbc.queryForObject("select status from case_file where id=?",String.class,caseId));
+            } catch(BizException ex) {outcome="REJECTED";reason=ex.getMessage();}
+        }
         if("APPLIED".equals(outcome) && "DELIVERED".equals(receipt.status())) {
             try {
                 boolean supplement=envelope.get("supplement_document_id")!=null;
@@ -201,12 +252,19 @@ public class ElectronicDeliveryService {
                     long delivery=supplements.insertDelivery(((Number)doc.get("id")).longValue(),"ELECTRONIC",date,(String)envelope.get("receiver"),receiptNo,"供应商 "+provider+"，事件 "+event,username);
                     jdbc.update("update electronic_delivery set supplement_delivery_id=? where id=?",delivery,receipt.deliveryId());
                 } else {
-                long delivery=jdbc.queryForObject("insert into case_delivery(case_id,method,delivered_at,receiver,note,receipt_no,receipt_signed_at,doc_kind,document_id) values(?,'ELECTRONIC',?,?,?, ?,?,?,?) returning id",Long.class,
-                        caseId,date,envelope.get("receiver"),"供应商回执；电子送达编号 "+receipt.deliveryId(),receiptNo,date,doc.get("doc_type"),envelope.get("document_id"));
-                jdbc.update("insert into case_document(case_id,doc_type,title,content,made_at,maker,signed) values(?,'DELIVERY_RECEIPT','电子送达回证',?,?,?,true)",caseId,
-                        "原文书："+doc.get("title")+"；送达编号："+receipt.deliveryId()+"；供应商编号："+provider+"；事件："+event+"；回证："+receiptNo+"；签收时间："+occurred,date,username);
-                if("DECISION".equals(doc.get("doc_type"))) jdbc.update("update case_file set status='DELIVERED',delivered_at=? where id=?",date,caseId);
-                jdbc.update("update electronic_delivery set delivery_id=? where id=?",delivery,receipt.deliveryId());
+                    String note="供应商回执；电子送达编号 "+receipt.deliveryId();
+                    String receiver=(String)envelope.get("receiver");
+                    Long documentId=(Long)doc.get("id");
+                    long delivery;
+                    if(doc.get("notice_id") instanceof Number noticeId)
+                        delivery=cases.applyNoticeDelivery(caseId,noticeId.longValue(),documentId,"ELECTRONIC",date,receiver,receiptNo,date,note);
+                    else
+                        delivery=jdbc.queryForObject("insert into case_delivery(case_id,method,delivered_at,receiver,note,receipt_no,receipt_signed_at,doc_kind,document_id) values(?,'ELECTRONIC',?,?,?, ?,?,?,?) returning id",Long.class,
+                                caseId,date,receiver,note,receiptNo,date,doc.get("doc_type"),documentId);
+                    jdbc.update("insert into case_document(case_id,doc_type,title,content,made_at,maker,signed) values(?,'DELIVERY_RECEIPT','电子送达回证',?,?,?,true)",caseId,
+                            "原文书："+doc.get("title")+"；送达编号："+receipt.deliveryId()+"；供应商编号："+provider+"；事件："+event+"；回证："+receiptNo+"；签收时间："+occurred,date,username);
+                    if("DECISION".equals(doc.get("doc_type"))) jdbc.update("update case_file set status='DELIVERED',delivered_at=? where id=?",date,caseId);
+                    jdbc.update("update electronic_delivery set delivery_id=? where id=?",delivery,receipt.deliveryId());
                 }
             } catch(BizException ex) {outcome="REJECTED";reason=ex.getMessage();}
         }

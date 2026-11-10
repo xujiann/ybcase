@@ -146,6 +146,20 @@ public class ApprovalService {
                 throw new BizException(2071, "此线索已有待审立案申请，请先处理原申请");
             }
         }
+        if (!filing) {
+            String sourceColumn = "CLUE_EXTEND".equals(req.kind()) ? "clue_id" : "case_id";
+            Long sourceId = "CLUE_EXTEND".equals(req.kind()) ? req.clueId() : req.caseId();
+            var pending = jdbc.queryForList(
+                    "select * from biz_approval where kind=? and status='PENDING' and " + sourceColumn + "=? order by id",
+                    req.kind(), sourceId);
+            if (!pending.isEmpty()) {
+                var row = pending.getFirst();
+                if (pending.size() == 1 && req.requestKey() == null && applicant.equals(row.get("applicant"))
+                        && sameSubmission(row, req, filingClueId, payload))
+                    return number(row.get("id"));
+                throw new BizException(2071, "此事项已有同类待审申请，请先处理原申请");
+            }
+        }
         if (req.previousApprovalId() != null) {
             var previous = jdbc.queryForList("""
                     select clue_id, payload, applicant_dept_id from biz_approval
@@ -191,6 +205,30 @@ public class ApprovalService {
     }
 
     private static Long number(Object value) { return value instanceof Number n ? n.longValue() : null; }
+
+    @Transactional
+    public void withdraw(long approvalId, String reason, String username) {
+        if (reason == null || reason.isBlank() || reason.indexOf('\0') >= 0
+                || reason.strip().codePointCount(0, reason.strip().length()) > 512)
+            throw new BizException(2071, "撤回须填写 512 字以内的原因");
+        var matches = jdbc.queryForList("select * from biz_approval where id=? and applicant=? for update", approvalId, username);
+        if (matches.isEmpty()) throw new BizException(403, "仅申请人可撤回本人待审申请");
+        var row = matches.getFirst();
+        var actor = workflowUsers.requireFiling(materialAccess.lockActor(username, true));
+        Long caseId = number(row.get("case_id"));
+        Long clueId = number(row.get("clue_id"));
+        if ("FILE_CASE".equals(row.get("kind"))) clueId = filingClueId(clueId, fromJson((String) row.get("payload")));
+        if (!Objects.equals(actor.deptId(), number(row.get("applicant_dept_id"))))
+            throw new BizException(2080, "申请不属于当前机构，请联系负责人处理原申请");
+        if (caseId != null) materialAccess.assertCaseScope(caseId, actor);
+        if (clueId != null) sourceAttachmentAccess.assertRead("CLUE", clueId, username);
+        String explanation = reason.strip();
+        if ("CANCELLED".equals(row.get("status")) && explanation.equals(row.get("withdraw_reason"))) return;
+        if (!"PENDING".equals(row.get("status")))
+            throw new BizException(2072, "仅待审申请可以撤回");
+        jdbc.update("update biz_approval set status='CANCELLED',withdrawn_at=now(),withdraw_reason=? where id=?",
+                explanation, approvalId);
+    }
 
     /** 负责人裁决：批准即执行对应动作（同事务，失败则整单回滚） */
     @Transactional

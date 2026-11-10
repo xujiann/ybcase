@@ -25,7 +25,7 @@ function fixture() {
     ElMessageBox:{prompt:()=>new Promise((resolve,reject)=>prompts.push({resolve,reject}))}}
   const script=source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const output=vm.runInNewContext(stripTypeScriptTypes(script.replace(/^import .+\r?\n/gm,''))+
-    '\n;({load,rows,loading,approvalState,deciding,onDecide,parsePayload,pl,officerNames})',context)
+    '\n;({load,rows,loading,approvalState,deciding,onDecide,onWithdraw,parsePayload,pl,officerNames})',context)
   return {...output,auth,route,reads,writes,prompts,successes,unmount:()=>unmount.forEach(fn=>fn())}
 }
 async function seed(f,rows=[{id:1,kind:'EXTEND',payload:'{"days":3}'}]) {
@@ -39,6 +39,24 @@ test('personal application history loads its own endpoint and offers no decision
   await f.onDecide(f.rows.value[0],true)
   assert.equal(f.prompts.length,0)
   assert.equal(f.writes.length,0)
+})
+test('withdrawal posts once from personal history and refreshes the preserved application',async()=>{
+  const f=fixture()
+  f.route.query.mine='1'
+  await seed(f,[{id:4,kind:'EXTEND',status:'PENDING',payload:'{}'}])
+  const row=f.rows.value[0],pending=f.onWithdraw(row)
+  await f.onWithdraw(row)
+  assert.equal(f.prompts.length,1)
+  f.prompts[0].resolve({value:' 已补材料 '})
+  await tick()
+  assert.equal(f.writes[0].url,'/bureau/approvals/4/withdraw')
+  assert.equal(f.writes[0].body.reason,'已补材料')
+  f.writes[0].resolve({})
+  await tick()
+  f.reads[1].resolve([{id:4,kind:'EXTEND',status:'CANCELLED',withdraw_reason:'已补材料',payload:'{}'}])
+  await pending
+  assert.equal(f.rows.value[0].status,'CANCELLED')
+  assert.equal(f.deciding.value,null)
 })
 test('a rejected filing with usable historical JSON can be corrected even if personnel are missing',()=>{
   const f=fixture()

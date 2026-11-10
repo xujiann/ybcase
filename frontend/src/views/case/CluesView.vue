@@ -52,7 +52,8 @@
           <el-button size="small" @click="openMaterials(row)">材料</el-button>
           <template v-if="row.status === 'PENDING'">
             <el-button v-if="canManageClue(row)" size="small" type="primary" @click="toFile(row)">立案</el-button>
-            <el-button v-if="canManageClue(row)" size="small" :disabled="row.extended" @click="onExtend(row)">申请延期</el-button>
+            <el-button v-if="canManageClue(row)" size="small" :loading="extendingClue === row.id"
+              :disabled="row.extended || extendingClue !== null" @click="onExtend(row)">申请延期</el-button>
             <el-button v-if="canManageClue(row)" size="small" @click="onExclusion(row)">期限扣除</el-button>
             <el-button v-if="canManageClue(row)" size="small" type="warning" @click="onReject(row)">不予立案</el-button>
           </template>
@@ -105,6 +106,7 @@ import { useRouter } from 'vue-router'
 import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import { caseOperationAccess } from '../../api/caseWriteAccess'
+import { createApprovalRequestKey } from '../../api/approvalRequestKey'
 import PrecaseAttachments from '../../components/PrecaseAttachments.vue'
 import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
 import WorkdayCoverageNotice from '../../components/WorkdayCoverageNotice.vue'
@@ -116,6 +118,8 @@ const canOperate = computed(() => caseOperationAccess(auth.user?.roles))
 const canPullMonitor = computed(() => auth.user?.accountCategory === 'BUREAU'
   && auth.user.roles.some(role => ['LEADER', 'ADMIN'].includes(role)))
 const pullingMonitor = ref(false)
+const extendingClue = ref<number | null>(null)
+const clueApprovalRequestKey = createApprovalRequestKey()
 function canManageClue(row: any) {
   return canWritePrecase(auth.user?.roles, auth.user?.username, { type: 'clues', id: row.id, status: row.status, owner: row.createdBy, handler: row.handler }, false)
 }
@@ -243,12 +247,23 @@ async function onExclusion(row: any) {
 }
 
 async function onExtend(row: any) {
-  if (!canManageClue(row)) return
-  const { value } = await ElMessageBox.prompt('特殊情况说明（经主要负责人批准，延长 15 个工作日）', '核查延期', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  if (!canManageClue(row)) return
-  await client.post('/bureau/approvals', { kind: 'CLUE_EXTEND', clueId: row.id, reason: value, payload: {} })
-  ElMessage.success('已提交延期审批')
-  load()
+  if (!canManageClue(row) || row.extended || extendingClue.value !== null) return
+  const identity = readIdentity(), generation = loadGeneration
+  extendingClue.value = row.id
+  try {
+    const { value } = await ElMessageBox.prompt('特殊情况说明（经主要负责人批准，延长 15 个工作日）', '核查延期', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+    if (disposed || identity !== readIdentity() || generation !== loadGeneration || !canManageClue(row)) return
+    const body = { kind: 'CLUE_EXTEND', clueId: row.id, reason: value.trim(), payload: {} }
+    await client.post('/bureau/approvals', { ...body, requestKey: clueApprovalRequestKey.get(body, auth.user?.id) })
+    if (disposed || identity !== readIdentity() || generation !== loadGeneration) return
+    clueApprovalRequestKey.clear()
+    ElMessage.success('已提交延期审批')
+    await load()
+  } catch {
+    // The API client reports request failures, and closing the prompt is expected.
+  } finally {
+    extendingClue.value = null
+  }
 }
 
 async function onReject(row: any) {

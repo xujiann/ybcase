@@ -10,15 +10,15 @@ function fixture(t, component='IntegrationWorkbench',role='LEADER') {
   const auth=Vue.reactive({token:'one',user:{id:1,username:'actor',accountCategory:'BUREAU',roles:[role]}})
   const props=Vue.reactive({caseId:1,writable:true,refreshKey:undefined})
   const sessionExpiry=createSessionExpiry();sessionExpiry.reset(auth.token)
-  const requests=[],notices=[],unmounts=[],listeners=new Map()
+  const requests=[],notices=[],events=[],unmounts=[],listeners=new Map()
   const request=(method,path,body,config)=>new Promise((resolve,reject)=>requests.push({method,path,body,config,resolve:data=>resolve({data:{data}}),reject}))
   const client={get:(path,config)=>request('GET',path,null,config),post:(path,body,config)=>request('POST',path,body,config)}
   const source=readFileSync(new URL(`../src/components/${component}.vue`,import.meta.url),'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .+\r?\n/gm,'')
   const scope=Vue.effectScope()
-  const exports=component==='IntegrationWorkbench'?'refresh,loadPage,selectSources,createBatch,openBatch,openItem,openAction,submitAction,runBatch,sources,selected,detail,detailVisible,actionVisible,activeItem,form,busy,failed':'load,create,send,expire,data,documentId,busy,failed,hasAddress,canWrite,canSupplement,openReplace,replaceRound,replaceVisible,replacement,replacementRow'
-  const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(source)+`;({${exports}})`,{...Vue,client,useAuthStore:()=>auth,defineProps:()=>props,sessionExpiry,SESSION_EXPIRED_EVENT,crypto:{randomUUID:()=>`request-${requests.length}`},ElMessage:{info:m=>notices.push(m),warning:m=>notices.push(m)},onMounted:()=>{},onUnmounted:fn=>unmounts.push(fn),window:{addEventListener:(k,fn)=>listeners.set(k,fn),removeEventListener:k=>listeners.delete(k)}}))
+  const exports=component==='IntegrationWorkbench'?'refresh,loadPage,selectSources,createBatch,openBatch,openItem,openAction,submitAction,runBatch,sources,selected,detail,detailVisible,actionVisible,activeItem,form,busy,failed':'load,create,prepareNotice,availableDocuments,send,expire,data,documentId,busy,failed,hasAddress,canWrite,canSupplement,openReplace,replaceRound,replaceVisible,replacement,replacementRow'
+  const view=scope.run(()=>vm.runInNewContext(stripTypeScriptTypes(source)+`;({${exports}})`,{...Vue,client,useAuthStore:()=>auth,defineProps:()=>props,defineEmits:()=>event=>events.push(event),sessionExpiry,SESSION_EXPIRED_EVENT,crypto:{randomUUID:()=>`request-${requests.length}`},ElMessage:{info:m=>notices.push(m),warning:m=>notices.push(m),success:m=>notices.push(m)},onMounted:()=>{},onUnmounted:fn=>unmounts.push(fn),window:{addEventListener:(k,fn)=>listeners.set(k,fn),removeEventListener:k=>listeners.delete(k)}}))
   t.after(()=>{unmounts.forEach(fn=>fn());scope.stop()})
-  return {...view,auth,props,requests,notices}
+  return {...view,auth,props,requests,notices,events}
 }
 const sourceRow=()=>({source:'ORIGINAL',id:5,case_id:1,case_no:'CASE-1',receipt_no:'TEST-1',amount:'23.45',paid_at:'2026-11-07'})
 const deliveryData=(extra={})=>({status:'DECIDED',archive_no:null,e_delivery_consent:true,e_delivery_receiver:'合成当事人',e_delivery_channel:'fixture@example.invalid',gatewayConfigured:true,documents:[{id:10,title:'决定书'}],deliveries:[{id:20,status:'DRAFT',attempts:0}],events:[],...extra})
@@ -76,6 +76,26 @@ test('delivery requires structured consent address and rejects sealed source wri
   assert.equal(f.hasAddress.value,false);await f.create();assert.equal(f.requests.length,0)
   f.data.value=deliveryData({archive_no:'SEALED'});assert.equal(f.canWrite.value,false)
   await f.send(f.data.value.deliveries[0]);await f.expire();assert.equal(f.requests.length,0)
+})
+
+test('tracked electronic notice allows only the current version and stops after a paper receipt',async t=>{
+  const f=fixture(t,'DeliveryReceiptsPanel')
+  const activeNotice={id:7,document_id:null,delivery_id:null}
+  const old={id:3,doc_type:'NOTICE',notice_id:6}
+  const unbound={id:4,doc_type:'NOTICE'}
+  const current={id:5,doc_type:'NOTICE',notice_id:7}
+  f.data.value=deliveryData({trackedNoticeId:7,activeNotice,documents:[old,unbound]})
+  assert.equal(f.availableDocuments.value.length,0)
+  const preparing=f.prepareNotice()
+  assert.equal(f.requests[0].path,'/bureau/cases/1/electronic-deliveries/notices/7/document')
+  f.requests[0].resolve({id:5})
+  await new Promise(setImmediate)
+  f.requests[1].resolve(deliveryData({trackedNoticeId:7,activeNotice:{...activeNotice,document_id:5},documents:[old,unbound,current]}))
+  await preparing
+  assert.deepEqual(f.events,['changed'])
+  assert.equal(f.availableDocuments.value[0].id,5)
+  f.data.value.activeNotice.delivery_id=9
+  assert.equal(f.availableDocuments.value.length,0)
 })
 test('delivery write is single flight and a late reply cannot reload another identity',async t=>{
   const f=fixture(t,'DeliveryReceiptsPanel');f.data.value=deliveryData();f.documentId.value=10

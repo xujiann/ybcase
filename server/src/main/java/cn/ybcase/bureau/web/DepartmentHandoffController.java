@@ -54,4 +54,16 @@ public class DepartmentHandoffController {
         handoffs.assignInspection(id, assignment, auth.getName());
         return R.ok();
     }
+
+    @GetMapping("/{id}/clue-assignees")
+    public R<Map<String, Object>> clueAssignees(@PathVariable long id, Authentication auth) {
+        return R.ok(handoffs.clueAssignees(id, auth.getName()));
+    }
+
+    @PostMapping("/{id}/clue-assignment")
+    public R<Void> assignClue(@PathVariable long id, @RequestBody DepartmentHandoffService.ClueAssignment assignment,
+                              Authentication auth) {
+        handoffs.assignClue(id, assignment, auth.getName());
+        return R.ok();
+    }
 }

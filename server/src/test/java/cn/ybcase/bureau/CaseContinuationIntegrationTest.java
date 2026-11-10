@@ -55,6 +55,46 @@ class CaseContinuationIntegrationTest {
         write(owner,path(id)+"/requests",request("EXECUTION",payment("51",LocalDate.now())),2193);
     }
 
+    @Test void actualRemedyIntakeRemainsAvailableAndInvalidatesPendingApproval() throws Exception {
+        var owner=actor("DISTRICT","HANDLER"); var legal=actor("BUREAU","LEGAL");
+        long id=caseFile(owner,"CLOSED");
+        long pending=write(owner,path(id)+"/requests",request("EXECUTION",payment("5",LocalDate.now())),0).path("id").asLong();
+        var state=read(owner,path(id),0);
+        assertFalse(state.path("canRequest").asBoolean());
+        assertTrue(state.path("canRegisterRemedy").asBoolean());
+        var intake=remedy();
+        long remedy=write(owner,path(id)+"/remedies",intake,0).path("id").asLong();
+        assertEquals(remedy,write(owner,path(id)+"/remedies",intake,0).path("id").asLong());
+        review(legal,id,pending,true,2193);
+        assertEquals("PENDING",jdbc.queryForObject("select status from case_continuation_request where id=?",String.class,pending));
+        assertEquals(0,count("case_execution_continuation",id));
+        review(legal,id,pending,false,0);
+        assertTrue(read(owner,path(id),0).path("executionDeadline").path("reliefPending").asBoolean());
+    }
+
+    @Test void approvedCourtReceiptCorrectionChangesEffectiveStatusAndPreservesOriginal() throws Exception {
+        var owner=actor("DISTRICT","HANDLER"); var legal=actor("BUREAU","LEGAL");
+        long id=caseFile(owner,"DELIVERED");
+        jdbc.update("""
+                update case_file set court_enforce_applied=true,court_applied_at=current_date-2,
+                    court_enforce_status='ACCEPTED',court_received_at=current_date-1,court_receipt_no='原始回执'
+                where id=?
+                """,id);
+        String original=original(id);
+        assertTrue(closeCheck(legal,id,"execution_or_court"));
+        long correction=write(owner,path(id)+"/requests",request("COURT_RECEIPT_CORRECTION",Map.of(
+                "round","LEGACY","status","RETURNED","receivedAt",LocalDate.now().minusDays(1).toString(),
+                "receiptNo","经法院核实的退回回执")),0).path("id").asLong();
+        assertEquals("ACCEPTED",read(owner,path(id),0).path("executionDeadline").path("state").asText());
+        review(legal,id,correction,true,0);
+        var state=read(owner,path(id),0);
+        assertEquals("RETURNED",state.path("executionDeadline").path("state").asText());
+        assertEquals("经法院核实的退回回执",state.path("courtRounds").get(0).path("receipt_no").asText());
+        assertFalse(closeCheck(legal,id,"execution_or_court"));
+        assertEquals(original,original(id));
+        assertThrows(Exception.class,()->jdbc.update("update case_court_receipt_correction set receipt_no='其他' where case_id=?",id));
+    }
+
     @Test void permissionsSelfApprovalAndChangedAssignmentAreAuthoritativelyRejected() throws Exception {
         var owner=actor("DISTRICT","LEADER");var outsider=actor("DISTRICT","LEADER");
         var admin=actor("BUREAU","ADMIN");var legal=actor("BUREAU","LEGAL");

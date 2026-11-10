@@ -73,6 +73,25 @@ class InterviewAndBatchLifecycleIntegrationTest {
   assertEquals(403,assertThrows(BizException.class,()->changes.request(id,request("CORRECT",value("CROSS")),other.name())).code);
   long change=changes.request(id,request("CORRECT",value("CENTER-NEW")),agency.name());changes.decide(change,true,"核对中心原始约谈",reviewer.name());
   assertEquals("CENTER-NEW",code(id));assertEquals(agreement,jdbc.queryForObject("select source_agreement_id from department_interview where id=?",Long.class,id));
+  String original=original(id);
+  long voidRequest=changes.request(id,request("VOID",null),agency.name());
+  changes.decide(voidRequest,true,"确认误建",reviewer.name());
+  var voidedAt=jdbc.queryForObject("select reviewed_at from interview_change_request where id=?",java.time.OffsetDateTime.class,voidRequest);
+  assertEquals(true,((Map<?,?>)((List<?>)changes.records(agency.name(),1,20,id).get("rows")).getFirst()).get("can_replace"));
+  assertTrue(((List<?>)changes.records(other.name(),1,20,id).get("rows")).isEmpty());
+  var replacement=request("REPLACE",value("REPLACEMENT"));
+  assertEquals(403,assertThrows(BizException.class,()->changes.request(id,replacement,other.name())).code);
+  long substitute=changes.request(id,replacement,agency.name());
+  assertEquals(substitute,changes.request(id,replacement,agency.name()));
+  assertEquals(2196,assertThrows(BizException.class,()->changes.request(id,request("REPLACE",value("DUPLICATE")),agency.name())).code);
+  assertEquals(1,((List<?>)changes.pending(reviewer.name(),1,20,substitute).get("rows")).size());
+  assertEquals(0,jdbc.queryForObject("select count(*) from effective_department_interviews() where id=?",Integer.class,id));
+  changes.decide(substitute,true,"核对真实替代登记",reviewer.name());
+  assertEquals("REPLACEMENT",code(id));
+  assertEquals(original,original(id));
+  assertEquals(0,jdbc.queryForObject("select count(*) from effective_department_interviews(?) where id=?",Integer.class,voidedAt,id));
+  assertEquals(1,jdbc.queryForObject("select count(*) from effective_department_interviews() where source_agreement_id=?",Integer.class,agreement));
+  assertEquals(1,jdbc.queryForObject("select count(*) from department_interview where source_agreement_id=?",Integer.class,agreement));
  }
  @Test void cancelAndRejectDoNotChangeSourceAndAnotherRequestCanFollow() {
   var owner=actor("DISTRICT","HANDLER");var reviewer=actor("BUREAU","LEGAL");long id=interview(owner);String source=original(id);

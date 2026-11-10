@@ -4,6 +4,8 @@
     <p>后续材料独立保存，原封存案卷保持原样。上传真实凭证、提交另一人复核后，可关联续办申请、制作后续文书及导出补充卷。</p>
     <el-alert v-if="failed" type="warning" :closable="false" title="后续材料未能加载，请核对单案范围或刷新重试。" />
     <el-alert v-if="focusFailed" type="warning" :closable="false" title="目标材料包已处理、已失效或不在当前复核范围，请在本案材料列表核对。" />
+    <el-alert v-if="deliveryVersion" type="info" :closable="false"
+              :title="`待办关联决定版本 #${deliveryVersion}，请在制作或登记送达前核对当前有效决定。`" />
     <el-button v-if="writer" type="primary" :disabled="busy || !data" @click="openCreate">建立材料包</el-button>
     <template v-if="data">
       <el-table :data="data.bundles" border size="small" class="gap" row-key="id" :expand-row-keys="focusedBundle ? [focusedBundle.id] : []" :row-class-name="bundleRowClass">
@@ -29,7 +31,7 @@
         </template></el-table-column>
       </el-table>
       <h4>后续版本文书</h4>
-      <el-table :data="data.documents" border size="small">
+      <el-table :data="data.documents" border size="small" :row-class-name="documentRowClass">
         <el-table-column type="expand"><template #default="{row}"><h4>{{ row.title }}</h4><pre>{{ row.content }}</pre>
           <p>关联决定版本：{{ row.decision_version_id || '—' }}　材料包：{{ row.bundle_id }}</p>
           <el-table :data="row.signatures" border size="small"><el-table-column prop="signer" label="签章人" /><el-table-column label="签章性质"><template #default="{row:sig}"><el-tag :type="sig.provider==='MOCK'?'warning':'success'">{{ sig.provider==='MOCK'?'模拟摘要签章':sig.provider }}</el-tag></template></el-table-column><el-table-column prop="content_hash" label="正文摘要" show-overflow-tooltip /></el-table>
@@ -101,6 +103,10 @@ interface Doc {id:number;bundle_id:number;decision_version_id?:number;doc_type:s
 interface State {bundles:Bundle[];documents:Doc[];decisionVersions:{id:number;decision_no:string;content?:string}[];timeline?:{event_type:string;event_time:string;reference:string;detail:string;actor:string}[]}
 const data=ref<State>(),loading=ref(false),failed=ref(false),busy=ref(false),downloading=ref(false)
 const focusFailed=ref(false),focusId=computed(()=>parseTaskFocus(route.query.supplementBundle))
+const deliveryVersion=computed(()=>parseTaskFocus(route.query.deliveryVersion))
+function documentRowClass({row}:{row:{decision_version_id?:number;doc_type?:string}}) {
+  return deliveryVersion.value && row.decision_version_id===deliveryVersion.value && row.doc_type==='DECISION' ? 'focused-bundle' : ''
+}
 const focusedBundle=computed(()=>data.value?.bundles.find(row=>row.id===focusId.value))
 const createVisible=ref(false),documentVisible=ref(false),opinionVisible=ref(false),actionVisible=ref(false)
 const selectedBundle=ref<Bundle>(),selectedDoc=ref<Doc>(),opinion=ref(''),operation=ref<'approve'|'reject'|'withdraw'>('approve')

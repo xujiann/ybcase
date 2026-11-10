@@ -59,4 +59,5 @@ export { formatLocalDate as fmtDate, formatLocalDateTime as fmtTime } from '../.
 export const EXECUTION_DEADLINE_STATE: Record<string, string> = {
   UNCONFIRMED: '救济期限待确认', RELIEF_PENDING: '救济程序进行中', WAITING: '尚未进入申请期',
   OPEN: '可申请法院强执', EXPIRED: '申请期限已过', APPLIED: '已申请，待法院结果', ACCEPTED: '法院已受理',
+  RETURNED: '法院退回补正', REJECTED: '法院不予受理',
 }

@@ -31,8 +31,10 @@ public class OversightController {
     @GetMapping("/inspections")
     public R<?> inspections(@RequestParam(required = false) Integer page,
                             @RequestParam(defaultValue = "20") int size,
-                            @RequestParam(required = false) String q, Authentication auth) {
-        return R.ok(history.list(cn.ybcase.bureau.service.SourceHistoryService.Kind.INSPECTIONS, page, size, q, auth.getName()));
+                            @RequestParam(required = false) String q,
+                            @RequestParam(required = false) Long focusId, Authentication auth) {
+        return R.ok(history.list(cn.ybcase.bureau.service.SourceHistoryService.Kind.INSPECTIONS,
+                page, size, q, focusId, auth.getName()));
     }
 
     @org.springframework.security.access.prepost.PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")

@@ -1,6 +1,7 @@
 package cn.ybcase.bureau.service;
 
 import lombok.RequiredArgsConstructor;
+import cn.ybcase.bureau.common.BizException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
@@ -20,6 +21,12 @@ public class SourceHistoryService {
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Object list(Kind kind, Integer requestedPage, int requestedSize, String query, String username) {
+        return list(kind, requestedPage, requestedSize, query, null, username);
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public Object list(Kind kind, Integer requestedPage, int requestedSize, String query, Long focusId, String username) {
+        if (focusId != null && focusId < 1) throw new BizException(2063, "待办来源编号须为正整数");
         String projection, from, id;
         List<String> search;
         SourceAttachmentAccess.ReadPredicate scope;
@@ -58,13 +65,17 @@ public class SourceHistoryService {
         }
         String where = " where (" + scope.sql() + ")";
         var args = new ArrayList<Object>(scope.args());
-        if (query != null && !query.isBlank()) {
+        if (focusId != null) {
+            where += " and " + id + "=?";
+            args.add(focusId);
+        } else if (query != null && !query.isBlank()) {
             where += " and (" + String.join(" or ", search.stream().map(column -> column + " ilike ?").toList()) + ")";
             for (int n = 0; n < search.size(); n++) args.add("%" + query.trim() + "%");
         }
-        int page = requestedPage == null ? 1 : Math.max(1, requestedPage);
-        int size = requestedPage == null ? 200 : Math.min(100, Math.max(1, requestedSize));
-        Long total = requestedPage == null ? null : jdbc.queryForObject("select count(*) from " + from + where, Long.class, args.toArray());
+        int page = requestedPage == null || focusId != null ? 1 : Math.max(1, requestedPage);
+        int size = focusId != null ? 1 : requestedPage == null ? 200 : Math.min(100, Math.max(1, requestedSize));
+        boolean paginated = requestedPage != null || focusId != null;
+        Long total = paginated ? jdbc.queryForObject("select count(*) from " + from + where, Long.class, args.toArray()) : null;
         args.add(size); args.add((long)(page - 1) * size);
         var rows = jdbc.queryForList("select " + projection + " from " + from + where + " order by " + id + " desc limit ? offset ?", args.toArray());
         if (kind == Kind.REWARDS && !access.hasRole(username, "LEGAL", "LEADER", "ADMIN")) {
@@ -74,6 +85,6 @@ public class SourceHistoryService {
                 row.put("reporter_contact", row.get("reporter_contact") == null ? null : "***");
             }
         }
-        return requestedPage == null ? rows : Map.of("rows", rows, "total", total == null ? 0L : total, "page", page, "size", size);
+        return paginated ? Map.of("rows", rows, "total", total == null ? 0L : total, "page", page, "size", size) : rows;
     }
 }

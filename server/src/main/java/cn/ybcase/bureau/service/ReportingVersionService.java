@@ -14,6 +14,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.YearMonth;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -27,12 +29,13 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ReportingVersionService {
     private static final String RULE_VERSION = "V48_BUSINESS_DATE_APPROVED_KNOWN_AT";
-    private static final String PENALTY_RULE_VERSION = "PENALTIES_EFFECTIVE_DECISION_EXECUTION_V1";
+    private static final String PENALTY_RULE_VERSION = "PENALTIES_EFFECTIVE_DECISION_EXECUTION_V2";
     private static final String METADATA = """
             select b.id,b.report_type,b.status,b.period_start,b.period_end,b.business_cutoff,b.known_at,
                    b.criteria,b.template_version,b.template_sha256,b.rule_version,b.filename,b.file_sha256,
                    b.row_count,b.parent_batch_id,b.generated_username,b.generated_at,b.confirmed_username,
-                   b.confirmed_at,b.confirmation_note,b.generated_by,b.confirmed_by
+                   b.confirmed_at,b.confirmation_note,b.generated_by,b.confirmed_by,b.scope_label,
+                   (b.confirmed_at at time zone 'Asia/Shanghai')::date as confirmed_day
             from report_frozen_batch b
             """;
     private final JdbcTemplate jdbc;
@@ -41,10 +44,12 @@ public class ReportingVersionService {
     private final PenaltyReportService penalties;
     private final EnforcementWorkReportService enforcement;
     private final DepartmentInterviewService interviews;
+    private final BusinessStatisticsService statistics;
 
     public record GenerateRequest(ReportExport.Kind type, Integer year, LocalDate start, LocalDate end,
                                   LocalDate cutoff, Long parentBatchId, UUID requestKey) {}
     public record Download(String filename, byte[] bytes, String sha256, ReportExport.Audit audit) {}
+    public record Receipt(LocalDate submittedAt, String recipient, String receiptNo, String note) {}
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Map<String, Object> list(String username, ReportExport.Kind type, int page, int size) {
@@ -79,40 +84,53 @@ public class ReportingVersionService {
             return metadata(existing.getFirst(), actor);
         }
         var knownAt = jdbc.queryForObject("select current_timestamp", OffsetDateTime.class);
+        boolean monthly = request.type() == ReportExport.Kind.MONTHLY_SUBMISSION;
+        var submission = monthly
+                ? statistics.monthlySnapshot(YearMonth.from(request.start()), request.cutoff(), knownAt, username)
+                : null;
         ReportExport report = switch (request.type()) {
             case PENALTIES -> penalties.export(request.year(), request.start(), request.end(), request.cutoff());
             case ENFORCEMENT_WORK -> enforcement.export(request.start(), request.end(), true);
             case INTERVIEWS -> interviews.export(request.year(), request.start(), request.end(), request.cutoff(), true, username);
+            case MONTHLY_SUBMISSION -> submission.report();
         };
         if (report.lines().size() != report.audit().rowCount() || report.lines().size() > ReportExport.MAX_ROWS
                 || report.workbook().length == 0 || report.workbook().length > ReportExport.MAX_WORKBOOK_BYTES)
             throw invalid("报表文件与来源行不一致或超出容量");
         if (request.parentBatchId() != null) {
             var parent = batch(request.parentBatchId());
-            if (!"CONFIRMED".equals(parent.get("status")) || !request.type().name().equals(parent.get("report_type"))
+            if (!replaceable(parent) || !request.type().name().equals(parent.get("report_type"))
                     || !report.audit().start().equals(day(parent.get("period_start")))
                     || !report.audit().end().equals(day(parent.get("period_end")))
                     || !report.audit().cutoff().equals(day(parent.get("business_cutoff"))))
-                throw invalid("重报前版须已确认，且报表类型、业务区间及截至日相同");
+                throw invalid("重报前版须已确认，月度上报可关联确认后作废的批次。类型、业务区间及截至日须相同");
         }
-        String resource = resource(request.type());
         String templateHash;
-        try (var input = new ClassPathResource("reports/" + resource).getInputStream()) {
-            templateHash = sha(input.readAllBytes());
-        } catch (java.io.IOException failure) {
-            throw new IllegalStateException("报表模板不可读", failure);
+        if (monthly) {
+            templateHash = sha(String.join(",", BusinessStatisticsService.SUBMISSION_COLUMNS).getBytes(StandardCharsets.UTF_8));
+        } else {
+            try (var input = new ClassPathResource("reports/" + resource(request.type())).getInputStream()) {
+                templateHash = sha(input.readAllBytes());
+            } catch (java.io.IOException failure) {
+                throw new IllegalStateException("报表模板不可读", failure);
+            }
         }
-        String filename = report.audit().start() + "至" + report.audit().end() + "-" + request.type().name() + ".xlsx";
-        String ruleVersion = request.type() == ReportExport.Kind.PENALTIES ? PENALTY_RULE_VERSION : RULE_VERSION;
+        String filename = monthly ? YearMonth.from(report.audit().start()) + "-医保执法统计上报.csv"
+                : report.audit().start() + "至" + report.audit().end() + "-" + request.type().name() + ".xlsx";
+        String ruleVersion = switch (request.type()) {
+            case PENALTIES -> PENALTY_RULE_VERSION;
+            case MONTHLY_SUBMISSION -> BusinessStatisticsService.SUBMISSION_RULE;
+            default -> RULE_VERSION;
+        };
         long id = jdbc.queryForObject("""
                 insert into report_frozen_batch(request_key,report_type,period_start,period_end,business_cutoff,
                     known_at,criteria,template_version,template_sha256,rule_version,filename,workbook,file_sha256,
-                    row_count,parent_batch_id,generated_by,generated_username,generator_dept_id)
-                values (?,?,?,?,?,?,?::jsonb,?,?,?,?,?,?,?,?,?,?,?) returning id
+                    row_count,parent_batch_id,generated_by,generated_username,generator_dept_id,scope_label)
+                values (?,?,?,?,?,?,?::jsonb,?,?,?,?,?,?,?,?,?,?,?,?) returning id
                 """, Long.class, request.requestKey(), request.type().name(), report.audit().start(), report.audit().end(),
                 report.audit().cutoff(), knownAt, json(criteria(request)), templateVersion(request.type()), templateHash,
                 ruleVersion, filename, report.workbook(), sha(report.workbook()), report.audit().rowCount(),
-                request.parentBatchId(), actor.id(), actor.username(), actor.deptId());
+                request.parentBatchId(), actor.id(), actor.username(), actor.deptId(), monthly ? submission.scope() : null);
         long textBytes = 0;
         for (var line : report.lines()) {
             String cells = json(line.cells());
@@ -153,11 +171,47 @@ public class ReportingVersionService {
             throw new BizException(403, "生成者不能确认本人生成的报表");
         long rows = jdbc.queryForObject("select count(*) from report_frozen_row where batch_id=?", Long.class, id);
         if (rows != ((Number) value.get("row_count")).longValue()) throw invalid("冻结来源行数量不一致");
+        byte[] file = jdbc.queryForObject("select workbook from report_frozen_batch where id=?", byte[].class, id);
+        if (file == null || !sha(file).equals(value.get("file_sha256"))) throw invalid("冻结文件摘要核对失败");
         jdbc.update("""
                 update report_frozen_batch set status='CONFIRMED',confirmed_by=?,confirmed_username=?,
                     confirmer_dept_id=?,confirmed_at=now(),confirmation_note=? where id=? and status='GENERATED'
                 """, actor.id(), actor.username(), actor.deptId(), opinion.strip(), id);
         return metadata(batch(id), actor);
+    }
+
+    @Transactional
+    public Map<String,Object> recordReceipt(long id, Receipt receipt, String username) {
+        if (receipt == null || receipt.submittedAt() == null) throw invalid("须填写实际报送日期");
+        var recipient = receiptText(receipt.recipient(), 256, true);
+        var receiptNo = receiptText(receipt.receiptNo(), 128, true);
+        var note = receiptText(receipt.note(), 2000, false);
+        if (jdbc.queryForList("select id from report_frozen_batch where id=? for no key update", id).isEmpty())
+            throw invalid("报表批次不存在");
+        var departments = jdbc.queryForList("select dept_id from sys_user where username=?", Long.class, username);
+        Long department = departments.isEmpty() ? null : departments.getFirst();
+        if (department != null) jdbc.queryForList("select id from sys_dept where id=? for share", department);
+        var actor = materials.lockActor(username, false);
+        if (!Objects.equals(department, actor.deptId()) || !canConfirm(actor))
+            throw new BizException(403, "须由已归类的局机关法制或负责人登记实际报送回执");
+        var batch = batch(id);
+        if (!"MONTHLY_SUBMISSION".equals(batch.get("report_type")) || !"CONFIRMED".equals(batch.get("status")))
+            throw invalid("仅可为已确认的月度上报快照登记回执");
+        var confirmedDay = day(batch.get("confirmed_day"));
+        if (receipt.submittedAt().isBefore(confirmedDay) || receipt.submittedAt().isAfter(LocalDate.now(ZoneId.of("Asia/Shanghai"))))
+            throw invalid("实际报送日期须在确认日与今天之间");
+        var existing = receipt(id);
+        if (existing != null) {
+            if (actor.id().equals(number(existing.get("recorded_by"))) && receipt.submittedAt().equals(day(existing.get("submitted_at")))
+                    && recipient.equals(existing.get("recipient")) && receiptNo.equals(existing.get("receipt_no"))
+                    && Objects.equals(note, existing.get("note"))) return metadata(batch, actor);
+            throw invalid("该批次已登记报送回执，请按关联更正流程保留原记录");
+        }
+        jdbc.update("""
+                insert into report_submission_receipt(batch_id,submitted_at,recipient,receipt_no,note,recorded_by,recorded_username)
+                values (?,?,?,?,?,?,?)
+                """, id, receipt.submittedAt(), recipient, receiptNo, note, actor.id(), actor.username());
+        return metadata(batch, actor);
     }
 
     @Transactional
@@ -275,9 +329,38 @@ public class ReportingVersionService {
         result.put("canWithdraw","GENERATED".equals(row.get("status"))&&own);
         result.put("canReturn","GENERATED".equals(row.get("status"))&&!own&&canConfirm(actor));
         result.put("canVoid",Set.of("GENERATED","CONFIRMED").contains(row.get("status"))&&!own&&canConfirm(actor));
+        result.put("canReissue",replaceable(row));
+        if ("MONTHLY_SUBMISSION".equals(row.get("report_type"))) {
+            var receipt = receipt(number(row.get("id")));
+            result.put("submissionReceipt",receipt);
+            result.put("canRecordReceipt",receipt==null && "CONFIRMED".equals(row.get("status")) && canConfirm(actor));
+        }
         result.put("events",jdbc.queryForList("select event_type,previous_status,resulting_status,actor_username,opinion,created_at from report_batch_event where batch_id=? order by id",row.get("id")));
         result.put("columns", columns(ReportExport.Kind.valueOf((String) row.get("report_type"))));
         return result;
+    }
+
+    private Map<String,Object> receipt(long id) {
+        var rows = jdbc.queryForList("""
+                select submitted_at,recipient,receipt_no,note,recorded_by,recorded_username,recorded_at
+                from report_submission_receipt where batch_id=?
+                """, id);
+        return rows.isEmpty() ? null : rows.getFirst();
+    }
+
+    private static String receiptText(String value, int max, boolean required) {
+        if (value == null || value.isBlank()) {
+            if (required) throw invalid("须填写接收单位和回执编号");
+            return null;
+        }
+        if (value.length() > max || value.indexOf(0) >= 0) throw invalid("报送回执字段无效");
+        return value.strip();
+    }
+
+    private static boolean replaceable(Map<String,Object> row) {
+        return "CONFIRMED".equals(row.get("status"))
+                || "MONTHLY_SUBMISSION".equals(row.get("report_type")) && "VOIDED".equals(row.get("status"))
+                && row.get("confirmed_at") != null;
     }
 
     private Map<String, Object> row(Map<String, Object> row) {
@@ -299,7 +382,8 @@ public class ReportingVersionService {
         return switch (type) {
             case "CASE" -> "/case/detail/" + id;
             case "INSPECTION" -> "/case/inspections?focus=" + id;
-            default -> "/case/interviews?focus=" + id;
+            case "INTERVIEW" -> "/case/interviews?interview=" + id;
+            default -> "";
         };
     }
 
@@ -320,6 +404,16 @@ public class ReportingVersionService {
                 && (request.start() == null || request.end() == null
                     || request.cutoff() != null && !request.cutoff().equals(request.end())))
             throw invalid("执法人员报表须填写起止日期，截至日与结束日相同");
+        if (request.type() == ReportExport.Kind.MONTHLY_SUBMISSION) {
+            var start = request.start();
+            var end = request.end();
+            var cutoff = request.cutoff();
+            if (start == null || end == null || cutoff == null || start.getYear() != request.year()
+                    || start.getYear() < 1900 || start.getDayOfMonth() != 1
+                    || !end.equals(YearMonth.from(start).atEndOfMonth()) || cutoff.isBefore(end)
+                    || cutoff.isAfter(LocalDate.now(ZoneId.of("Asia/Shanghai"))))
+                throw invalid("月度上报须选择一个已结束的自然月，且截至日在月末与今天之间");
+        }
         if (request.parentBatchId() != null && request.parentBatchId() <= 0) throw invalid("前版批次无效");
     }
 
@@ -332,6 +426,7 @@ public class ReportingVersionService {
             case PENALTIES -> "administrative-penalties-annual.xlsx";
             case ENFORCEMENT_WORK -> "enforcement-work.xlsx";
             case INTERVIEWS -> "department-interviews.xlsx";
+            case MONTHLY_SUBMISSION -> throw new IllegalArgumentException("月度上报使用 CSV 表头");
         };
     }
 
@@ -346,6 +441,7 @@ public class ReportingVersionService {
                     "来源", "处理完成", "发现违法", "违法情形", "行政处罚", "协议处理", "调查状态", "移送",
                     "解除协议", "司法判决", "国家飞检", "省飞检", "市级检查", "备注");
             case INTERVIEWS -> List.of("序号", "部门", "机构编码", "机构名称", "约谈类型", "事由", "内容", "人员", "日期");
+            case MONTHLY_SUBMISSION -> BusinessStatisticsService.SUBMISSION_COLUMNS;
         };
     }
 

@@ -5,6 +5,7 @@
     <div class="heading filters"><span>业务截至日</span><el-date-picker v-model="cutoff" type="date" value-format="YYYY-MM-DD" :clearable="false" :disabled="saving" @change="load" /></div>
     <el-alert v-if="failed" title="后续事项读取失败，请刷新重试" type="warning" :closable="false" />
     <template v-if="state">
+      <el-alert v-if="focusUnavailable" title="待办指向的执行版本或法院轮次已变化，请核对下方当前办理情况。" type="warning" :closable="false" />
       <el-empty v-if="!state.eligible" description="作出处理决定后可办理后续事项" />
       <template v-else>
         <p>原状态：{{ state.originalCaseStatus }}；原案卷：{{ state.originalArchiveNo || '尚未归档' }}。有效决定：{{ decisionLabel(state.effectiveDecision.decision_type) }} {{ state.effectiveDecision.decision_no || '' }}，生效日 {{ state.effectiveDecision.effective_at || '—' }}。</p>
@@ -12,7 +13,7 @@
         <el-alert v-if="state.effectiveDecision.version_id" title="当前已有独立决定版本，原决定不能继续登记公开。请人工核对既有公示是否需要撤回，并按实际结果办理新版本公示；平台不自动撤回或发布。" type="warning" :closable="false" />
         <el-table :data="balanceRows" size="small"><el-table-column prop="name" label="款项" /><el-table-column prop="obligation" label="有效／人工核定金额" :formatter="(_r: any, _c: any, value: any) => value == null ? '未登记核定额' : value" /><el-table-column prop="paid" label="已登记净额" /><el-table-column prop="remaining" label="余额（负数待核实）" /></el-table>
         <p>加处罚款显示已批准登记的人工核定总额；没有核定记录时留空，罚款本金只作上限。结果变更后的实际义务和退付仍须按材料复核。</p>
-        <p v-if="state.executionDeadline">
+        <p v-if="state.executionDeadline" :class="{ 'task-highlight': focusedExecution }">
           当前执行依据：{{ state.executionDeadline.decisionVersionId ? '独立决定 #' + state.executionDeadline.decisionVersionId : '原决定' }}。
           有效送达日 {{ state.executionDeadline.deliveredAt || '待核实' }}，
           缴款期限 {{ state.executionDeadline.paymentDeadline || '待核实' }}，
@@ -24,11 +25,11 @@
           登记当前决定期限依据
         </el-button>
         <div class="actions"><el-button v-for="item in actions" :key="item.value" :disabled="saving || loading || !(item.value === 'REGISTER_REMEDY' ? state.canRegisterRemedy : state.canRequest)" @click="open(item.value)">{{ item.label }}</el-button></div>
-        <p v-if="!state.canRequest">有待复核申请时，须先处理或撤回后再提交下一项。历史截至日仅用于核对，申请仍按当前有效资料复核。</p>
+        <p v-if="!state.canRequest && state.canRegisterRemedy">可先登记实际救济收件。待复核申请按最新资料重新核对，资料变化后可驳回或撤回，再提出申请。</p>
         <h4>执行记录（含独立续记、冲正及实际退款）</h4>
         <el-table :data="state.executions" size="small"><el-table-column prop="source" label="来源" :formatter="(_r: any, _c: any, value: string) => value === 'ORIGINAL' ? '原执行' : '独立续记'" /><el-table-column prop="id" label="记录号" /><el-table-column prop="kind" label="款项" :formatter="(_r: any, _c: any, value: string) => names[value] || value" /><el-table-column prop="amount" label="金额" /><el-table-column prop="method" label="办理类型" :formatter="(_r: any, _c: any, value: string) => ({ REFUND: '实际退款', REVERSAL: '差错冲正', BANK: '银行缴付', ONSITE: '当场收缴', INSTALLMENT: '分期缴纳' } as Record<string, string>)[value] || value" /><el-table-column prop="paid_at" label="实际到账／冲正／退付日" /><el-table-column prop="receipt_no" label="凭证号" /></el-table>
         <h4>法院申请轮次</h4>
-        <el-table :data="state.courtRounds" size="small"><el-table-column prop="round_no" label="轮次" /><el-table-column prop="decision_version_id" label="绑定决定版本" :formatter="(_r: any, _c: any, value: number | null) => value == null ? '原决定或历史记录' : '#' + value" /><el-table-column prop="applied_at" label="申请日期" /><el-table-column prop="application_reference" label="申请文号" /><el-table-column prop="status" label="状态" :formatter="(_r: any, _c: any, value: string) => statusLabel(value)" /><el-table-column prop="received_at" label="回执日期" /><el-table-column prop="receipt_no" label="回执文号" /></el-table>
+        <el-table :data="state.courtRounds" :row-class-name="courtRowClass" size="small"><el-table-column prop="round_no" label="轮次" /><el-table-column prop="decision_version_id" label="绑定决定版本" :formatter="(_r: any, _c: any, value: number | null) => value == null ? '原决定或历史记录' : '#' + value" /><el-table-column prop="applied_at" label="申请日期" /><el-table-column prop="application_reference" label="申请文号" /><el-table-column label="法院状态"><template #default="{ row }">{{ row.status === 'REJECTED' ? '不予受理' : statusLabel(row.status) }}<small v-if="row.correction_id">（已复核更正）</small></template></el-table-column><el-table-column prop="received_at" label="回执日期" /><el-table-column prop="receipt_no" label="回执文号" /></el-table>
         <h4>救济与更正受理</h4>
         <el-table :data="state.remedies" size="small"><el-table-column prop="id" label="受理记录号" /><el-table-column prop="remedy_type" label="类型" :formatter="(_r: any, _c: any, value: string) => remedyLabel(value)" /><el-table-column prop="accepted_at" label="受理日期" /><el-table-column prop="reference" label="受理文号" /><el-table-column prop="status" label="状态" :formatter="(_r: any, _c: any, value: string) => statusLabel(value)" /></el-table>
         <h4>申请与复核记录</h4>
@@ -67,14 +68,17 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import client from '../api/client'
+import { parseTaskFocus } from '../api/taskFocus'
 import { useAuthStore } from '../stores/auth'
 import { sessionExpiry, SESSION_EXPIRED_EVENT } from '../api/sessionExpiry'
 
 interface Entry { id: number; type: string; payload: Record<string, unknown>; status: string; reason: string; sourceReference: string; requestedBy: string; requestedAt: string; reviewedBy?: string; reviewedAt?: string; opinion?: string; canReview: boolean; canCancel: boolean }
 interface ExecutionDeadline {
   decisionVersionId?: number
+  courtRoundId?: number
   deliveryId?: number
   deliveredAt?: string
   paymentDeadline?: string
@@ -86,16 +90,29 @@ interface State { eligible: boolean; canRequest: boolean; canRegisterRemedy: boo
 interface Field { key: string; label: string; kind?: string; max?: number; optional?: boolean; options?: { value: string; label: string }[] }
 const props = defineProps<{ caseId: number }>()
 const auth = useAuthStore()
+const route = useRoute()
 const identity = computed(() => JSON.stringify([auth.token, auth.user?.id, auth.user?.roles, auth.user?.accountCategory]))
 const permitted = computed(() => !!auth.token && !!auth.user && auth.user.roles.some(r => ['HANDLER', 'LEGAL', 'LEADER', 'ADMIN'].includes(r)) && auth.user.accountCategory !== 'AGENCY')
 const state = ref<State>(), loading = ref(false), saving = ref(false), failed = ref(false)
+const executionFocus = computed(() => route.query.executionVersion === '0' ? 0 : parseTaskFocus(route.query.executionVersion))
+const courtFocus = computed(() => parseTaskFocus(route.query.courtRound))
+const focusedExecution = computed(() => !!state.value?.eligible && !!state.value.executionDeadline
+  && executionFocus.value !== undefined
+  && (executionFocus.value !== 0 || route.query.executionVersion === '0')
+  && executionFocus.value === Number(state.value.executionDeadline.decisionVersionId ?? 0))
+const focusedCourt = computed(() => focusedExecution.value && courtFocus.value != null && courtFocus.value > 0
+  && courtFocus.value === Number(state.value?.executionDeadline?.courtRoundId)
+  && state.value?.courtRounds.some(row => Number(row.id) === courtFocus.value))
+const focusUnavailable = computed(() => (executionFocus.value !== undefined || courtFocus.value !== undefined)
+  && (!focusedExecution.value || courtFocus.value !== undefined && !focusedCourt.value))
+function courtRowClass({row}:{row:any}) { return focusedCourt.value && Number(row.id) === courtFocus.value ? 'task-highlight' : '' }
 const cutoff = ref(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()))
 const formVisible = ref(false), reviewVisible = ref(false), mode = ref('EXECUTION'), reviewAction = ref<'approve' | 'reject' | 'cancel'>('approve')
 const draft = reactive<Record<string, string>>({}), reason = ref(''), sourceReference = ref(''), opinion = ref(''), requestKey = ref('')
 const withInstitution=ref(false),withFinding=ref(false)
 const approvedBundles=ref<{id:number;title:string}[]>([]),materialBundleId=ref<number|null>(null)
 const selected = ref<Entry>()
-const actions = [{ value: 'EXECUTION', label: '申请执行续记' }, { value: 'REVERSAL', label: '申请整笔差错冲正' }, { value: 'REFUND', label: '登记实际退款' }, { value: 'COURT_APPLY', label: '登记法院后续申请' }, { value: 'COURT_RECEIPT', label: '登记本轮法院回执' }, { value: 'REGISTER_REMEDY', label: '登记救济／更正受理' }, { value: 'REMEDY_RESULT', label: '提交结果材料' }, { value: 'REMEDY_VOID', label: '申请作废误登受理' }, {value:'FACT_CORRECTION',label:'申请独立事实更正'}]
+const actions = [{ value: 'EXECUTION', label: '申请执行续记' }, { value: 'REVERSAL', label: '申请整笔差错冲正' }, { value: 'REFUND', label: '登记实际退款' }, { value: 'COURT_APPLY', label: '登记法院后续申请' }, { value: 'COURT_RECEIPT', label: '登记本轮法院回执' }, { value: 'COURT_RECEIPT_CORRECTION', label: '申请更正法院回执' }, { value: 'REGISTER_REMEDY', label: '登记救济／更正受理' }, { value: 'REMEDY_RESULT', label: '提交结果材料' }, { value: 'REMEDY_VOID', label: '申请作废误登受理' }, {value:'FACT_CORRECTION',label:'申请独立事实更正'}]
 const names: Record<string, string> = { FINE: '罚款', RECOUP: '退回基金', CONFISCATE: '没收', LATE_FEE: '加处罚款' }
 const balanceRows = computed(() => Object.entries(state.value?.balances || {}).map(([key, value]) => ({ name: names[key] || key, ...value })))
 const options = (values: Record<string, string>) => Object.entries(values).map(([value, label]) => ({ value, label }))
@@ -126,6 +143,12 @@ const formFields = computed<Field[]>(() => {
   }
   if (mode.value === 'COURT_APPLY') return [{ key: 'appliedAt', label: '实际申请日期', kind: 'date' }, { key: 'applicationReference', label: '申请文号' }, { key: 'eligibilityBasis', label: '本轮申请材料依据', kind: 'long', max: 2000 }]
   if (mode.value === 'COURT_RECEIPT') return [{ key: 'roundId', label: '法院申请轮次', options: (state.value?.courtRounds || []).filter(r => r.id && r.status === 'APPLIED').map(r => ({ value: String(r.id), label: `第${r.round_no}轮 ${r.application_reference}` })) }, { key: 'status', label: '实际回执结果', options: options({ ACCEPTED: '正式受理', RETURNED: '退回补正', REJECTED: '不予受理' }) }, { key: 'receivedAt', label: '回执日期', kind: 'date' }, { key: 'receiptNo', label: '回执文号' }]
+  if (mode.value === 'COURT_RECEIPT_CORRECTION') return [
+    { key: 'round', label: '需更正的回执', options: (state.value?.courtRounds || []).filter(r => r.status !== 'APPLIED').map(r => ({ value: r.id == null ? 'LEGACY' : String(r.id), label: `第${r.round_no}轮 ${r.receipt_no || '历史回执'}` })) },
+    { key: 'status', label: '更正后结果', options: options({ ACCEPTED: '正式受理', RETURNED: '退回补正', REJECTED: '不予受理' }) },
+    { key: 'receivedAt', label: '实际回执日期', kind: 'date' },
+    { key: 'receiptNo', label: '实际回执文号' }
+  ]
   if (mode.value === 'REGISTER_REMEDY') return [{ key: 'remedyType', label: '类型', options: options({ RECONSIDERATION: '行政复议', LITIGATION: '行政诉讼', CORRECTION: '决定更正' }) }, { key: 'acceptedAt', label: '受理日期', kind: 'date' }, { key: 'reference', label: '受理文号' }]
   if(mode.value==='FACT_CORRECTION')return [{key:'effectiveAt',label:'事实更正生效日',kind:'date'},...selectedFactFields()]
   if (mode.value === 'REMEDY_VOID') return [{ key: 'remedyId', label: '误登或重复受理记录', options: openRemedyOptions.value }]
@@ -187,6 +210,7 @@ async function submit() {
   if (!registeringBasis && (!reason.value.trim() || !sourceReference.value.trim())) { ElMessage.warning('请填写理由和材料出处'); return }
   if (mode.value === 'REVERSAL' || mode.value === 'REFUND') { const [source, id] = String(payload.executionSource).split(':'); delete payload.executionSource; payload.source = source; payload.sourceId = Number(id) }
   for (const key of ['roundId', 'remedyId']) if (key in payload) payload[key] = Number(payload[key])
+  if ('round' in payload && payload.round !== 'LEGACY') payload.round = Number(payload.round)
   const context = capture(), registeringRemedy = mode.value === 'REGISTER_REMEDY'
   const base = { requestKey: requestKey.value, reason: reason.value.trim(), sourceReference: sourceReference.value.trim() }
   if (registeringBasis) {
@@ -219,5 +243,7 @@ onBeforeUnmount(() => { disposed = true; clear(); window.removeEventListener(SES
 </script>
 
 <style scoped>
+.task-highlight { background: var(--el-color-warning-light-9); padding: 4px 8px; }
+:deep(.task-highlight td.el-table__cell) { background-color: var(--el-color-warning-light-9); }
 .continuation-panel { margin-top: 16px; }.heading { display:flex; align-items:center; gap:12px; justify-content:space-between; }.filters { margin:14px 0; justify-content:flex-start; }.actions { display:flex; gap:8px; flex-wrap:wrap; margin:16px 0; }.actions .el-button { margin-left:0; }pre { white-space:pre-wrap; overflow-wrap:anywhere; }p { line-height:1.7; }dd { margin:4px 0 12px; }
 </style>

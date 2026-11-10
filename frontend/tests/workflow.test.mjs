@@ -10,6 +10,7 @@ import { renderToString } from '@vue/server-renderer'
 import { canWritePrecase } from '../src/api/precaseAttachments.ts'
 import { periodEndError } from '../src/api/periodCompletion.ts'
 import { emptyJurisdiction, jurisdictionError, serializeJurisdiction } from '../src/api/jurisdiction.ts'
+import { createApprovalRequestKey } from '../src/api/approvalRequestKey.ts'
 
 // Execute the real component handlers with controlled state and HTTP, without a browser or database.
 function handler(file, name, context) {
@@ -40,11 +41,13 @@ test('review submit omits user-controlled reviewer identity', async () => {
   assert.equal(ctx.calls[0][1].opinion,'同意')
 })
 test('clue extension requests approval rather than granting itself an extension', async () => {
-  const ctx=state({ElMessageBox:{prompt:async()=>({value:'核查情况复杂'})}})
+  const ctx=state({ElMessageBox:{prompt:async()=>({value:'核查情况复杂'})}, extendingClue:{value:null},
+    readIdentity:()=> 'test', loadGeneration:1, disposed:false, auth:{user:{id:1}}, clueApprovalRequestKey:createApprovalRequestKey()})
   await handler('case/CluesView.vue','onExtend',ctx)({id:12})
   assert.equal(ctx.calls[0][0],'/bureau/approvals')
   assert.equal(ctx.calls[0][1].kind,'CLUE_EXTEND')
   assert.equal(ctx.calls[0][1].clueId,12)
+  assert.match(ctx.calls[0][1].requestKey, /^[a-f0-9]{32}$/)
 })
 test('opening relief dialog refreshes every field from current case', () => {
   const ctx=state({c:{value:{reliefDeadline:'2026-10-01', reliefPending:false, reliefBasis:'期限依据'}},reliefForm:{deadline:'old',pending:true,basis:'old',deferUntil:'old'}})
@@ -306,7 +309,7 @@ test('actual pending clue operation cell hides filing for a foreign handler and 
   const row={id:7,status:'PENDING',createdBy:'creator',handler:'assignee',extended:false}
   for (const [username,canFile] of [['creator',true],['assignee',true],['foreign',false]]) {
     const canManageClue=handler('case/CluesView.vue','canManageClue',{auth:{user:{roles:['HANDLER'],username}},canWritePrecase})
-    const app=Vue.createSSRApp({render,setup:()=>({canOperate:true,canManageClue,toFile(){},openMaterials(){},onExtend(){},onExclusion(){},onReject(){}})})
+    const app=Vue.createSSRApp({render,setup:()=>({canOperate:true,canManageClue,extendingClue:null,toFile(){},openMaterials(){},onExtend(){},onExclusion(){},onReject(){}})})
     app.component('el-table-column',{setup:(_, {slots})=>()=>Vue.h('div',slots.default?.({row}))})
     app.component('el-button',{setup:(_, {slots})=>()=>Vue.h('button',slots.default?.())})
     app.config.warnHandler=()=>{}
@@ -412,6 +415,7 @@ function applicationFixture(extra={}) {
   const fn=source.slice(fnStart,source.indexOf('\n}',fnStart)+2)
   const events=[],unmount=[],stops=[]
   const ctx=state({dlg:Vue.reactive({apply:true}),id:Vue.ref('9'),
+    createApprovalRequestKey,auth:{user:{id:1}},
     reactive:Vue.reactive,ref:Vue.ref,onUnmounted:cb=>unmount.push(cb),
     watch:(...args)=>{const stop=Vue.watch(...args);stops.push(stop);return stop},
     load:async()=>events.push('load'),ElMessage:{success:()=>events.push('success'),warning:()=>events.push('warning')},...extra})
@@ -433,6 +437,18 @@ test('failed approval application preserves its draft and releases the operation
   await assert.doesNotReject(f.onApply())
   assert.equal(f.ctx.dlg.apply,true);assert.equal(f.applyForm.reason,'保留申请理由')
   assert.equal(f.applying.value,false);assert.equal(f.events.length,0);f.unmount()
+})
+test('retry of the same approval draft retains its request key after an uncertain response',async()=>{
+  const keys=[]
+  const f=applicationFixture({client:{post:async (_path,body)=>{
+    keys.push(body.requestKey)
+    if(keys.length===1) throw new Error('response lost')
+  }}})
+  await f.onApply()
+  await f.onApply()
+  assert.match(keys[0], /^[a-f0-9]{32}$/)
+  assert.deepEqual(keys,[keys[0],keys[0]])
+  f.unmount()
 })
 test('application completion cannot close a draft reopened on the same case',async()=>{
   let finish;const f=applicationFixture({client:{post:()=>new Promise(resolve=>finish=resolve)}})

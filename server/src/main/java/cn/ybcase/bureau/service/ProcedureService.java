@@ -155,11 +155,52 @@ public class ProcedureService {
     }
 
     public record HearingScheduleReq(LocalDate announcedAt, LocalDate noticeSentAt, LocalDate scheduledAt,
-                                     String host, String hostDept, String recorder, Long noticeId) {
+                                     String host, String hostDept, String recorder, Long noticeId,
+                                     Long hearingNoticeDeliveryId, Boolean requireReceipt) {
+        public HearingScheduleReq(LocalDate announcedAt, LocalDate noticeSentAt, LocalDate scheduledAt,
+                                  String host, String hostDept, String recorder, Long noticeId) {
+            this(announcedAt, noticeSentAt, scheduledAt, host, hostDept, recorder, noticeId, null, null);
+        }
         public HearingScheduleReq(LocalDate announcedAt, LocalDate noticeSentAt, LocalDate scheduledAt,
                                   String host, String hostDept, String recorder) {
             this(announcedAt, noticeSentAt, scheduledAt, host, hostDept, recorder, null);
         }
+    }
+
+    private LocalDate hearingNoticeEarliest(CaseNotice notice) {
+        LocalDate deliveredAt = notice.isDeliveryRequired() ? requireNoticeDelivery(notice) : notice.getNotifiedAt();
+        return notice.getHearingRequestedAt() == null ? deliveredAt : notice.getHearingRequestedAt();
+    }
+
+    @Transactional
+    public void recordHearingNoticeDelivery(Long caseId, Long noticeId, Long documentId, String method, LocalDate deliveredAt,
+                                            String receiver, String receiptNo, LocalDate signedAt, String note) {
+        CaseGuards.lockWritable(jdbc, caseId);
+        materialAccess.requireCurrentCaseWriter(caseId);
+        var notice = noticeRepository.findTopByCaseIdOrderByIdDesc(caseId)
+                .orElseThrow(() -> new BizException(2039, "尚未作出处罚告知"));
+        requireNoticeVersion(notice, noticeId);
+        if (!"NOTIFIED".equals(caseFile(caseId).getStatus()) || !Boolean.TRUE.equals(notice.getHearingRequested()))
+            throw new BizException(2057, "仅可登记当前已申请听证的通知回证");
+        if (documentId != null && !Boolean.TRUE.equals(jdbc.queryForObject("""
+                select exists(select 1 from case_document where case_id=? and id=? and doc_type='HEARING_NOTICE')
+                """,Boolean.class,caseId,documentId)))
+            throw new BizException(2057, "所选文书不是本案听证通知");
+        LocalDate earliest = hearingNoticeEarliest(notice);
+        LocalDate today = LocalDate.now();
+        if (deliveredAt == null || deliveredAt.isBefore(earliest) || deliveredAt.isAfter(today)
+                || signedAt != null && (signedAt.isBefore(earliest) || signedAt.isAfter(today))
+                || receiptNo == null || receiptNo.isBlank() || receiver == null || receiver.isBlank())
+            throw new BizException(2057, "须登记听证申请后的实际送达日、受送达人和回证编号");
+        if (Boolean.TRUE.equals(jdbc.queryForObject("""
+                select exists(select 1 from case_delivery where case_id=? and hearing_notice_version_id=?
+                    and document_id is not distinct from ?::bigint and method=? and delivered_at=? and receiver=?
+                    and receipt_no=? and receipt_signed_at is not distinct from ?::date and note is not distinct from ?::text)
+                """,Boolean.class,caseId,noticeId,documentId,method,deliveredAt,receiver,receiptNo,signedAt,note))) return;
+        jdbc.update("""
+                insert into case_delivery(case_id,method,delivered_at,receiver,note,receipt_no,receipt_signed_at,
+                    doc_kind,document_id,hearing_notice_version_id) values(?,?,?,?,?,?,?,'HEARING_NOTICE',?,?)
+                """,caseId,method,deliveredAt,receiver,note,receiptNo,signedAt,documentId,noticeId);
     }
 
     @Transactional
@@ -189,20 +230,32 @@ public class ProcedureService {
         // 辽47条：举行听证7日前书面通知当事人（参数化）
         int ahead = config.intVal("hearing_notice_ahead_days", 7);
         LocalDate noticeSent = req.noticeSentAt() != null ? req.noticeSentAt() : LocalDate.now();
+        if (req.hearingNoticeDeliveryId() != null) {
+            var receipts = jdbc.queryForList("""
+                    select delivered_at from case_delivery d
+                    where d.id=? and d.case_id=? and d.doc_kind='HEARING_NOTICE' and d.hearing_notice_version_id=?
+                      and coalesce(btrim(d.receipt_no),'') <> ''
+                      and not exists (select 1 from case_hearing h where h.hearing_notice_delivery_id=d.id)
+                    """,req.hearingNoticeDeliveryId(),caseId,notice.getId());
+            if (receipts.isEmpty()) throw new BizException(2057, "请选择本案当前告知版本的未使用听证通知回证");
+            noticeSent = ((java.sql.Date) receipts.getFirst().get("delivered_at")).toLocalDate();
+        } else if (Boolean.TRUE.equals(req.requireReceipt())) {
+            throw new BizException(2057, "请先登记并选择本次听证通知的实际送达回证");
+        }
         if (notice.isDeliveryRequired()) {
             if (!"NOTIFIED".equals(c.getStatus())) throw new BizException(2057, "当前阶段不能安排听证");
-            LocalDate deliveredAt = requireNoticeDelivery(notice);
-            LocalDate earliest = notice.getHearingRequestedAt() == null ? deliveredAt : notice.getHearingRequestedAt();
-            if (req.noticeSentAt() == null || noticeSent.isBefore(earliest) || noticeSent.isAfter(LocalDate.now()))
+            LocalDate earliest = hearingNoticeEarliest(notice);
+            if (req.noticeSentAt() == null && req.hearingNoticeDeliveryId() == null
+                    || noticeSent.isBefore(earliest) || noticeSent.isAfter(LocalDate.now()))
                 throw new BizException(2057, "请填写当前告知版本听证申请后已实际送达通知的日期");
         }
         if (ChronoUnit.DAYS.between(noticeSent, req.scheduledAt()) < ahead)
             throw new BizException(2057, "听证应在通知送达后至少 " + ahead + " 日举行（辽47条）");
         jdbc.update("""
-                insert into case_hearing (case_id, announced_at, notice_sent_at, scheduled_at, host, host_dept, recorder, notice_id)
-                values (?,?,?,?,?,?,?,?)""",
+                insert into case_hearing (case_id, announced_at, notice_sent_at, scheduled_at, host, host_dept, recorder, notice_id,
+                    hearing_notice_delivery_id) values (?,?,?,?,?,?,?,?,?)""",
                 caseId, req.announcedAt(), noticeSent, req.scheduledAt(),
-                req.host(), req.hostDept(), req.recorder(), notice.getId());
+                req.host(), req.hostDept(), req.recorder(), notice.getId(), req.hearingNoticeDeliveryId());
     }
 
     /**

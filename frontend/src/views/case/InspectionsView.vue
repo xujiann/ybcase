@@ -3,12 +3,13 @@
     <div class="toolbar">
       <h3>行政检查<span class="hint">（清单第10-12项；发现违法一键转线索，打通 检查→线索→立案 闭环）</span></h3>
       <div class="list-controls">
-        <el-input v-model="pagination.q" clearable placeholder="编号/对象/结果" style="width: 220px" @keyup.enter="paging.search" @clear="paging.search" />
-        <el-button @click="paging.search">搜索</el-button>
+        <el-input v-model="pagination.q" :disabled="focusId !== undefined" clearable placeholder="编号/对象/结果" style="width: 220px" @keyup.enter="paging.search" @clear="paging.search" />
+        <el-button :disabled="focusId !== undefined" @click="paging.search">搜索</el-button>
         <el-button @click="load">刷新</el-button>
         <el-button v-if="canOperate" type="primary" @click="dlg = true">新建检查任务</el-button>
       </div>
     </div>
+    <TaskFocusBanner :loading="loading" :failed="pagination.failed" :count="rows.length" label="行政检查" @change="setTaskFocus" />
     <el-alert v-if="pagination.failed" type="error" :closable="false" :title="pagination.error" style="margin-bottom: 12px" />
     <el-table :data="rows" border stripe size="small" v-loading="loading">
       <el-table-column prop="insp_no" label="检查编号" width="110" />
@@ -30,15 +31,16 @@
             <el-tag size="small" :type="row.violation_found ? 'danger' : 'success'">
               {{ row.violation_found ? '发现违法' : '未见违法' }}
             </el-tag>
-            <el-button v-if="canOperateInspection(row) && row.violation_found" size="small" text type="danger" @click="onToClue(row)">转线索</el-button>
-            <span v-if="row.clue_id" class="hint">已转线索#{{ row.clue_id }}</span>
+            <el-button v-if="canOperateInspection(row) && row.violation_found" size="small" text type="danger"
+              :loading="convertingInspection === row.id" :disabled="convertingInspection !== null" @click="onToClue(row)">转线索</el-button>
+            <router-link v-if="row.clue_id" :to="{ path: '/case/clues', query: { focus: row.clue_id } }">查看线索</router-link>
           </template>
         </template>
       </el-table-column>
       <el-table-column prop="result" label="检查结果" show-overflow-tooltip />
       <el-table-column label="材料" width="90"><template #default="{ row }"><el-button size="small" @click="openMaterials(row)">材料</el-button></template></el-table-column>
     </el-table>
-    <el-pagination style="margin-top: 12px; justify-content: flex-end" :current-page="pagination.page" :page-size="pagination.size" :page-sizes="[20,50,100]" :total="pagination.total" layout="total, sizes, prev, pager, next, jumper" @current-change="paging.changePage" @size-change="paging.changeSize" />
+    <el-pagination style="margin-top: 12px; justify-content: flex-end" :current-page="pagination.page" :page-size="pagination.size" :page-sizes="[20,50,100]" :total="pagination.total" :disabled="focusId !== undefined" layout="total, sizes, prev, pager, next, jumper" @current-change="paging.changePage" @size-change="paging.changeSize" />
 
 
     <PrecaseAttachments v-model:visible="materialsVisible" :source="materialsSource" />
@@ -101,6 +103,7 @@ import { historyPageState, createHistoryPagination } from '../../api/historyPagi
 import { useAuthStore } from '../../stores/auth'
 import { caseOperationAccess } from '../../api/caseWriteAccess'
 import PrecaseAttachments from '../../components/PrecaseAttachments.vue'
+import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
 import { canWritePrecase, type PrecaseSource } from '../../api/precaseAttachments'
 import { PARTY_TYPE } from './labels'
 
@@ -124,7 +127,14 @@ function openMaterials(row: any) {
   materialsVisible.value = true
 }
 const pagination = reactive(historyPageState<any>())
-const paging = createHistoryPagination(pagination, async (params, { signal }) => (await client.get('/bureau/inspections', { params, signal, historyRead: true })).data.data)
+const focusId = ref<number>()
+const paging = createHistoryPagination(pagination, async (params, { signal }) => {
+  if (focusId.value === 0) return { rows: [], total: 0, page: 1, size: 1 }
+  const generation = contextGeneration
+  const response = await client.get('/bureau/inspections', { params: { ...params, focusId: focusId.value }, signal, historyRead: true })
+  if (generation !== contextGeneration) throw new Error('Inspection context changed')
+  return response.data.data
+})
 const rows = computed(() => pagination.rows)
 onUnmounted(paging.dispose)
 const items = ref<any[]>([])
@@ -154,16 +164,36 @@ async function onCreate() {
 
 const resultVisible = ref(false)
 const resultSaving = ref(false)
+const convertingInspection = ref<number | null>(null)
 const resultForm = reactive<{ id: number | null; result: string; violationFound: boolean | null }>({
   id: null, result: '', violationFound: null,
 })
 let resultDisposed = false
+let mounted = false
+let contextGeneration = 0
 
-watch(() => [auth.token, auth.user?.id], () => { resultVisible.value = false }, { flush: 'sync' })
+watch(() => JSON.stringify([auth.token, auth.user?.id, auth.user?.accountCategory, auth.user?.roles]), () => {
+  contextGeneration++
+  resultVisible.value = false
+  materialsVisible.value = false
+  pagination.rows = []
+  pagination.total = 0
+  if (mounted && auth.token) void paging.firstPage()
+}, { flush: 'sync' })
 onUnmounted(() => { resultDisposed = true })
 
-function onComplete(row: { id: number; done_at?: string }) {
-  if (!canOperate.value || row.done_at || resultSaving.value) return
+function setTaskFocus(value: number | undefined) {
+  if (value === focusId.value) return
+  focusId.value = value
+  contextGeneration++
+  resultVisible.value = false
+  materialsVisible.value = false
+  if (value === undefined) pagination.size = 20
+  if (mounted) void paging.firstPage()
+}
+
+function onComplete(row: any) {
+  if (!canOperate.value || !canOperateInspection(row) || row.done_at || resultSaving.value) return
   Object.assign(resultForm, { id: row.id, result: '', violationFound: null })
   resultVisible.value = true
 }
@@ -193,15 +223,29 @@ async function submitResult() {
 }
 
 async function onToClue(row: any) {
-  if (!canOperate.value) return
-  const resp = await client.post(`/bureau/inspections/${row.id}/to-clue`)
-  ElMessage.success(`已转线索 ${resp.data.data.clueNo}`)
-  load()
+  if (!canOperate.value || !canOperateInspection(row) || !row.violation_found || convertingInspection.value !== null) return
+  const generation = contextGeneration
+  convertingInspection.value = row.id
+  try {
+    const resp = await client.post(`/bureau/inspections/${row.id}/to-clue`)
+    if (resultDisposed || generation !== contextGeneration) return
+    ElMessage.success(`已转线索 ${resp.data.data.clueNo}`)
+    await load()
+  } catch {
+    // The API client displays the request failure.
+  } finally {
+    convertingInspection.value = null
+  }
 }
 
 onMounted(async () => {
-  items.value = ((await client.get('/bureau/enforce-items')).data.data as any[]).filter((x) => x.category === 'INSPECTION')
-  load()
+  mounted = true
+  void load()
+  try {
+    items.value = ((await client.get('/bureau/enforce-items')).data.data as any[]).filter((x) => x.category === 'INSPECTION')
+  } catch {
+    // Inspectors can still open existing tasks if reference data is unavailable.
+  }
 })
 </script>
 

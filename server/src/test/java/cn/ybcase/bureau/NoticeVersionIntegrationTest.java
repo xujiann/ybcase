@@ -101,6 +101,45 @@ class NoticeVersionIntegrationTest {
                 "select event_type from case_notice_procedure_event where notice_id=? order by id", String.class, notice.getId()));
     }
 
+    @Test
+    void hearingUsesTheCurrentVersionReceiptAndItsActualDate() {
+        long caseId = reportedCase();
+        LocalDate today = LocalDate.now();
+        LocalDate sent = today.minusDays(Math.max(0, config.intVal("hearing_notice_ahead_days", 7)) + 1L);
+        CaseNotice first = notice(caseId, null, sent);
+        deliver(first, sent, "处罚告知回证");
+        cases.recordStatement(caseId, response(first, null, null, true, sent, null, null, null));
+        procedures.recordHearingNoticeDelivery(caseId, first.getId(), null, "DIRECT", sent, "当事人", "前次听证通知", sent, null);
+        long oldReceipt = jdbc.queryForObject("select id from case_delivery where hearing_notice_version_id=?",Long.class,first.getId());
+
+        CaseNotice latest = notice(caseId, first.getId(), sent);
+        deliver(latest, sent, "当前处罚告知回证");
+        assertEquals(2057, assertThrows(BizException.class, () -> procedures.scheduleHearing(caseId,
+                hearingSchedule(latest, today, oldReceipt))).code);
+        assertEquals(2057, assertThrows(BizException.class, () -> procedures.scheduleHearing(caseId,
+                hearingSchedule(latest, today, null))).code);
+        procedures.recordHearingNoticeDelivery(caseId, latest.getId(), null, "DIRECT", sent, "当事人", "当前听证通知", sent, null);
+        long currentReceipt = jdbc.queryForObject("select id from case_delivery where hearing_notice_version_id=?",Long.class,latest.getId());
+        procedures.scheduleHearing(caseId, hearingSchedule(latest, today, currentReceipt));
+        assertEquals(sent, jdbc.queryForObject("select notice_sent_at from case_hearing where hearing_notice_delivery_id=?",
+                java.sql.Date.class,currentReceipt).toLocalDate());
+    }
+
+    @Test
+    void modernRepeatNoticeAndDecisionUseTheSameMinimumEvenWithAChangeReason() {
+        long caseId = reportedCase();
+        CaseNotice first = notice(caseId, null, LocalDate.now());
+        assertEquals(2077, assertThrows(BizException.class, () -> cases.notify(caseId, new CaseService.NoticeReq(
+                "本次拟增额",FINE.add(BigDecimal.ONE),BigDecimal.ZERO,BigDecimal.ZERO,"已说明事实变化",true,first.getId()))).code);
+        assertEquals(1,jdbc.queryForObject("select count(*) from case_notice where case_id=?",Integer.class,caseId));
+        assertTrue(check(caseId,"no_aggravation"));
+    }
+
+    private ProcedureService.HearingScheduleReq hearingSchedule(CaseNotice notice, LocalDate planned, Long receipt) {
+        return new ProcedureService.HearingScheduleReq(null, planned, planned, "李法制", "法制科", "书记员",
+                notice.getId(),receipt,true);
+    }
+
     private long reportedCase() {
         long cause = causes.findAll().stream().filter(c -> c.getItemNo() == 13).findFirst().orElseThrow().getId();
         var c = cases.create(new CaseService.CaseCreateReq(null, cause, "NORMAL", "NOTICE-" + System.nanoTime(),

@@ -39,6 +39,7 @@ public class FormalizationController {
     private final BureauConfig config;
     private final JdbcTemplate jdbc;
     private final cn.ybcase.bureau.service.CaseService caseService;
+    private final cn.ybcase.bureau.service.ProcedureService procedureService;
     private final cn.ybcase.bureau.service.DocumentService documentService;
     private final cn.ybcase.bureau.service.EvidenceCatalogService evidenceCatalogService;
     private final cn.ybcase.bureau.service.SourceAttachmentAccess sourceAccess;
@@ -153,6 +154,14 @@ public class FormalizationController {
         return R.ok(approvalService.byCase(caseId));
     }
 
+    @PostMapping("/approvals/{id}/withdraw")
+    @PreAuthorize("hasAnyRole('HANDLER','LEADER','ADMIN')")
+    public R<Void> withdrawApproval(@PathVariable long id, @RequestBody Map<String, Object> body, Authentication auth) {
+        approvalService.withdraw(id, body == null || !(body.get("reason") instanceof String value) ? null : value,
+                auth.getName());
+        return R.ok();
+    }
+
     @PreAuthorize("hasAnyRole('LEADER','ADMIN')")
     @PostMapping("/approvals/{id}/decide")
     public R<Map<String, Object>> decide(@PathVariable long id, @RequestBody Map<String, Object> body,
@@ -227,12 +236,13 @@ public class FormalizationController {
         if (caseExists == null || caseExists == 0) throw new BizException(2043, "案件不存在");
         Long documentId = deliveryDocumentId(body.get("documentId"));
         boolean decisionDocument = "DECISION".equals(body.get("docKind"));
+        String documentType = null;
         if (documentId != null) {
             Integer own = jdbc.queryForObject(
                     "select count(*) from case_document where id = ? and case_id = ?", Integer.class, documentId, caseId);
             if (own == null || own == 0) throw new BizException(2041, "所选文书不属于本案");
-            decisionDocument |= "DECISION".equals(jdbc.queryForObject(
-                    "select doc_type from case_document where id=? and case_id=?", String.class, documentId, caseId));
+            documentType = jdbc.queryForObject("select doc_type from case_document where id=? and case_id=?", String.class, documentId, caseId);
+            decisionDocument |= "DECISION".equals(documentType);
         }
         if (decisionDocument && Boolean.TRUE.equals(jdbc.queryForObject(
                 "select exists(select 1 from case_effective_decisions(current_date,clock_timestamp()) where case_id=? and version_id is not null)",Boolean.class,caseId)))
@@ -247,6 +257,18 @@ public class FormalizationController {
                 throw new BizException(2054, "当事人未签订电子送达确认书（第59条）");
         }
         Long noticeId = deliveryDocumentId(body.get("noticeId"));
+        Long hearingNoticeVersionId = deliveryDocumentId(body.get("hearingNoticeVersionId"));
+        if (hearingNoticeVersionId != null) {
+            if (noticeId != null || !"HEARING_NOTICE".equals(body.get("docKind")))
+                throw new BizException(2041, "请为当前听证通知登记对应告知版本的实际送达回证");
+            procedureService.recordHearingNoticeDelivery(caseId, hearingNoticeVersionId, documentId, method,
+                    reqDate(body, "deliveredAt", "实际送达日期"),
+                    deliveryText(body, "receiver", null, "受送达人", 64, true),
+                    deliveryText(body, "receiptNo", null, "回证编号", 64, true),
+                    optDate(body, "receiptSignedAt", "回证签收日期"),
+                    deliveryText(body, "note", null, "送达备注", 255, false));
+            return R.ok();
+        }
         if (noticeId != null) {
             if (documentId != null || !"NOTICE".equals(body.get("docKind")))
                 throw new BizException(2041, "请从当前告知记录登记对应版本的送达回证");
@@ -258,6 +280,11 @@ public class FormalizationController {
                     deliveryText(body, "note", null, "送达备注", 255, false));
             return R.ok();
         }
+        if (("NOTICE".equals(body.get("docKind")) || "NOTICE".equals(documentType))
+                && Boolean.TRUE.equals(jdbc.queryForObject("""
+                select coalesce((select delivery_required from case_notice where case_id=? order by id desc limit 1),false)
+                """,Boolean.class,caseId)))
+            throw new BizException(2041, "请从当前告知版本登记纸质回证，或由认证电子回执登记");
         jdbc.update("""
                 insert into case_delivery (case_id, method, delivered_at, receiver, note, receipt_no,
                                            receipt_signed_at, doc_kind, document_id)

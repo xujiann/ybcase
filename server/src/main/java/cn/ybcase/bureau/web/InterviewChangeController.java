@@ -15,8 +15,8 @@ public class InterviewChangeController {
  private final InterviewChangeService changes;
  public record Review(Boolean approve,String opinion){}
  public record Cancel(String opinion){}
- @GetMapping("/records") public R<Map<String,Object>> records(@RequestParam(defaultValue="1") int page,@RequestParam(defaultValue="20") int size,Authentication a){return R.ok(changes.records(a.getName(),page,size));}
- @GetMapping("/pending") public R<Map<String,Object>> pending(@RequestParam(defaultValue="1") int page,@RequestParam(defaultValue="20") int size,Authentication a){return R.ok(changes.pending(a.getName(),page,size));}
+ @GetMapping("/records") public R<Map<String,Object>> records(@RequestParam(defaultValue="1") int page,@RequestParam(defaultValue="20") int size,@RequestParam(required=false) Long focus,Authentication a){return R.ok(changes.records(a.getName(),page,size,focus));}
+ @GetMapping("/pending") public R<Map<String,Object>> pending(@RequestParam(defaultValue="1") int page,@RequestParam(defaultValue="20") int size,@RequestParam(required=false) Long focus,Authentication a){return R.ok(changes.pending(a.getName(),page,size,focus));}
  @GetMapping("/{id}") public R<List<Map<String,Object>>> history(@PathVariable long id,Authentication a){return R.ok(changes.history(id,a.getName()));}
  @PostMapping("/{id}") public R<Map<String,Long>> request(@PathVariable long id,@RequestBody InterviewChangeService.Request b,Authentication a){return R.ok(Map.of("id",changes.request(id,b,a.getName())));}
  @PostMapping("/requests/{id}/review") public R<Void> review(@PathVariable long id,@RequestBody Review b,Authentication a){
