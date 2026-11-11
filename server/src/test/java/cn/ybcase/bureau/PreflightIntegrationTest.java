@@ -155,7 +155,7 @@ class PreflightIntegrationTest {
     @Test void deliveredPunishmentMustBePaidBeforeReadyAndPreflightNeverWritesCloseReport() {
         var c = noticed(new BigDecimal("100"), true);
         cases.decide(c.getId(), decision(new BigDecimal("100"), "一般情形"));
-        cases.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "法人", null, null, null));
+        cases.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "法人", null, "TEST-RECEIPT", null));
         var unpaid = state(c.getId());
         var blocked = preflight(c.getId(), "CLOSE", null, "执行完毕结案报告");
         assertEquals(false, blocked.get("ready"));

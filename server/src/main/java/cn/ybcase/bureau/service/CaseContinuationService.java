@@ -255,9 +255,9 @@ public class CaseContinuationService {
                     BigDecimal limit=jdbc.queryForObject("select cfg_value::numeric from sys_config where cfg_key='onsite_collect_limit'",BigDecimal.class);
                     if (limit==null || amount.compareTo(limit)>0) throw invalid("当场收缴超出已配置限额");
                 }
-                // The current effective obligation also caps a historical correction. Existing excess is visible, never hidden.
-                BigDecimal cap=cap(effectiveDecision(caseId,today()),kind);
-                if (cap.signum()<=0 || total(caseId,kind).add(amount).compareTo(cap)>0) throw invalid("续记后累计金额超出当前有效决定；请先核实冲正或决定结果");
+                BigDecimal cap=cap(decision,kind);
+                if (cap.signum()<=0 || exceedsExecutionCap(caseId,kind,paid,amount))
+                    throw invalid("续记后累计金额超出对应日期有效决定额度；请先核实到账、退付或决定结果");
                 if ("LATE_FEE".equals(kind)) {
                     BigDecimal assessed=money(p.get("assessedLateFeeAmount"),true);
                     text(p.get("assessmentReference"),2000,"人工核定文号及按日核算依据");
@@ -265,7 +265,7 @@ public class CaseContinuationService {
                     if (delivered == null || !paid.isAfter(delivered.date()))
                         throw invalid("加处罚款续记须有到账当日有效决定的送达事实并核实实际缴款日期");
                     if (assessed.compareTo(cap)>0 || total(caseId,kind).add(amount).compareTo(assessed)>0)
-                        throw invalid("加处罚款累计净额不得超过人工核定总额及当前有效罚款本金");
+                        throw invalid("加处罚款累计净额不得超过人工核定总额及到账日有效罚款本金");
                 }
             }
             case "REVERSAL" -> {
@@ -536,7 +536,37 @@ public class CaseContinuationService {
     }
     private BigDecimal cap(Map<String,Object> d,String kind) {
         if (d.isEmpty() || !"PUNISH".equals(d.get("decision_type"))) return BigDecimal.ZERO;
-        return (BigDecimal)d.get(switch(kind) {case "FINE","LATE_FEE"->"fine_amount";case "RECOUP"->"recoup_amount";default->"confiscate_amount";});
+        return (BigDecimal)d.get(obligationColumn(kind));
+    }
+    private static String obligationColumn(String kind) {
+        return switch(kind) {case "FINE","LATE_FEE"->"fine_amount";case "RECOUP"->"recoup_amount";default->"confiscate_amount";};
+    }
+    private boolean exceedsExecutionCap(long caseId,String kind,LocalDate paid,BigDecimal amount) {
+        // Check every affected balance. Later refunds cannot erase an earlier excess,
+        // while a later reduction never prevents recording a payment lawful when made.
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                with ledger as (
+                    select paid_at,sum(amount) amount from case_effective_executions(?,clock_timestamp())
+                    where case_id=? and kind=? group by paid_at
+                ), days as (
+                    select cast(? as date) as balance_day union select cast(? as date)
+                    union select paid_at from ledger where paid_at>=?
+                    union select v.effective_at from case_decision_version v
+                    join case_continuation_request r on r.id=v.request_id and r.status='APPROVED'
+                    where v.case_id=? and v.effective_at between ? and ? and r.reviewed_at<=clock_timestamp()
+                ), balances as (
+                    select days.balance_day,
+                        coalesce((select sum(amount) from ledger where paid_at<?),0)
+                            + sum(coalesce(ledger.amount,0)) over(order by days.balance_day) as paid_total,
+                        case when d.decision_type='PUNISH' then d.%s else 0 end as obligation
+                    from days left join ledger on ledger.paid_at=days.balance_day
+                    left join lateral case_effective_decisions(days.balance_day,clock_timestamp()) d on d.case_id=?
+                ), limits as (
+                    select paid_total,max(obligation) over(order by balance_day) as obligation from balances
+                )
+                select exists(select 1 from limits where paid_total+?>obligation)
+                """.formatted(obligationColumn(kind)),Boolean.class,today(),caseId,kind,paid,today(),paid,
+                caseId,paid,today(),paid,caseId,amount));
     }
     private BigDecimal total(long id,String kind) { return jdbc.queryForObject("select coalesce(sum(amount),0) from case_effective_executions(?,clock_timestamp()) where case_id=? and kind=?",BigDecimal.class,today(),id,kind); }
     private List<Map<String,Object>> courtRounds(long id) {

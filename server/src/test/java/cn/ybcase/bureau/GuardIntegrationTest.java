@@ -303,7 +303,7 @@ class GuardIntegrationTest {
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("5000"),
                 BigDecimal.ZERO, null, null, "罚款5000", null, "一般情形"));
         caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
-                java.time.LocalDate.now(), "当事人", null, null, null));
+                java.time.LocalDate.now(), "当事人", null, "TEST-RECEIPT", null));
         executionService.approveDefer(c.getId());
         oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
                 .InstallmentReq(1, java.time.LocalDate.now(), new BigDecimal("2500"), "FINE"));
@@ -339,7 +339,7 @@ class GuardIntegrationTest {
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", BigDecimal.ZERO,
                 new BigDecimal("6000"), null, null, "责令退回基金6000", null, "一般情形"));
         caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
-                java.time.LocalDate.now(), "当事人", null, null, null));
+                java.time.LocalDate.now(), "当事人", null, "TEST-RECEIPT", null));
         executionService.approveDefer(c.getId());
         oversightService.addInstallment(c.getId(), new cn.ybcase.bureau.service.OversightService
                 .InstallmentReq(1, java.time.LocalDate.now(), new BigDecimal("6000"), "RECOUP"));
@@ -390,7 +390,7 @@ class GuardIntegrationTest {
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("1500"),
                 BigDecimal.ZERO, null, null, "罚款1500", null, "一般情形"));
         caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
-                java.time.LocalDate.now(), "当事人", null, null, null));
+                java.time.LocalDate.now(), "当事人", null, "TEST-RECEIPT", null));
 
         var catalog = documentService.archiveCatalog(c.getId());
         @SuppressWarnings("unchecked")
@@ -436,7 +436,7 @@ class GuardIntegrationTest {
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("5000"),
                 BigDecimal.ZERO, null, null, "罚款5000", null, "一般情形"));   // 未经法制审核即可决定
         caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT",
-                java.time.LocalDate.now(), "当事人", null, null, null));
+                java.time.LocalDate.now(), "当事人", null, "TEST-RECEIPT", null));
 
         @SuppressWarnings("unchecked")
         var missing = (java.util.List<String>) documentService.archiveCatalog(c.getId()).get("missing");

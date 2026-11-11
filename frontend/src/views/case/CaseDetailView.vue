@@ -145,7 +145,7 @@
         </template>
         <template v-if="c.status === 'REPORTED'">
           <el-button v-if="canWriteCase" type="primary" @click="openNotice">处罚告知</el-button>
-          <el-button v-if="canWriteCase" @click="onSubmitReview">提交法制审核</el-button>
+          <el-button v-if="canWriteCase" :loading="submittingReview" :disabled="submittingReview" @click="onSubmitReview">提交法制审核</el-button>
           <el-button v-if="canWriteCase && (isLeader)" @click="onExtendCase">延长期限</el-button>
           <el-button v-else-if="canWriteCase" @click="dlg.apply = true">申请延期</el-button>
         </template>
@@ -154,7 +154,7 @@
           <el-button v-if="canWriteCase && currentNotice?.deliveryRequired && !currentNoticeReceipt" type="primary" @click="onDeliverNotice">登记告知回证</el-button>
           <el-button v-if="isLeader" type="primary" @click="openDecide">作出决定</el-button>
           <el-button v-if="canWriteCase" :disabled="currentNotice?.deliveryRequired && !currentNoticeReceipt" @click="openStatement">陈述申辩/听证</el-button>
-          <el-button v-if="canWriteCase" @click="onSubmitReview">提交法制审核</el-button>
+          <el-button v-if="canWriteCase" :loading="submittingReview" :disabled="submittingReview" @click="onSubmitReview">提交法制审核</el-button>
           <el-button v-if="canWriteCase && (isLeader)" @click="onExtendCase">延长期限</el-button>
           <el-button v-else-if="canWriteCase" @click="dlg.apply = true">申请延期</el-button>
         </template>
@@ -918,7 +918,7 @@
             <el-option v-for="(v, k) in DELIVERY_METHOD" :key="k" :label="v" :value="k" />
           </el-select>
         </el-form-item>
-        <el-form-item label="送达日期">
+        <el-form-item :label="deliveryForm.method === 'ANNOUNCE' ? '公告日期' : '送达日期'">
           <el-date-picker v-model="deliveryForm.deliveredAt" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
         </el-form-item>
         <el-form-item label="受送达人"><el-input v-model="deliveryForm.receiver" /></el-form-item>
@@ -930,7 +930,7 @@
       </el-form>
       <template #footer>
         <el-button @click="dlg.deliver = false">取消</el-button>
-        <el-button v-if="canWriteCase" type="primary" @click="onDeliver">登记</el-button>
+        <el-button v-if="canWriteCase" type="primary" :loading="deliveringCase" :disabled="deliveringCase" @click="onDeliver">登记</el-button>
       </template>
     </el-dialog>
 
@@ -1881,6 +1881,8 @@ async function checkTreasuryReceipt(executionId: number) {
 }
 
 const submitting = ref(false)
+const submittingReview = ref(false)
+const deliveringCase = ref(false)
 async function submit(path: string, body: any, dlgKey: string) {
   if (!canWriteCase.value) return
   if (path === 'evidences' && !canEditActive.value) return
@@ -2072,12 +2074,19 @@ async function onReport() {
 }
 
 async function onSubmitReview() {
-  if (!canWriteCase.value) return
-  const { value } = await ElMessageBox.prompt('审核触发情形（第37条：罚款数额较大/听证案件/疑难复杂/重大公共利益等）', '提交法制审核', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  if (!canWriteCase.value) return
-  await client.post(`/bureau/cases/${id.value}/reviews`, { requiredReason: value })
-  ElMessage.success('已提交法制审核（10个工作日内审核完毕）')
-  load()
+  if (!canWriteCase.value || submittingReview.value) return
+  const context = captureMaterialContext(), token = auth.token
+  submittingReview.value = true
+  try {
+    const { value } = await ElMessageBox.prompt('审核触发情形（第37条：罚款数额较大/听证案件/疑难复杂/重大公共利益等）', '提交法制审核', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+    if (!materialContextCurrent(context) || token !== auth.token || !canWriteCase.value) return
+    await client.post(`/bureau/cases/${context.caseId}/reviews`, { requiredReason: value })
+    if (!materialContextCurrent(context) || token !== auth.token) return
+    ElMessage.success('已提交法制审核（10个工作日内审核完毕）')
+    await load()
+  } catch {
+    // Cancelled prompts and request failures leave the existing application available.
+  } finally { submittingReview.value = false }
 }
 
 function openReviewDialog(row: any) {
@@ -2200,11 +2209,29 @@ async function onDecide() {
 }
 
 async function onDeliver() {
-  if (!canWriteCase.value) return
-  await client.post(`/bureau/cases/${id.value}/deliver`, deliveryForm)
-  ElMessage.success('已送达')
-  dlg.deliver = false
-  load()
+  if (!canWriteCase.value || deliveringCase.value || !dlg.deliver) return
+  const payload = { ...deliveryForm }
+  const actualDate = payload.method === 'ANNOUNCE' ? payload.deliveredAt : payload.receiptSignedAt || payload.deliveredAt
+  if (!actualDate || !payload.receiver.trim() || !payload.receiptNo.trim()) {
+    ElMessage.warning('请填写实际送达或公告日期、受送达人和回证编号')
+    return
+  }
+  const decidedAt = detail.value.decision?.decidedAt || c.value.decidedAt
+  if (!decidedAt || actualDate < decidedAt || actualDate > todayLocal()) {
+    ElMessage.warning('实际送达或公告日期须在处理决定日与今天之间')
+    return
+  }
+  const context = captureMaterialContext(), token = auth.token
+  deliveringCase.value = true
+  try {
+    await client.post(`/bureau/cases/${context.caseId}/deliver`, payload)
+    if (!materialContextCurrent(context) || token !== auth.token) return
+    ElMessage.success('已送达')
+    dlg.deliver = false
+    await load()
+  } catch {
+    // Preserve the entered receipt for correction or an explicit retry.
+  } finally { deliveringCase.value = false }
 }
 
 async function onLateFee() {

@@ -92,7 +92,7 @@ class AuditFixIntegrationTest {
         CaseFile c = noticed(new BigDecimal("100"), BigDecimal.ZERO);
         decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("100"), BigDecimal.ZERO,
             BigDecimal.ZERO, null, "罚款100元", null, "一般情形"));
-        cases.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "当事人", null, null, null));
+        cases.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "当事人", null, "TEST-RECEIPT", null));
         return cases.get(c.getId());
     }
     void rejected(int code, org.junit.jupiter.api.function.Executable action) {

@@ -196,7 +196,7 @@ class OpsIntegrationTest {
         caseService.recordStatement(c.getId(), new CaseService.StatementReq(null, null, null, null, true));
         caseService.decide(c.getId(), new CaseService.DecisionReq("PUNISH", new BigDecimal("5000"),
                 BigDecimal.ZERO, null, null, "罚款5000", null, "一般情形"));
-        caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "当事人", null, null, null));
+        caseService.deliver(c.getId(), new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "当事人", null, "TEST-RECEIPT", null));
         caseService.publish(c.getId());
         return c;
     }

@@ -47,6 +47,7 @@ public class CaseService {
     private final MaterialAccess materialAccess;
     private final MessageService messageService;
     private final CaseFactService factHistory;
+    private final RuntimePolicy runtimePolicy;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
     private final jakarta.persistence.EntityManager entityManager;
 
@@ -820,6 +821,12 @@ public class CaseService {
         CaseFile c = get(caseId);
         if (!List.of("REPORTED", "NOTIFIED").contains(c.getStatus()))
             throw new BizException(2036, "法制审核在调查终结后、作出决定前进行（第37条）");
+        var material = reviewMaterials.capture(caseId);
+        var pending = reviewRepository.findTopByCaseIdOrderByIdDesc(caseId);
+        if (pending.isPresent() && pending.get().getReviewedAt() == null
+                && java.util.Objects.equals(requiredReason, pending.get().getRequiredReason())
+                && material.fingerprint().equals(pending.get().getMaterialFingerprint()))
+            return pending.get();
         CaseReview r = new CaseReview();
         r.setCaseId(caseId);
         r.setRequiredReason(requiredReason);
@@ -827,7 +834,6 @@ public class CaseService {
         // 国家第40条：10个工作日；辽41条：7日+3——参数化
         r.setDeadlineAt(config.plusByUnit(LocalDate.now(),
                 config.intVal("legal_review_days", 10), "legal_review_day_unit"));
-        var material = reviewMaterials.capture(caseId);
         r.setMaterialSnapshot(material.json());
         r.setMaterialFingerprint(material.fingerprint());
         return reviewRepository.save(r);
@@ -1442,7 +1448,8 @@ public class CaseService {
             throw new BizException(2193,"本案已有当前生效的独立决定版本，不得继续登记原决定送达；请办理具体后续版本文书送达");
         CaseFile c = get(caseId);
         if (!"DECIDED".equals(c.getStatus())) throw new BizException(2041, "仅已决定的案件可登记送达（第59条）");
-        if (!List.of("DIRECT", "MAIL", "LEFT", "ELECTRONIC", "ANNOUNCE").contains(req.method()))
+        if (req == null || req.method() == null
+                || !List.of("DIRECT", "MAIL", "LEFT", "ELECTRONIC", "ANNOUNCE").contains(req.method()))
             throw new BizException(2041, "送达方式须为 直接/邮寄/留置/电子/公告 之一");
         // 辽61条：行政处罚决定书不得电子送达（国家局令59条允许但须签确认书——参数开关）
         if ("ELECTRONIC".equals(req.method()) && !config.bool("delivery_electronic_decision_allowed", true))
@@ -1450,20 +1457,24 @@ public class CaseService {
         // 第59条：电子送达以当事人同意并签订确认书为前提
         if ("ELECTRONIC".equals(req.method()) && !Boolean.TRUE.equals(c.getEDeliveryConsent()))
             throw new BizException(2054, "当事人未签订电子送达确认书，不得电子送达（第59条）");
+        if ("ELECTRONIC".equals(req.method()) && runtimePolicy.isFormal())
+            throw new BizException(2193, "正式模式须通过电子送达回证流程核验正式签章和原始回证后登记送达");
+        if (req.receiver() == null || req.receiver().isBlank() || req.receiver().length() > 64
+                || req.receiptNo() == null || req.receiptNo().isBlank() || req.receiptNo().length() > 64)
+            throw new BizException(2041, "须填写受送达人及有效回证编号（均不超过64字）");
         // 辽58条：送达回证签收日期为送达日期；辽60条：公告送达自公告之日起满60日视为送达
-        LocalDate deliveredAt;
-        if ("ANNOUNCE".equals(req.method())) {
-            LocalDate announceDate = req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now();
-            deliveredAt = announceDate.plusDays(config.intVal("announce_deliver_days", 60));
-        } else {
-            deliveredAt = req.receiptSignedAt() != null ? req.receiptSignedAt()
-                    : (req.deliveredAt() != null ? req.deliveredAt() : LocalDate.now());
-        }
+        LocalDate actualDate = "ANNOUNCE".equals(req.method()) ? req.deliveredAt()
+                : req.receiptSignedAt() != null ? req.receiptSignedAt() : req.deliveredAt();
+        if (actualDate == null || c.getDecidedAt() == null || actualDate.isBefore(c.getDecidedAt())
+                || actualDate.isAfter(LocalDate.now()))
+            throw new BizException(2041, "须填写实际送达或公告日期，日期须在原处理决定日与今天之间");
+        LocalDate deliveredAt = "ANNOUNCE".equals(req.method())
+                ? actualDate.plusDays(config.intVal("announce_deliver_days", 60)) : actualDate;
         jdbc.update("""
                 insert into case_delivery (case_id, method, delivered_at, receiver, note, receipt_no, receipt_signed_at)
                 values (?,?,?,?,?,?,?)""",
-                caseId, req.method(), deliveredAt, req.receiver(), req.note(),
-                req.receiptNo(), req.receiptSignedAt());
+                caseId, req.method(), deliveredAt, req.receiver().strip(), req.note(),
+                req.receiptNo().strip(), req.receiptSignedAt());
         c.setStatus("DELIVERED");
         c.setDeliveredAt(deliveredAt);
         return caseRepository.save(c);

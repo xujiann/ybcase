@@ -200,6 +200,93 @@ class CaseContinuationIntegrationTest {
         review(legal,id,req,false,0);
     }
 
+    @Test void lateRecordedPaymentUsesItsEffectiveDecisionAndKeepsRefundSourceReview() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");
+        long id=caseFile(owner,"CLOSED");String original=original(id);
+        approveResult(owner,legal,id,"REVOKE","REVOKED","0");
+        write(owner,path(id)+"/requests",request("REFUND",Map.of("source","CONTINUATION","sourceId",Long.MAX_VALUE,
+                "paidAt",LocalDate.now().toString(),"receiptNo","missing-"+UUID.randomUUID(),"amount",40)),2193);
+        long payment=write(owner,path(id)+"/requests",request("EXECUTION",payment("40",LocalDate.now().minusDays(6))),0).path("id").asLong();
+        assertEquals(0,count("case_execution_continuation",id));
+        review(owner,id,payment,true,403);review(legal,id,payment,true,0);
+        assertEquals(0,new BigDecimal("40").compareTo(sum(id,LocalDate.now().minusDays(6))));
+        assertEquals(-40,read(owner,path(id),0).path("balances").path("FINE").path("remaining").asInt());
+        write(owner,path(id)+"/requests",request("EXECUTION",payment("1",LocalDate.now())),2193);
+        long source=jdbc.queryForObject("select id from case_execution_continuation where request_id=?",Long.class,payment);
+        var refund=new LinkedHashMap<String,Object>(Map.of("source","CONTINUATION","sourceId",source,
+                "paidAt",LocalDate.now().toString(),"receiptNo","late-refund-"+UUID.randomUUID(),"amount",41));
+        write(owner,path(id)+"/requests",request("REFUND",refund),2193);
+        refund.put("amount",40);
+        long refundRequest=write(owner,path(id)+"/requests",request("REFUND",refund),0).path("id").asLong();
+        assertEquals(0,new BigDecimal("40").compareTo(sum(id,LocalDate.now())));
+        review(legal,id,refundRequest,true,0);
+        assertEquals(0,sum(id,LocalDate.now()).signum());assertEquals(original,original(id));
+    }
+
+    @Test void laterHigherDecisionCannotAuthorizeAnEarlierExcessPayment() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");long id=caseFile(owner,"CLOSED");
+        approveResult(owner,legal,id,"CHANGE","PUNISH","200");
+        write(owner,path(id)+"/requests",request("EXECUTION",payment("101",LocalDate.now().minusDays(6))),2193);
+        jdbc.update("insert into case_execution(case_id,kind,amount,paid_at,method) values(?,'FINE',100,current_date-1,'BANK')",id);
+        long payment=write(owner,path(id)+"/requests",request("EXECUTION",payment("50",LocalDate.now().minusDays(6))),0).path("id").asLong();
+        review(legal,id,payment,true,0);
+        assertEquals(0,new BigDecimal("150").compareTo(sum(id,LocalDate.now())));
+    }
+
+    @Test void historicalDateCannotReuseCapacityFreedByALaterRefund() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");long id=caseFile(owner,"CLOSED");
+        long source=jdbc.queryForObject("insert into case_execution(case_id,kind,amount,paid_at,method) values(?,'FINE',100,current_date-4,'BANK') returning id",Long.class,id);
+        long refund=write(owner,path(id)+"/requests",request("REFUND",Map.of("source","ORIGINAL","sourceId",source,
+                "paidAt",LocalDate.now().minusDays(1).toString(),"receiptNo","capacity-refund-"+UUID.randomUUID(),"amount",100)),0).path("id").asLong();
+        review(legal,id,refund,true,0);assertEquals(0,sum(id,LocalDate.now()).signum());
+        write(owner,path(id)+"/requests",request("EXECUTION",payment("1",LocalDate.now().minusDays(6))),2193);
+    }
+
+    @Test void interveningHigherDecisionRetainsItsLawfulCollectionCapacityAfterReduction() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");long id=caseFile(owner,"CLOSED");
+        approveResultAt(owner,legal,id,"CHANGE","PUNISH","200",LocalDate.now().minusDays(8),LocalDate.now().minusDays(6));
+        approveResultAt(owner,legal,id,"CHANGE","PUNISH","50",LocalDate.now().minusDays(4),LocalDate.now().minusDays(2));
+        jdbc.update("insert into case_execution(case_id,kind,amount,paid_at,method) values(?,'FINE',120,current_date-5,'BANK')",id);
+        String original=original(id);
+        long request=write(owner,path(id)+"/requests",request("EXECUTION",payment("60",LocalDate.now().minusDays(9))),0).path("id").asLong();
+        review(legal,id,request,true,0);
+        assertEquals(0,new BigDecimal("60").compareTo(sum(id,LocalDate.now().minusDays(9))));
+        assertEquals(0,new BigDecimal("180").compareTo(sum(id,LocalDate.now())));
+        assertEquals(-130,read(owner,path(id),0).path("balances").path("FINE").path("remaining").asInt());
+        assertEquals(original,original(id));
+    }
+
+    @Test void allMonetaryKindsCanRecordLawfulHistoricalPaymentsAfterRevocation() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");
+        for(String kind:List.of("FINE","RECOUP","CONFISCATE","LATE_FEE")) {
+            long id=caseFile(owner,"CLOSED");String original=original(id);
+            approveResult(owner,legal,id,"REVOKE","REVOKED","0");
+            var payload=payment("5",LocalDate.now().minusDays(6));payload.put("kind",kind);
+            if("LATE_FEE".equals(kind)) {
+                payload.put("assessedLateFeeAmount",20);payload.put("assessmentReference","原决定按日核定材料");
+            }
+            long request=write(owner,path(id)+"/requests",request("EXECUTION",payload),0).path("id").asLong();
+            review(legal,id,request,true,0);
+            assertEquals(0,new BigDecimal("5").compareTo(jdbc.queryForObject(
+                    "select sum(amount) from case_effective_executions(current_date) where case_id=? and kind=?",BigDecimal.class,id,kind)));
+            assertEquals(original,original(id));
+        }
+    }
+
+    private void approveResult(Actor owner,Actor legal,long id,String outcome,String decision,String fine) throws Exception {
+        approveResultAt(owner,legal,id,outcome,decision,fine,LocalDate.now().minusDays(5),LocalDate.now().minusDays(2));
+    }
+    private void approveResultAt(Actor owner,Actor legal,long id,String outcome,String decision,String fine,
+                                 LocalDate accepted,LocalDate effective) throws Exception {
+        var intake=new LinkedHashMap<String,Object>(remedy());intake.put("acceptedAt",accepted.toString());
+        long remedy=write(owner,path(id)+"/remedies",intake,0).path("id").asLong();
+        var payload=result(remedy,outcome,decision,fine);
+        payload.put("effectiveAt",effective.toString());
+        if("REVOKE".equals(outcome)){payload.put("recoupAmount",0);payload.put("confiscateAmount",0);}
+        long request=write(owner,path(id)+"/requests",request("REMEDY_RESULT",payload),0).path("id").asLong();
+        review(legal,id,request,true,0);
+    }
+
     @Test void explicitCloseUsesReviewedVersionNetExecutionAndBlocksUnfinishedRemedy() throws Exception {
         var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");var leader=actor("BUREAU","LEADER");
         long id=caseFile(owner,"DELIVERED");

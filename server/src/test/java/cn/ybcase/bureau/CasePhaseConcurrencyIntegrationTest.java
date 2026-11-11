@@ -121,7 +121,7 @@ class CasePhaseConcurrencyIntegrationTest {
         if (EnumSet.of(Kind.DELIVER, Kind.PUBLISH, Kind.GOV_RECORD, Kind.CLOSE).contains(kind))
             cases.decide(id, decision(kind == Kind.CLOSE ? "NO_PUNISH" : "PUNISH"));
         if (kind == Kind.PUBLISH || kind == Kind.GOV_RECORD)
-            cases.deliver(id, new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "原受送达人", null, null, null));
+            cases.deliver(id, new CaseService.DeliveryReq("DIRECT", LocalDate.now(), "原受送达人", null, "TEST-RECEIPT", null));
         return switch (kind) {
             case JURISDICTION -> new Probe(id, "PUT", path + "/jurisdiction", Map.of("jurisdiction",
                     Map.of("type", "LOCAL", "basis", "原有管辖事实核实", "violationPlace", "本辖区"), "reason", "核实补录"));
@@ -143,7 +143,7 @@ class CasePhaseConcurrencyIntegrationTest {
             case NOTICE -> new Probe(id, "POST", path + "/notice", Map.of("content", "处罚告知", "proposedFine", 10));
             case STATEMENT -> new Probe(id, "POST", path + "/statement", Map.of("statement", "当事人陈述", "statementReview", "已复核"));
             case MEETING -> new Probe(id, "POST", path + "/meetings", Map.of("attendees", "原参加人员", "record", "原讨论记录", "conclusion", "原结论"));
-            case DELIVER -> new Probe(id, "POST", path + "/deliver", Map.of("method", "DIRECT", "receiver", "法人", "deliveredAt", LocalDate.now().toString()));
+            case DELIVER -> new Probe(id, "POST", path + "/deliver", Map.of("method", "DIRECT", "receiver", "法人", "deliveredAt", LocalDate.now().toString(), "receiptNo", "PHASE-RECEIPT"));
             case PUBLISH -> new Probe(id, "POST", path + "/publish", Map.of());
             case GOV_RECORD -> new Probe(id, "POST", path + "/gov-record", Map.of("recordNo", "阶段回归备案文号"));
             case SUSPEND -> new Probe(id, "POST", path + "/suspend", Map.of("reason", "法定中止情形"));
