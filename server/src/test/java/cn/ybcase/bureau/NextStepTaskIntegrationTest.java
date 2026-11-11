@@ -4,6 +4,8 @@ import cn.ybcase.bureau.common.BizException;
 import cn.ybcase.bureau.service.NextStepTaskService;
 import cn.ybcase.bureau.service.MessageService;
 import cn.ybcase.bureau.service.ReportingSupplementService;
+import cn.ybcase.bureau.service.DepartmentHandoffService;
+import cn.ybcase.bureau.service.SourceAttachmentAccess;
 import cn.ybcase.core.security.JwtService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -15,6 +17,8 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -31,9 +35,12 @@ class NextStepTaskIntegrationTest {
     @Autowired MockMvc mvc;
     @Autowired JwtService jwt;
     @Autowired MessageService messages;
+    @Autowired DepartmentHandoffService handoffs;
+    @Autowired SourceAttachmentAccess sourceAccess;
     private String previousScope;
 
     private record Actor(long id, String name, long department) {}
+    private record ReceivedSource(long sourceId, long handoffId) {}
 
     @AfterEach void restoreScope() {
         if (previousScope != null) jdbc.update("update sys_config set cfg_value=? where cfg_key='case_view_scope'", previousScope);
@@ -81,6 +88,95 @@ class NextStepTaskIntegrationTest {
         jdbc.update("insert into case_officer(case_id,name,cert_no,duty) values(?,'历史参办',?,'MEMBER')",
                 legacyCase, certificate);
         assertTrue(has(tasks.bureau(own.name(), 1, 100), "CASE", legacyCase));
+    }
+
+    @Test void receivedClueReturnsToAssignmentWhenItsCurrentHandlerBecomesIneligible() {
+        assertIneligibleAssigneeReturnsToAssignment("CLUE");
+    }
+
+    @Test void receivedInspectionReturnsToAssignmentWhenItsCurrentHandlerBecomesIneligible() {
+        assertIneligibleAssigneeReturnsToAssignment("INSPECTION");
+    }
+
+    private void assertIneligibleAssigneeReturnsToAssignment(String type) {
+        for(String change:List.of("DISABLED","DEPARTMENT","CATEGORY","ROLE")) {
+            var sender=actor("DISTRICT","LEADER");
+            var leader=actor("DISTRICT","LEADER");
+            var worker=actorAt("DISTRICT","HANDLER",leader.department());
+            var replacement=actorAt("DISTRICT","HANDLER",leader.department());
+            var outsider=actor("DISTRICT","LEADER");
+            var received=receivedSource(type,sender,leader);
+            assign(received,type,worker,leader);
+            assertTrue(canReadSource(type,received.sourceId(),worker.name()));
+            assertFalse(has(tasks.bureau(leader.name(),1,100),"HANDOFF",received.handoffId()));
+            switch(change) {
+                case "DISABLED" -> jdbc.update("update sys_user set enabled=false where id=?",worker.id());
+                case "DEPARTMENT" -> jdbc.update("update sys_user set dept_id=? where id=?",outsider.department(),worker.id());
+                case "CATEGORY" -> jdbc.update("update sys_user set account_category='BUREAU' where id=?",worker.id());
+                case "ROLE" -> jdbc.update("delete from sys_user_role where user_id=?",worker.id());
+            }
+            assertFalse(canReadSource(type,received.sourceId(),worker.name()),change);
+            var pending=tasks.bureau(leader.name(),1,100);
+            var assignment=pending.rows().stream().filter(row->row.taskKey().equals("HANDOFF:"+received.handoffId()+":ASSIGN")).toList();
+            assertEquals(1,assignment.size(),change);
+            assertEquals("/case/department-handoffs?focus="+received.handoffId(),assignment.getFirst().link());
+            assertFalse(has(pending,type,received.sourceId()),"负责人待指派来源只显示现有交接办理入口");
+            assertFalse(has(tasks.bureau(outsider.name(),1,100),"HANDOFF",received.handoffId()));
+            assertFalse(has(tasks.bureau(replacement.name(),1,100),"HANDOFF",received.handoffId()));
+            assertThrows(BizException.class,()->assign(received,type,replacement,outsider));
+            assertThrows(BizException.class,()->assign(received,type,replacement,replacement));
+            assign(received,type,replacement,leader);
+            assertFalse(has(tasks.bureau(leader.name(),1,100),"HANDOFF",received.handoffId()));
+            assertTrue(has(tasks.bureau(replacement.name(),1,100),type,received.sourceId()));
+            assertTrue(canReadSource(type,received.sourceId(),replacement.name()));
+            assertFalse(canReadSource(type,received.sourceId(),worker.name()));
+
+            // Historical valid assignments cannot hide an invalid current assignment.
+            jdbc.update("update sys_user set enabled=true,dept_id=?,account_category='DISTRICT' where id=?",leader.department(),worker.id());
+            FixtureUsers.ensure(jdbc,worker.name(),"HANDLER");
+            jdbc.update("update sys_user set enabled=false where id=?",replacement.id());
+            assertTrue(has(tasks.bureau(leader.name(),1,100),"HANDOFF",received.handoffId()));
+            assign(received,type,worker,leader);
+            assertFalse(has(tasks.bureau(leader.name(),1,100),"HANDOFF",received.handoffId()));
+        }
+    }
+
+    private ReceivedSource receivedSource(String type,Actor sender,Actor leader) {
+        String number=unique();
+        long source;
+        if("CLUE".equals(type)) source=jdbc.queryForObject("""
+                insert into case_clue(clue_no,source,content,suspect_name,suspect_type,received_at,deadline_at,created_by,owner_dept_id)
+                values(?,'TRANSFER','已接收待办','合成机构','PROVIDER',current_date,current_date,?,?) returning id
+                """,Long.class,number,sender.name(),leader.department());
+        else source=jdbc.queryForObject("""
+                insert into inspection(insp_no,object_name,object_type,officers,planned_at,created_by,owner_dept_id)
+                values(?,'合成检查','PROVIDER','甲乙',current_date,?,?) returning id
+                """,Long.class,number,sender.name(),leader.department());
+        String column="CLUE".equals(type)?"clue_id":"inspection_id";
+        long handoff=jdbc.queryForObject("""
+                insert into department_handoff(%s,source_no,from_dept_id,to_dept_id,requested_by,reason,status,decided_by,decided_at,opinion)
+                values(?,?,?,?,?,'合成机构交接','ACCEPTED',?,current_timestamp,'已接收') returning id
+                """.formatted(column),Long.class,source,number,sender.department(),leader.department(),sender.id(),leader.id());
+        return new ReceivedSource(source,handoff);
+    }
+
+    private void assign(ReceivedSource received,String type,Actor worker,Actor leader) {
+        if("CLUE".equals(type)) {
+            var ids=jdbc.queryForList("select id from clue_assignment where handoff_id=? order by id desc limit 1",Long.class,received.handoffId());
+            handoffs.assignClue(received.handoffId(),new DepartmentHandoffService.ClueAssignment(worker.name(),
+                    ids.isEmpty()?null:ids.getFirst(),"核实当前承办人后指派"),leader.name());
+        } else {
+            Long previous=jdbc.queryForObject("select assigned_user_id from inspection where id=?",Long.class,received.sourceId());
+            handoffs.assignInspection(received.handoffId(),new DepartmentHandoffService.InspectionAssignment(worker.name(),
+                    previous,"核实当前承办人后指派"),leader.name());
+        }
+    }
+
+    private boolean canReadSource(String type,long id,String username) {
+        var predicate="CLUE".equals(type)?sourceAccess.clueReadPredicate("s.id",username):sourceAccess.inspectionReadPredicate("s",username);
+        var args=new ArrayList<>(predicate.args());args.add(id);
+        String table="CLUE".equals(type)?"case_clue":"inspection";
+        return Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from "+table+" s where ("+predicate.sql()+") and s.id=?)",Boolean.class,args.toArray()));
     }
 
     @Test void agencyTasksFollowCurrentReceiverCycleAndDisappearWhenActualInterviewRecorded() throws Exception {

@@ -37,7 +37,7 @@ public class ClueService {
 
     // A converted inspection or an already-authorized import passes its captured organization.
     CaseClue create(ClueCreateReq req, String username, Long ownerDeptId) {
-        if (req.content() == null || req.content().isBlank()) throw new BizException(2020, "线索内容不能为空");
+        validateCreate(req);
         LocalDate received = req.receivedAt() != null ? req.receivedAt() : LocalDate.now();
         CaseClue clue = new CaseClue();
         clue.setClueNo("XS" + received.getYear() + String.format("%04d", seq.next("CLUE", received.getYear())));
@@ -102,14 +102,34 @@ public class ClueService {
                                                         String username, Long ownerDeptId) {
         if (rows == null || rows.isEmpty() || rows.size() > 500)
             throw new BizException(2067, "导入清单须为1至500条");
+        var requests = new java.util.ArrayList<ClueCreateReq>(rows.size());
         for (var row : rows) {
-            if (row == null || row.get("content") == null || row.get("content").isBlank())
-                throw new BizException(2020, "每条导入线索须填写内容，整批未导入");
+            if (row == null) throw new BizException(2020, "导入线索不能为空，整批未导入");
+            var request = new ClueCreateReq("MONITOR", row.get("content"), row.get("suspectName"),
+                    row.getOrDefault("suspectType", "PROVIDER"), LocalDate.now(), row.get("handler"));
+            validateCreate(request);
+            requests.add(request);
         }
         var nos = new java.util.ArrayList<String>();
-        for (var row : rows) nos.add(create(new ClueCreateReq("MONITOR", row.get("content"), row.get("suspectName"),
-                row.getOrDefault("suspectType", "PROVIDER"), LocalDate.now(), row.get("handler")), username, ownerDeptId).getClueNo());
+        for (var request : requests) nos.add(create(request, username, ownerDeptId).getClueNo());
         return java.util.Map.of("imported", nos.size(), "clueNos", nos);
+    }
+
+    private static void validateCreate(ClueCreateReq request) {
+        if (request == null) throw new BizException(2020, "须填写线索资料");
+        if (request.source() == null || request.source().isBlank())
+            throw new BizException(2020, "线索来源不能为空");
+        if (request.content() == null || request.content().isBlank())
+            throw new BizException(2020, "线索内容不能为空");
+        if (request.suspectName() == null || request.suspectName().isBlank())
+            throw new BizException(2020, "违法嫌疑人不能为空");
+        if (request.suspectType() == null || request.suspectType().isBlank())
+            throw new BizException(2020, "主体类别不能为空");
+        if (request.source().codePointCount(0, request.source().length()) > 16
+                || request.suspectName().codePointCount(0, request.suspectName().length()) > 128
+                || request.suspectType().codePointCount(0, request.suspectType().length()) > 16
+                || request.handler() != null && request.handler().codePointCount(0, request.handler().length()) > 64)
+            throw new BizException(2020, "来源和主体类别最多16字，违法嫌疑人最多128字，承办人员最多64字");
     }
 
     /** 核查期限扣除（辽15条：鉴定、检验时间不计入核查期限） */

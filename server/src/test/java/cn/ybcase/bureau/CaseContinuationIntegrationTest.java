@@ -122,6 +122,88 @@ class CaseContinuationIntegrationTest {
         assertEquals(original,original(id));
     }
 
+    @Test void refundSourcesDatesAmountsAndDuplicateReceiptsKeepTheOriginalLedgerConsistent() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");
+        long id=caseFile(owner,"CLOSED"),other=caseFile(owner,"CLOSED");
+        long source=jdbc.queryForObject("insert into case_execution(case_id,kind,amount,paid_at,method,receipt_no) values(?,'FINE',40,current_date-4,'BANK',?) returning id",Long.class,id,"original-"+UUID.randomUUID());
+        long foreign=jdbc.queryForObject("insert into case_execution(case_id,kind,amount,paid_at,method,receipt_no) values(?,'RECOUP',40,current_date-4,'BANK',?) returning id",Long.class,other,"foreign-"+UUID.randomUUID());
+        var valid=new LinkedHashMap<String,Object>(Map.of("source","ORIGINAL","sourceId",source,
+                "paidAt",LocalDate.now().minusDays(1).toString(),"receiptNo","refund-"+UUID.randomUUID(),"amount",new BigDecimal("10")));
+        for(LocalDate invalidDay:List.of(LocalDate.now().minusDays(5),LocalDate.now().plusDays(1))) {
+            var payload=new LinkedHashMap<>(valid);payload.put("paidAt",invalidDay.toString());
+            write(owner,path(id)+"/requests",request("REFUND",payload),2193);
+        }
+        for(BigDecimal invalidAmount:List.of(BigDecimal.ZERO,new BigDecimal("-1"),new BigDecimal("0.001"))) {
+            var payload=new LinkedHashMap<>(valid);payload.put("amount",invalidAmount);
+            write(owner,path(id)+"/requests",request("REFUND",payload),2140);
+        }
+        var excess=new LinkedHashMap<>(valid);excess.put("amount",new BigDecimal("40.01"));
+        write(owner,path(id)+"/requests",request("REFUND",excess),2193);
+        var foreignSource=new LinkedHashMap<>(valid);foreignSource.put("sourceId",foreign);
+        write(owner,path(id)+"/requests",request("REFUND",foreignSource),2193);
+        var changedKind=new LinkedHashMap<>(valid);changedKind.put("kind","RECOUP");
+        write(owner,path(id)+"/requests",request("REFUND",changedKind),2193);
+        assertEquals(0,count("case_execution_continuation",id));
+        var body=request("REFUND",valid);
+        long refund=write(owner,path(id)+"/requests",body,0).path("id").asLong();
+        review(legal,id,refund,true,0);
+        assertEquals(refund,write(owner,path(id)+"/requests",body,0).path("id").asLong());
+        assertEquals("FINE",jdbc.queryForObject("select kind from case_execution_continuation where request_id=?",String.class,refund));
+        var reversal=new LinkedHashMap<>(valid);reversal.remove("amount");reversal.put("receiptNo","reverse-"+UUID.randomUUID());
+        write(owner,path(id)+"/requests",request("REVERSAL",reversal),2193);
+        write(owner,path(id)+"/requests",request("REFUND",valid),2193);
+        var remainder=new LinkedHashMap<>(valid);remainder.put("receiptNo","refund-rest-"+UUID.randomUUID());remainder.put("amount",new BigDecimal("30"));
+        long rest=write(owner,path(id)+"/requests",request("REFUND",remainder),0).path("id").asLong();
+        review(legal,id,rest,true,0);
+        assertEquals(0,sum(id,LocalDate.now()).signum());
+        var more=new LinkedHashMap<>(valid);more.put("receiptNo","refund-over-"+UUID.randomUUID());more.put("amount",new BigDecimal("0.01"));
+        write(owner,path(id)+"/requests",request("REFUND",more),2193);
+        assertEquals(2,count("case_execution_continuation",id));
+        assertEquals(1,jdbc.queryForObject("select count(*) from case_execution where case_id=? and id=? and amount=40",Integer.class,id,source));
+    }
+
+    @Test void reversedContinuationCannotBeRefundedAndNegativeEntriesCannotBecomeSources() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");long id=caseFile(owner,"CLOSED");
+        long payment=write(owner,path(id)+"/requests",request("EXECUTION",payment("40",LocalDate.now().minusDays(3))),0).path("id").asLong();
+        review(legal,id,payment,true,0);
+        long entry=jdbc.queryForObject("select id from case_execution_continuation where request_id=?",Long.class,payment);
+        var payload=new LinkedHashMap<String,Object>(Map.of("source","CONTINUATION","sourceId",entry,
+                "paidAt",LocalDate.now().minusDays(4).toString(),"receiptNo","reversal-"+UUID.randomUUID()));
+        write(owner,path(id)+"/requests",request("REVERSAL",payload),2193);
+        payload.put("paidAt",LocalDate.now().plusDays(1).toString());
+        write(owner,path(id)+"/requests",request("REVERSAL",payload),2193);
+        payload.put("paidAt",LocalDate.now().minusDays(1).toString());
+        long reversal=write(owner,path(id)+"/requests",request("REVERSAL",payload),0).path("id").asLong();
+        review(legal,id,reversal,true,0);
+        var refund=new LinkedHashMap<>(payload);refund.put("receiptNo","refund-"+UUID.randomUUID());refund.put("amount",BigDecimal.ONE);
+        write(owner,path(id)+"/requests",request("REFUND",refund),2193);
+        long reversed=jdbc.queryForObject("select id from case_execution_continuation where request_id=?",Long.class,reversal);
+        refund.put("sourceId",reversed);
+        write(owner,path(id)+"/requests",request("REFUND",refund),2193);
+        payload.put("sourceId",reversed);payload.put("receiptNo","reverse-negative-"+UUID.randomUUID());
+        write(owner,path(id)+"/requests",request("REVERSAL",payload),2193);
+        assertEquals(0,sum(id,LocalDate.now()).signum());
+        assertEquals(2,count("case_execution_continuation",id));
+    }
+
+    @Test void remedyVoidIsSameCaseReviewedOnceAndRetainsTheOriginalIntake() throws Exception {
+        var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");long id=caseFile(owner,"CLOSED"),other=caseFile(owner,"CLOSED");
+        long remedy=write(owner,path(id)+"/remedies",remedy(),0).path("id").asLong();
+        long foreign=write(owner,path(other)+"/remedies",remedy(),0).path("id").asLong();
+        String originalRemedy=jdbc.queryForObject("select to_jsonb(r)::text from case_remedy r where id=?",String.class,remedy);
+        write(owner,path(id)+"/requests",request("REMEDY_VOID",Map.of("remedyId",foreign)),2193);
+        write(owner,path(id)+"/requests",request("REMEDY_VOID",Map.of("remedyId",remedy,"paidAt",LocalDate.now().toString())),2193);
+        var body=request("REMEDY_VOID",Map.of("remedyId",remedy));
+        long voidRequest=write(owner,path(id)+"/requests",body,0).path("id").asLong();
+        review(owner,id,voidRequest,true,403);
+        assertEquals("OPEN",jdbc.queryForObject("select status from case_remedy_status where id=?",String.class,remedy));
+        review(legal,id,voidRequest,true,0);
+        assertEquals("VOIDED",jdbc.queryForObject("select status from case_remedy_status where id=?",String.class,remedy));
+        assertEquals(voidRequest,write(owner,path(id)+"/requests",body,0).path("id").asLong());
+        write(owner,path(id)+"/requests",request("REMEDY_VOID",Map.of("remedyId",remedy)),2193);
+        assertEquals(originalRemedy,jdbc.queryForObject("select to_jsonb(r)::text from case_remedy r where id=?",String.class,remedy));
+    }
+
     @Test void concurrentRequestsAndReviewsCommitAtMostOnce() throws Exception {
         var owner=actor("DISTRICT","HANDLER");var legal=actor("BUREAU","LEGAL");var leader=actor("BUREAU","LEADER");long id=caseFile(owner,"CLOSED");
         var pool=Executors.newFixedThreadPool(2);

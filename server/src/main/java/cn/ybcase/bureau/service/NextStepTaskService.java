@@ -38,7 +38,22 @@ public class NextStepTaskService {
         var caseScope = sources.caseReadPredicate("c.id", username);
         var arguments = new ArrayList<Object>(caseScope.args());
         var parts = new ArrayList<String>();
-        String ctes = "with visible_cases as (select c.* from case_file c where " + caseScope.sql() + "), ";
+        String ctes = """
+                with valid_source_assignees as (
+                    select u.id,u.dept_id from sys_user u join sys_dept d on d.id=u.dept_id
+                    where u.enabled and d.enabled and d.org_kind=u.account_category
+                      and exists(select 1 from sys_user_role ur join sys_role r on r.id=ur.role_id
+                                 where ur.user_id=u.id and r.code='HANDLER')
+                ), visible_cases as (select c.* from case_file c where
+                """ + caseScope.sql() + "), ";
+        String inspectionAssignee = """
+                exists(select 1 from valid_source_assignees u where u.id=i.assigned_user_id and u.dept_id=i.owner_dept_id)
+                """;
+        String clueAssignee = """
+                exists(select 1 from valid_source_assignees u where u.dept_id=cl.owner_dept_id
+                    and u.id=(select ca.assigned_user_id from clue_assignment ca
+                              where ca.handoff_id=h.id order by ca.id desc limit 1))
+                """;
         boolean writer = actor.roles().stream().anyMatch(Set.of("HANDLER", "LEADER", "ADMIN")::contains);
         boolean reviewer = actor.roles().contains("LEGAL") || actor.roles().contains("LEADER");
         boolean bureauReviewer = reviewer && "BUREAU".equals(actor.accountCategory()) && actor.deptId() != null
@@ -107,9 +122,9 @@ public class NextStepTaskService {
                          select 1 from department_handoff h where h.id=(
                             select max(a.id) from department_handoff a where a.clue_id=cl.id and a.status='ACCEPTED')
                            and h.to_dept_id=cl.owner_dept_id
-                           and not exists(select 1 from clue_assignment ca where ca.handoff_id=h.id)
+                           and not (%s)
                       ) and
-                    """ + clueScope.sql());
+                    """.formatted(clueAssignee) + clueScope.sql());
 
             var inspectionScope = sources.inspectionReadPredicate("i", username);
             arguments.addAll(inspectionScope.args());
@@ -122,9 +137,9 @@ public class NextStepTaskService {
                     from inspection i where i.clue_id is null
                       and (i.done_at is null or i.violation_found)
                       and not exists(select 1 from department_handoff h where h.inspection_id=i.id
-                             and (h.status='PENDING' or (h.status='ACCEPTED' and i.assigned_user_id is null)))
+                             and (h.status='PENDING' or (h.status='ACCEPTED' and not (%s))))
                       and
-                    """ + inspectionScope.sql());
+                    """.formatted(inspectionAssignee) + inspectionScope.sql());
 
             arguments.add(ExecutionDeadlines.today());
             arguments.addAll(assignmentArgs);
@@ -243,15 +258,15 @@ public class NextStepTaskService {
                     left join case_clue cl on cl.id=h.clue_id
                     where h.status='ACCEPTED' and h.to_dept_id=? and d.org_kind=?
                       and ((i.id is not null and i.owner_dept_id=h.to_dept_id and i.clue_id is null
-                            and (i.done_at is null or i.violation_found) and i.assigned_user_id is null
+                            and (i.done_at is null or i.violation_found) and not (%s)
                             and h.id=(select max(a.id) from department_handoff a where a.inspection_id=i.id and a.status='ACCEPTED')
                             and not exists(select 1 from department_handoff p where p.inspection_id=i.id and p.status='PENDING'))
                         or (cl.id is not null and cl.owner_dept_id=h.to_dept_id and cl.status='PENDING'
                             and h.id=(select max(a.id) from department_handoff a where a.clue_id=cl.id and a.status='ACCEPTED')
                             and not exists(select 1 from case_file f where f.clue_id=cl.id)
                             and not exists(select 1 from department_handoff p where p.clue_id=cl.id and p.status='PENDING')
-                            and not exists(select 1 from clue_assignment ca where ca.handoff_id=h.id)))
-                    """);
+                            and not (%s)))
+                    """.formatted(inspectionAssignee,clueAssignee));
         }
         if (bureauReviewer) {
             arguments.add(actor.id());

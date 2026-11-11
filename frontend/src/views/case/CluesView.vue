@@ -15,7 +15,7 @@
           <el-option v-for="(v, k) in SOURCE" :key="k" :label="v" :value="k" />
         </el-select>
         <el-button v-if="canPullMonitor" :loading="pullingMonitor" @click="onPullMonitor">拉取监控疑点</el-button>
-        <el-button v-if="canOperate" @click="onImport">监控疑点导入</el-button>
+        <el-button v-if="canOperate" :loading="importing" @click="onImport">监控疑点导入</el-button>
         <el-button v-if="canOperate" type="primary" @click="createVisible = true">登记线索</el-button>
       </div>
     </div>
@@ -53,9 +53,9 @@
           <template v-if="row.status === 'PENDING'">
             <el-button v-if="canManageClue(row)" size="small" type="primary" @click="toFile(row)">立案</el-button>
             <el-button v-if="canManageClue(row)" size="small" :loading="extendingClue === row.id"
-              :disabled="row.extended || extendingClue !== null" @click="onExtend(row)">申请延期</el-button>
-            <el-button v-if="canManageClue(row)" size="small" @click="onExclusion(row)">期限扣除</el-button>
-            <el-button v-if="canManageClue(row)" size="small" type="warning" @click="onReject(row)">不予立案</el-button>
+              :disabled="row.extended || extendingClue !== null || handlingClue !== null" @click="onExtend(row)">申请延期</el-button>
+            <el-button v-if="canManageClue(row)" size="small" :disabled="handlingClue !== null || extendingClue !== null" @click="onExclusion(row)">期限扣除</el-button>
+            <el-button v-if="canManageClue(row)" size="small" :disabled="handlingClue !== null || extendingClue !== null" type="warning" @click="onReject(row)">不予立案</el-button>
           </template>
           <span v-else class="hint">{{ row.verifyResult || '-' }}</span>
         </template>
@@ -67,7 +67,7 @@
 
     <PrecaseAttachments v-model:visible="materialsVisible" :source="materialsSource" />
     <el-dialog v-model="createVisible" title="登记线索" width="560px">
-      <el-form :model="form" label-width="90px">
+      <el-form :model="form" :disabled="submitting" label-width="90px">
         <el-form-item label="线索来源">
           <el-select v-model="form.source" style="width: 100%">
             <el-option v-for="(v, k) in SOURCE" :key="k" :label="v" :value="k" />
@@ -107,6 +107,7 @@ import client from '../../api/client'
 import { useAuthStore } from '../../stores/auth'
 import { caseOperationAccess } from '../../api/caseWriteAccess'
 import { createApprovalRequestKey } from '../../api/approvalRequestKey'
+import { sessionExpiry, type SessionStamp } from '../../api/sessionExpiry'
 import PrecaseAttachments from '../../components/PrecaseAttachments.vue'
 import TaskFocusBanner from '../../components/TaskFocusBanner.vue'
 import WorkdayCoverageNotice from '../../components/WorkdayCoverageNotice.vue'
@@ -119,6 +120,9 @@ const canPullMonitor = computed(() => auth.user?.accountCategory === 'BUREAU'
   && auth.user.roles.some(role => ['LEADER', 'ADMIN'].includes(role)))
 const pullingMonitor = ref(false)
 const extendingClue = ref<number | null>(null)
+const handlingClue = ref<number | null>(null)
+const importing = ref(false)
+const importDraft = ref('')
 const clueApprovalRequestKey = createApprovalRequestKey()
 function canManageClue(row: any) {
   return canWritePrecase(auth.user?.roles, auth.user?.username, { type: 'clues', id: row.id, status: row.status, owner: row.createdBy, handler: row.handler }, false)
@@ -140,7 +144,16 @@ let disposed = false
 let mounted = false
 const focusId = ref<number>()
 const readIdentity = () => JSON.stringify([auth.token, auth.user?.id, auth.user?.accountCategory, auth.user?.roles])
-watch(readIdentity, () => { loadGeneration++; records.value=[]; total.value=0; loading.value=false; failed.value=false; materialsVisible.value=false }, { flush: 'sync' })
+watch(readIdentity, () => {
+  loadGeneration++; records.value=[]; total.value=0; loading.value=false; failed.value=false; materialsVisible.value=false
+  createVisible.value=false; creationGeneration++; importDraft.value=''
+  Object.assign(form, initialForm())
+}, { flush: 'sync' })
+function clueActionCurrent(context: { identity: string; generation: number; stamp: SessionStamp }) {
+  return !disposed && canOperate.value && !!auth.token && context.identity === readIdentity()
+    && context.generation === loadGeneration && sessionExpiry.isCurrent(context.stamp, auth.token)
+    && !sessionExpiry.isExpired(context.stamp, auth.token)
+}
 function setTaskFocus(value: number | undefined) {
   if (value === focusId.value) return
   focusId.value = value
@@ -152,12 +165,17 @@ const statusFilter = ref('')
 const sourceFilter = ref('')
 const createVisible = ref(false)
 const submitting = ref(false)
+let creationGeneration = 0
+watch(createVisible, visible => { if (!visible) creationGeneration++ }, { flush: 'sync' })
 function todayLocal() {
   const d = new Date()
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 const today = todayLocal()
-const form = reactive({ source: 'COMPLAINT', suspectName: '', suspectType: 'PROVIDER', receivedAt: today, content: '', handler: '' })
+function initialForm() {
+  return { source: 'COMPLAINT', suspectName: '', suspectType: 'PROVIDER', receivedAt: todayLocal(), content: '', handler: '' }
+}
+const form = reactive(initialForm())
 const q = ref('')
 const range = ref<[string, string] | null>(null)
 const page = ref(1)
@@ -212,42 +230,61 @@ function changePage(value: number) {
 }
 
 async function onCreate() {
-  if (!canOperate.value) return
-  // 防重：连点或 15s 超时后的重试会生成两条连号且无法删除的记录
-  if (submitting.value) return
+  if (!canOperate.value || disposed || !createVisible.value || submitting.value) return
+  const identity = readIdentity(), generation = creationGeneration, stamp = sessionExpiry.capture(auth.token)
+  const current = () => !disposed && canOperate.value && createVisible.value && !!auth.token
+    && identity === readIdentity() && generation === creationGeneration
+    && sessionExpiry.isCurrent(stamp, auth.token) && !sessionExpiry.isExpired(stamp, auth.token)
+  if (!current()) return
   submitting.value = true
   try {
     if (!form.suspectName || !form.content) {
       ElMessage.warning('请填写嫌疑人与线索内容')
       return
     }
-    await client.post('/bureau/clues', form)
+    const payload = { ...form }
+    await client.post('/bureau/clues', payload)
+    if (!current()) return
     ElMessage.success('线索已登记')
     createVisible.value = false
     form.suspectName = ''
     form.content = ''
-    load()
+    await load()
+  } catch {
+    // The shared client reports errors while the current draft remains available.
   } finally {
     submitting.value = false
   }
 }
 
 async function onExclusion(row: any) {
-  if (!canManageClue(row)) return
-  // 鉴定/检验期间不计入核查期限（辽15条）——此前只有后端接口，UI 无入口
-  const { value: days } = await ElMessageBox.prompt(
-    '不计入核查期限的天数（鉴定、检验等，辽15条）', '期限扣除',
-    { inputPattern: /^[1-9]\d*$/, inputErrorMessage: '请填写正整数天数' })
-  const { value: reason } = await ElMessageBox.prompt('扣除事由', '期限扣除',
-    { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  if (!canManageClue(row)) return
-  await client.post(`/bureau/clues/${row.id}/exclusions`, { days: Number(days), reason })
-  ElMessage.success('已登记扣除，核查期限相应顺延')
-  load()
+  if (!canManageClue(row) || handlingClue.value !== null || extendingClue.value !== null) return
+  const id = row.id
+  const context = { identity: readIdentity(), generation: loadGeneration, stamp: sessionExpiry.capture(auth.token) }
+  const current = () => clueActionCurrent(context) && row.id === id && canManageClue(row)
+  if (!current()) return
+  handlingClue.value = id
+  try {
+    const { value: days } = await ElMessageBox.prompt(
+      '不计入核查期限的天数（鉴定、检验等，辽15条）', '期限扣除',
+      { inputPattern: /^[1-9]\d*$/, inputErrorMessage: '请填写正整数天数' })
+    if (!current()) return
+    const { value: reason } = await ElMessageBox.prompt('扣除事由', '期限扣除',
+      { inputPattern: /\S+/, inputErrorMessage: '必填' })
+    if (!current()) return
+    await client.post(`/bureau/clues/${id}/exclusions`, { days: Number(days), reason })
+    if (!current()) return
+    ElMessage.success('已登记扣除，核查期限相应顺延')
+    await load()
+  } catch {
+    // Cancelling the prompt is expected. The shared client reports request failures.
+  } finally {
+    handlingClue.value = null
+  }
 }
 
 async function onExtend(row: any) {
-  if (!canManageClue(row) || row.extended || extendingClue.value !== null) return
+  if (!canManageClue(row) || row.extended || extendingClue.value !== null || handlingClue.value !== null) return
   const identity = readIdentity(), generation = loadGeneration
   extendingClue.value = row.id
   try {
@@ -267,12 +304,24 @@ async function onExtend(row: any) {
 }
 
 async function onReject(row: any) {
-  if (!canManageClue(row)) return
-  const { value } = await ElMessageBox.prompt('核查结果（不予立案理由）', '不予立案', { inputPattern: /\S+/, inputErrorMessage: '必填' })
-  if (!canManageClue(row)) return
-  await client.post(`/bureau/clues/${row.id}/reject`, { verifyResult: value })
-  ElMessage.success('已办结')
-  load()
+  if (!canManageClue(row) || handlingClue.value !== null || extendingClue.value !== null) return
+  const id = row.id
+  const context = { identity: readIdentity(), generation: loadGeneration, stamp: sessionExpiry.capture(auth.token) }
+  const current = () => clueActionCurrent(context) && row.id === id && canManageClue(row)
+  if (!current()) return
+  handlingClue.value = id
+  try {
+    const { value } = await ElMessageBox.prompt('核查结果（不予立案理由）', '不予立案', { inputPattern: /\S+/, inputErrorMessage: '必填' })
+    if (!current()) return
+    await client.post(`/bureau/clues/${id}/reject`, { verifyResult: value })
+    if (!current()) return
+    ElMessage.success('已办结')
+    await load()
+  } catch {
+    // Cancelling the prompt is expected. The shared client reports request failures.
+  } finally {
+    handlingClue.value = null
+  }
 }
 
 async function onPullMonitor() {
@@ -297,24 +346,37 @@ async function onPullMonitor() {
 }
 
 async function onImport() {
-  if (!canOperate.value) return
-  const { value } = await ElMessageBox.prompt(
-    '粘贴智能监控疑点 JSON 数组：[{"suspectName":"…","suspectType":"PROVIDER","content":"…"}]',
-    '批量导入线索', { inputType: 'textarea', inputPattern: /^\s*\[/, inputErrorMessage: '须为 JSON 数组' })
-  let rows: any
+  if (!canOperate.value || importing.value) return
+  const context = { identity: readIdentity(), generation: loadGeneration, stamp: sessionExpiry.capture(auth.token) }
+  if (!clueActionCurrent(context)) return
+  importing.value = true
   try {
-    rows = JSON.parse(value)
+    const { value } = await ElMessageBox.prompt(
+      '粘贴智能监控疑点 JSON 数组：[{"suspectName":"…","suspectType":"PROVIDER","content":"…"}]',
+      '批量导入线索', { inputValue: importDraft.value, inputType: 'textarea', inputPattern: /^\s*\[/, inputErrorMessage: '须为 JSON 数组' })
+    if (!clueActionCurrent(context)) return
+    importDraft.value = value
+    let rows: any
+    try {
+      rows = JSON.parse(value)
+    } catch {
+      ElMessage.error('JSON 格式有误，请检查括号与逗号后重试')
+      return
+    }
+    if (!Array.isArray(rows) || !rows.length) {
+      ElMessage.warning('请粘贴非空的线索数组')
+      return
+    }
+    const resp = await client.post('/bureau/clues/import', rows)
+    if (!clueActionCurrent(context)) return
+    importDraft.value = ''
+    ElMessage.success(`已导入 ${resp.data.data.imported} 条线索`)
+    await load()
   } catch {
-    ElMessage.error('JSON 格式有误，请检查括号与逗号后重试')
-    return
+    // Keep confirmed JSON for an explicit retry. The shared client reports request failures.
+  } finally {
+    importing.value = false
   }
-  if (!Array.isArray(rows) || !rows.length) {
-    ElMessage.warning('请粘贴非空的线索数组')
-    return
-  }
-  const resp = await client.post('/bureau/clues/import', rows)
-  ElMessage.success(`已导入 ${resp.data.data.imported} 条线索`)
-  load()
 }
 
 function toFile(row: any) {

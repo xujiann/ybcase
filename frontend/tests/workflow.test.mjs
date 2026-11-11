@@ -41,7 +41,7 @@ test('review submit omits user-controlled reviewer identity', async () => {
   assert.equal(ctx.calls[0][1].opinion,'同意')
 })
 test('clue extension requests approval rather than granting itself an extension', async () => {
-  const ctx=state({ElMessageBox:{prompt:async()=>({value:'核查情况复杂'})}, extendingClue:{value:null},
+  const ctx=state({ElMessageBox:{prompt:async()=>({value:'核查情况复杂'})}, extendingClue:{value:null}, handlingClue:{value:null},
     readIdentity:()=> 'test', loadGeneration:1, disposed:false, auth:{user:{id:1}}, clueApprovalRequestKey:createApprovalRequestKey()})
   await handler('case/CluesView.vue','onExtend',ctx)({id:12})
   assert.equal(ctx.calls[0][0],'/bureau/approvals')
@@ -309,7 +309,7 @@ test('actual pending clue operation cell hides filing for a foreign handler and 
   const row={id:7,status:'PENDING',createdBy:'creator',handler:'assignee',extended:false}
   for (const [username,canFile] of [['creator',true],['assignee',true],['foreign',false]]) {
     const canManageClue=handler('case/CluesView.vue','canManageClue',{auth:{user:{roles:['HANDLER'],username}},canWritePrecase})
-    const app=Vue.createSSRApp({render,setup:()=>({canOperate:true,canManageClue,extendingClue:null,toFile(){},openMaterials(){},onExtend(){},onExclusion(){},onReject(){}})})
+    const app=Vue.createSSRApp({render,setup:()=>({canOperate:true,canManageClue,extendingClue:null,handlingClue:null,toFile(){},openMaterials(){},onExtend(){},onExclusion(){},onReject(){}})})
     app.component('el-table-column',{setup:(_, {slots})=>()=>Vue.h('div',slots.default?.({row}))})
     app.component('el-button',{setup:(_, {slots})=>()=>Vue.h('button',slots.default?.())})
     app.config.warnHandler=()=>{}
@@ -322,7 +322,9 @@ test('actual pending clue operation cell hides filing for a foreign handler and 
 test('history-page creation handlers return to page one, while edits refresh the current page', async () => {
   for (const [page,form] of [['InspectionsView',{objectName:'检查对象',officers:'甲、乙'}],['RewardsView',{clueId:1,reporterName:'举报人'}],['TransfersView',{clueId:1}]]) {
     const refreshes=[]
-    const ctx=state({form,paging:{firstPage:async()=>refreshes.push('first')},dlg:{value:true},load:()=>refreshes.push('current')})
+    const ctx=state({form,paging:{firstPage:async()=>refreshes.push('first')},dlg:{value:true},load:()=>refreshes.push('current'),
+      resultDisposed:false,creating:{value:false},creationGeneration:0,contextGeneration:0,auth:{token:'session'},
+      sessionExpiry:{capture:()=> 'stamp',isCurrent:()=>true,isExpired:()=>false}})
     await handler(`case/${page}.vue`,'onCreate',ctx)()
     assert.deepEqual(refreshes,['first'],page)
   }

@@ -45,7 +45,7 @@
 
     <PrecaseAttachments v-model:visible="materialsVisible" :source="materialsSource" />
     <el-dialog v-model="dlg" title="新建检查任务（检查人员不得少于2人）" width="520px">
-      <el-form :model="form" label-width="90px">
+      <el-form :model="form" :disabled="creating" label-width="90px">
         <el-form-item label="检查事项">
           <el-select v-model="form.itemId" style="width: 100%">
             <el-option v-for="it in items" :key="it.id" :label="`${it.seq_no}. ${it.name}`" :value="it.id" />
@@ -70,7 +70,7 @@
       </el-form>
       <template #footer>
         <el-button @click="dlg = false">取消</el-button>
-        <el-button v-if="canOperate" type="primary" @click="onCreate">创建</el-button>
+        <el-button v-if="canOperate" type="primary" :loading="creating" @click="onCreate">创建</el-button>
       </template>
     </el-dialog>
     <el-dialog v-model="resultVisible" title="登记检查结果" width="520px"
@@ -140,26 +140,46 @@ onUnmounted(paging.dispose)
 const items = ref<any[]>([])
 const loading = computed(() => pagination.loading)
 const dlg = ref(false)
+const creating = ref(false)
+let creationGeneration = 0
+watch(dlg, visible => { if (!visible) creationGeneration++ }, { flush: 'sync' })
 function todayLocal() {
   const d = new Date()
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
-const form = reactive<any>({ itemId: null, objectName: '', objectType: 'PROVIDER', officers: '', plannedAt: todayLocal(), taskLevel: null })
+function initialForm() {
+  return { itemId: null, objectName: '', objectType: 'PROVIDER', officers: '', plannedAt: todayLocal(), taskLevel: null }
+}
+const form = reactive<any>(initialForm())
 
 async function load() {
   await paging.load()
 }
 
 async function onCreate() {
-  if (!canOperate.value) return
+  if (!canOperate.value || resultDisposed || !dlg.value || creating.value) return
   if (!form.objectName || !form.officers) {
     ElMessage.warning('检查对象与人员必填')
     return
   }
-  await client.post('/bureau/inspections', form)
-  ElMessage.success('已创建')
-  dlg.value = false
-  await paging.firstPage()
+  const generation = creationGeneration, context = contextGeneration
+  const stamp = sessionExpiry.capture(auth.token), payload = { ...form }
+  const current = () => !resultDisposed && canOperate.value && dlg.value && !!auth.token
+    && generation === creationGeneration && context === contextGeneration
+    && sessionExpiry.isCurrent(stamp, auth.token) && !sessionExpiry.isExpired(stamp, auth.token)
+  if (!current()) return
+  creating.value = true
+  try {
+    await client.post('/bureau/inspections', payload)
+    if (!current()) return
+    ElMessage.success('已创建')
+    dlg.value = false
+    await paging.firstPage()
+  } catch {
+    // The shared client reports errors while the current draft remains available.
+  } finally {
+    creating.value = false
+  }
 }
 
 const resultVisible = ref(false)
@@ -174,6 +194,8 @@ let contextGeneration = 0
 
 watch(() => JSON.stringify([auth.token, auth.user?.id, auth.user?.accountCategory, auth.user?.roles]), () => {
   contextGeneration++
+  dlg.value = false
+  Object.assign(form, initialForm())
   resultVisible.value = false
   materialsVisible.value = false
   pagination.rows = []
