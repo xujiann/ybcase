@@ -50,7 +50,7 @@
                 placeholder="2027-01-01,放假,元旦
 2027-01-02,放假,元旦
 2027-01-03,放假,元旦
-2027-02-06,调休上班,春节调休" />
+2027-01-31,调休上班,春节调休" />
       <div v-if="batchError" class="err">{{ batchError }}</div>
       <template #footer>
         <el-button :disabled="batchSubmitting" @click="batchVisible = false">取消</el-button>

@@ -37,7 +37,7 @@ FIXED_FILES = {"ybcase-server.jar", "docker-compose.yml", "Caddyfile",
                "backup-transfer.py", "restore-rehearsal.py", "capacity-check.py"}
 NEW_TOOL_FILES = {"backup-set.py", "release.py", "data-audit.py", "backup-transfer.py", "restore-rehearsal.py", "capacity-check.py"}
 SEED_TABLES = {"flyway_schema_history", "sys_dept", "sys_menu",
-               "sys_role", "sys_role_menu", "sys_config"}
+               "sys_role", "sys_role_menu", "sys_config", "sys_holiday"}
 
 
 def require(condition, message):

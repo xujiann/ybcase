@@ -17,6 +17,38 @@ m.BASELINE_SCHEMA = 46
 m.TARGET_SCHEMA = 50
 
 
+class CalendarSeedPreservation(unittest.TestCase):
+    def setUp(self):
+        self.original = {"count": 2, "hashes": ["old-year-holiday", "custom-calendar-row"]}
+        self.baseline = {"tables": {"sys_holiday": self.original}}
+        mock = patch.object(m, "json_file", return_value=self.baseline)
+        mock.start()
+        self.addCleanup(mock.stop)
+
+    def test_calendar_migration_may_append_dates_in_prepare_and_final_checks(self):
+        after = {"count": 36, "hashes": self.original["hashes"] + ["official-2027-" + str(day) for day in range(34)]}
+        for allow_logins in (False, True):
+            with self.subTest(allow_logins=allow_logins):
+                m.assert_rows({"tables": {"sys_holiday": after}}, "baseline.json", allow_logins=allow_logins)
+
+    def test_calendar_seed_permission_never_allows_deleting_or_replacing_existing_dates(self):
+        for after in ({"count": 1, "hashes": ["old-year-holiday"]},
+                      {"count": 2, "hashes": ["old-year-holiday", "replacement-calendar-row"]}):
+            for allow_logins in (False, True):
+                with self.subTest(after=after, allow_logins=allow_logins):
+                    with self.assertRaisesRegex(RuntimeError, "An original row changed in sys_holiday"):
+                        m.assert_rows({"tables": {"sys_holiday": after}}, "baseline.json", allow_logins=allow_logins)
+
+    def test_calendar_seed_permission_does_not_allow_business_row_additions(self):
+        self.baseline["tables"]["case_file"] = {"count": 1, "hashes": ["existing-case"]}
+        result = {"tables": {"sys_holiday": self.original,
+                             "case_file": {"count": 2, "hashes": ["existing-case", "unexpected-case"]}}}
+        for allow_logins in (False, True):
+            with self.subTest(allow_logins=allow_logins):
+                with self.assertRaisesRegex(RuntimeError, "Unexpected new rows in case_file"):
+                    m.assert_rows(result, "baseline.json", allow_logins=allow_logins)
+
+
 class MissingApplicationRecovery(unittest.TestCase):
     def setUp(self):
         temporary_root = Path.home() / "Temp"
