@@ -38,17 +38,22 @@ jobs:
   backend:
     name: 后端构建与测试（单测+集成测试）
     runs-on: ubuntu-latest
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGUSER: hip
+      PGPASSWORD: hip123456
     services:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_DB: ybcase_authowner_test_20261028_00000000
+          POSTGRES_DB: postgres
           POSTGRES_USER: hip
           POSTGRES_PASSWORD: hip123456
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U hip -d ybcase_authowner_test_20261028_00000000"
+          --health-cmd "pg_isready -U hip -d postgres"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
@@ -61,11 +66,20 @@ jobs:
           java-version: '21'
           cache: maven
 
+      - name: 验证隔离库授权与清理边界
+        run: python3 -m unittest discover -s .github/tests -p 'test_*.py' -v
+
+      - name: 创建并授权本轮随机独占测试库
+        run: python3 .github/scripts/test_database.py provision --state "$RUNNER_TEMP/ybcase-test-database.json"
+
       - name: 构建与测试
         env:
-          # 并发回归要求明确命名的隔离库，避免在开发或业务库运行。
-          SPRING_DATASOURCE_URL: jdbc:postgresql://127.0.0.1:5432/ybcase_authowner_test_20261028_00000000
+          SPRING_DATASOURCE_PASSWORD: hip123456
         run: mvn -B --no-transfer-progress test
+
+      - name: 核验并清理本轮独占测试库
+        if: ${{ always() }}
+        run: python3 .github/scripts/test_database.py cleanup --state "$RUNNER_TEMP/ybcase-test-database.json"
 
   frontend:
     name: 前端测试与构建
