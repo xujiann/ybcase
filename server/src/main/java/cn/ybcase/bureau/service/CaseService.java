@@ -814,10 +814,18 @@ public class CaseService {
 
     // ---------- 法制审核（第37-40条） ----------
 
+    private static boolean blankReviewText(String value) {
+        return value == null || value.codePoints().allMatch(point -> Character.isWhitespace(point)
+                || Character.isSpaceChar(point) || point == 0xfeff);
+    }
+
     @Transactional
     public CaseReview submitReview(Long caseId, String requiredReason) {
         CaseGuards.lockWritable(jdbc, caseId);
         materialAccess.requireCurrentCaseWriter(caseId);
+        if (blankReviewText(requiredReason) || requiredReason.indexOf('\0') >= 0
+                || requiredReason.codePointCount(0, requiredReason.length()) > 255)
+            throw new BizException(2037, "审核触发情形须为255字以内的非空文本");
         CaseFile c = get(caseId);
         if (!List.of("REPORTED", "NOTIFIED").contains(c.getStatus()))
             throw new BizException(2036, "法制审核在调查终结后、作出决定前进行（第37条）");
@@ -860,8 +868,10 @@ public class CaseService {
         Long actorId = actor.id();
         String reviewer = jdbc.queryForObject("select real_name from sys_user where id=?", String.class, actorId);
         var certificates = enforcerRegistry.lockReviewCertificates(actorId, r.getCaseId());
-        if (!List.of("AGREE", "CONTINUE", "CHANGE", "CORRECT", "OTHER").contains(opinionType))
+        if (opinionType == null || !List.of("AGREE", "CONTINUE", "CHANGE", "CORRECT", "OTHER").contains(opinionType))
             throw new BizException(2037, "审核意见类型须为 同意/继续调查/变更/纠正/其他（第39条）");
+        if (blankReviewText(opinion) || opinion.indexOf('\0') >= 0)
+            throw new BizException(2037, "须填写有效的法制审核意见");
         // 第37条：办案人员不得作为审核人员
         var officers = jdbc.queryForList("select cert_no, user_id from case_officer where case_id=?", r.getCaseId());
         boolean participant = officers.stream().anyMatch(o -> {

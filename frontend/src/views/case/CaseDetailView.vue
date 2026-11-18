@@ -379,7 +379,7 @@
               <template #default="{ row }">
                 <span v-if="row.reviewedAt">{{ REVIEW_OPINION[row.opinionType] }}：{{ row.opinion }}（{{ row.reviewer }}）</span>
                 <template v-else>
-                  <el-button v-if="isLegal" size="small" type="primary" :disabled="c.status === 'CLOSED' || !!c.archiveNo || !reviewVersion(row, detail.reviewMaterialStatus).actionable" @click="openReviewDialog(row)">办理审核</el-button>
+                  <el-button v-if="isLegal" size="small" type="primary" :disabled="reviewing || c.status === 'CLOSED' || !!c.archiveNo || !reviewVersion(row, detail.reviewMaterialStatus).actionable" @click="openReviewDialog(row)">办理审核</el-button>
                   <span v-if="!reviewVersion(row, detail.reviewMaterialStatus).actionable" class="hint">请由办案人员重新送审</span>
                   <span v-else-if="!isLegal" class="hint">待法制机构审核</span>
                 </template>
@@ -1009,10 +1009,11 @@
     </el-dialog>
 
     <el-dialog v-model="dlg.reviewSnapshot" title="审核申请材料快照（只读）" width="850px" style="max-width: 95vw"><ReviewMaterialSnapshot :review="snapshotReview" /></el-dialog>
-    <el-dialog v-model="dlg.review" title="法制审核办理（审核人须具备法律职业资格，不得为本案办案人员）" width="850px" style="max-width: 95vw">
+    <el-dialog v-model="dlg.review" title="法制审核办理（审核人须具备法律职业资格，不得为本案办案人员）" width="850px" style="max-width: 95vw"
+      :close-on-click-modal="!reviewing" :close-on-press-escape="!reviewing" :show-close="!reviewing">
       <ReviewMaterialSnapshot :review="selectedReview" />
       <el-alert v-if="!canReviewSelected" type="warning" :closable="false" title="本申请已不适用于当前材料或已有后续申请，请重新送审后办理。" style="margin: 12px 0" />
-      <el-form label-width="90px">
+      <el-form label-width="90px" :disabled="reviewing">
         <el-form-item label="审核人"><el-input :model-value="auth.user?.realName || auth.user?.username" readonly /></el-form-item>
         <el-form-item label="意见类型">
           <el-select v-model="reviewForm.opinionType" style="width: 100%">
@@ -1022,8 +1023,8 @@
         <el-form-item label="审核意见"><el-input v-model="reviewForm.opinion" type="textarea" :rows="3" /></el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dlg.review = false">取消</el-button>
-        <el-button type="primary" :disabled="!canReviewSelected" @click="onDoReview">提交审核</el-button>
+        <el-button :disabled="reviewing" @click="dlg.review = false">取消</el-button>
+        <el-button type="primary" :loading="reviewing" :disabled="reviewing || !canReviewSelected" @click="onDoReview">提交审核</el-button>
       </template>
     </el-dialog>
 
@@ -1298,6 +1299,9 @@ const pendingApprovals = computed(() => (detail.value.approvals || []).filter((a
 const reviewForm = reactive<any>({ reviewId: null, reviewer: '', opinionType: 'AGREE', opinion: '' })
 const selectedReview = ref<MaterialReview | null>(null)
 const snapshotReview = ref<MaterialReview | null>(null)
+const reviewing = ref(false)
+let reviewDraftGeneration = 0
+watch(() => [dlg.review, reviewForm.reviewId], () => { reviewDraftGeneration++ }, { flush: 'sync' })
 const canReviewSelected = computed(() => {
   const row = detail.value.reviews?.find((r: any) => String(r.id) === String(reviewForm.reviewId))
   return c.value.status !== 'CLOSED' && !c.value.archiveNo && !!isLegal.value && !!row && reviewVersion(row, detail.value.reviewMaterialStatus).actionable
@@ -2090,6 +2094,7 @@ async function onSubmitReview() {
 }
 
 function openReviewDialog(row: any) {
+  if (materialDisposed || reviewing.value || !caseReady.value || loading.value) return
   if (c.value.status === 'CLOSED' || c.value.archiveNo || !isLegal.value || !reviewVersion(row, detail.value.reviewMaterialStatus).actionable) return
   selectedReview.value = cloneReview(row)
   // 不重置会串单：上一份审核单的审核人与意见残留到下一份
@@ -2098,17 +2103,25 @@ function openReviewDialog(row: any) {
 }
 
 async function onDoReview() {
+  if (materialDisposed || reviewing.value || !dlg.review) return
   if (!canReviewSelected.value) { ElMessage.warning('申请材料版本已失效，请重新送审'); return }
   if (!reviewForm.opinion.trim()) {
     ElMessage.warning('审核意见必填')
     return
   }
-  const caseId = id.value, reviewId = reviewForm.reviewId
-  await client.post(`/bureau/cases/reviews/${reviewId}`, { opinionType: reviewForm.opinionType, opinion: reviewForm.opinion })
-  if (caseId !== id.value || String(reviewForm.reviewId) !== String(reviewId)) return
-  ElMessage.success('审核完成')
-  dlg.review = false
-  load()
+  const context = captureMaterialContext(), token = auth.token, draft = reviewDraftGeneration, reviewId = reviewForm.reviewId
+  const payload = { opinionType: reviewForm.opinionType, opinion: reviewForm.opinion }
+  reviewing.value = true
+  try {
+    await client.post(`/bureau/cases/reviews/${reviewId}`, payload)
+    if (!materialContextCurrent(context) || token !== auth.token || draft !== reviewDraftGeneration
+        || !dlg.review || String(reviewForm.reviewId) !== String(reviewId)) return
+    ElMessage.success('审核完成')
+    dlg.review = false
+    await load()
+  } catch {
+    // The interceptor reports failures. Keep the opinion available for an explicit retry.
+  } finally { reviewing.value = false }
 }
 
 async function onNotify() {

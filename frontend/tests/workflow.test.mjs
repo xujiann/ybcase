@@ -35,7 +35,9 @@ test('statement save preserves changed booleans and cannot fabricate hearing dat
   assert.equal(Object.hasOwn(body,'hearingHeldAt'),false)
 })
 test('review submit omits user-controlled reviewer identity', async () => {
-  const ctx=state({canReviewSelected:{value:true},reviewForm:{reviewId:5,reviewer:'冒用姓名',opinionType:'AGREE',opinion:'同意'}})
+  const ctx=state({canReviewSelected:{value:true},reviewForm:{reviewId:5,reviewer:'冒用姓名',opinionType:'AGREE',opinion:'同意'},
+    materialDisposed:false,reviewing:{value:false},dlg:{review:true},reviewDraftGeneration:1,auth:{token:'test'},
+    captureMaterialContext:()=>({caseId:'9',generation:1}),materialContextCurrent:()=>true})
   await handler('case/CaseDetailView.vue','onDoReview',ctx)()
   assert.equal(Object.hasOwn(ctx.calls[0][1],'reviewer'),false)
   assert.equal(ctx.calls[0][1].opinion,'同意')
@@ -220,7 +222,8 @@ test('period completion role guard prevents writes even if the handler is invoke
 })
 
 test('expired or superseded material review cannot be submitted through its handler', async () => {
-  const ctx=state({canReviewSelected:{value:false},reviewForm:{reviewId:5,opinion:'意见',opinionType:'AGREE'},dlg:{review:true}})
+  const ctx=state({canReviewSelected:{value:false},reviewForm:{reviewId:5,opinion:'意见',opinionType:'AGREE'},dlg:{review:true},
+    materialDisposed:false,reviewing:{value:false}})
   await handler('case/CaseDetailView.vue','onDoReview',ctx)()
   assert.equal(ctx.calls.length,0)
   assert.equal(ctx.dlg.review,true)
