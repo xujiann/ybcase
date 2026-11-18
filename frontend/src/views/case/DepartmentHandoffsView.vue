@@ -41,8 +41,9 @@
     <el-pagination class="handoff-pagination" :current-page="pagination.page" :page-size="pagination.size" :page-sizes="[20,50,100]"
       :total="pagination.total" :disabled="focusId !== undefined || pagination.loading" layout="total, sizes, prev, pager, next" @current-change="paging.changePage" @size-change="paging.changeSize" />
 
-    <el-dialog v-model="requestVisible" title="发起机构交接" width="min(540px, 94vw)" :close-on-click-modal="!saving">
-      <el-form label-width="100px">
+    <el-dialog v-model="requestVisible" title="发起机构交接" width="min(540px, 94vw)"
+      :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
+      <el-form label-width="100px" :disabled="saving">
         <el-form-item label="来源类型" required>
           <el-select v-model="request.sourceType" @change="changeSourceType">
             <el-option v-for="(option, key) in SOURCES" :key="key" :label="option.label" :value="key" />
@@ -68,9 +69,10 @@
         <el-button type="primary" :loading="saving" @click="submitRequest">提交交接</el-button>
       </template>
     </el-dialog>
-    <el-dialog v-model="decisionVisible" :title="ACTIONS[decision.action]" width="min(500px, 94vw)" :close-on-click-modal="!saving">
+    <el-dialog v-model="decisionVisible" :title="ACTIONS[decision.action]" width="min(500px, 94vw)"
+      :close-on-click-modal="!saving" :close-on-press-escape="!saving" :show-close="!saving">
       <p>{{ decision.number }}</p>
-      <el-input v-model="decision.opinion" type="textarea" :rows="3" maxlength="512" show-word-limit placeholder="填写处理意见" />
+      <el-input v-model="decision.opinion" type="textarea" :rows="3" maxlength="512" show-word-limit placeholder="填写处理意见" :disabled="saving" />
       <template #footer>
         <el-button :disabled="saving" @click="decisionVisible = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="submitDecision">确认{{ ACTIONS[decision.action] }}</el-button>
@@ -155,6 +157,7 @@ const decision = reactive({ id: 0, number: '', action: 'accept' as Action, opini
 const assignment = reactive({ id: 0, number: '', username: '', reason: '', sourceType: 'INSPECTION' as 'INSPECTION' | 'CLUE',
   expectedAssignedUserId: null as number | null, expectedAssignmentId: null as number | null })
 let sourceSearch: AbortController | undefined
+let departmentSearch: AbortController | undefined
 let assignmentSearch: AbortController | undefined
 let disposed = false
 let mounted = false
@@ -201,17 +204,19 @@ async function openRequest() {
   Object.assign(request, { sourceType: 'CLUE', sourceId: undefined, targetDeptId: undefined, reason: '' })
   changeSourceType()
   requestVisible.value = true
+  departmentSearch?.abort()
+  const current = departmentSearch = new AbortController()
   const token = auth.token
   deptLoading.value = true
   departments.value = []
   try {
-    const { data } = await client.get<{ data: Department[] }>('/system/depts')
-    if (disposed || token !== auth.token || !requestVisible.value) return
+    const { data } = await client.get<{ data: Department[] }>('/system/depts', { signal: current.signal })
+    if (disposed || current.signal.aborted || departmentSearch !== current || token !== auth.token || !requestVisible.value) return
     departments.value = data.data.filter(dept => dept.enabled && ['BUREAU', 'DISTRICT'].includes(dept.orgKind))
   } catch {
     // The API client displays the request failure.
   } finally {
-    deptLoading.value = false
+    if (departmentSearch === current) deptLoading.value = false
   }
 }
 
@@ -301,7 +306,14 @@ async function submit(path: string, body: object, visible: typeof requestVisible
   }
 }
 
-watch(requestVisible, visible => { if (!visible) sourceSearch?.abort() })
+watch(requestVisible, visible => {
+  if (!visible) {
+    sourceSearch?.abort()
+    departmentSearch?.abort()
+    sourceLoading.value = false
+    deptLoading.value = false
+  }
+}, { flush: 'sync' })
 watch(assignmentVisible, visible => { if (!visible) assignmentSearch?.abort() })
 watch(readIdentity, () => {
   pagination.rows=[]; pagination.total=0; requestVisible.value=false; decisionVisible.value=false; departments.value=[]; sources.value=[]; sourceSearch?.abort()
@@ -311,6 +323,7 @@ onMounted(() => { mounted = true; void paging.load() })
 onUnmounted(() => {
   disposed = true
   sourceSearch?.abort()
+  departmentSearch?.abort()
   assignmentSearch?.abort()
   paging.dispose()
 })
