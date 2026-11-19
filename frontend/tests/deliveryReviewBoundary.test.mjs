@@ -10,6 +10,7 @@ function fixture(name) {
   const writes = [], prompts = [], success = [], warnings = []
   const context = {
     canWriteCase: { value: true }, submittingReview: { value: false }, deliveringCase: { value: false },
+    caseDeliveryDraftGeneration: 0,
     auth: { token: 'first' }, id: { value: '1' }, dlg: { deliver: true },
     deliveryForm: { method: 'DIRECT', deliveredAt: '2026-11-11', receiptSignedAt: null, receiver: '当事人', receiptNo: 'R-1' },
     c: { value: { decidedAt: '2026-11-10' } }, detail: { value: {} }, todayLocal: () => '2026-11-11',

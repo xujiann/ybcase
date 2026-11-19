@@ -21,6 +21,8 @@ public class AgencyInterviewService {
 
     @Transactional
     public long register(long agreementId, Integer cycle, ActualInterview input, String username) {
+        // Reviewed interview changes lock the agreement before its agency actor as well.
+        jdbc.queryForList("select id from agreement_action where id=? for update", agreementId);
         var actor = materials.lockActor(username, false);
         if (!"AGENCY".equals(actor.accountCategory()) || !actor.roles().equals(java.util.Set.of("AGENCY")) || actor.deptId() == null)
             throw new BizException(403, "请使用已归类的医保中心经办账号");

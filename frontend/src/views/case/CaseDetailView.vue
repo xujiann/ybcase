@@ -159,7 +159,7 @@
           <el-button v-else-if="canWriteCase" @click="dlg.apply = true">申请延期</el-button>
         </template>
         <template v-if="c.status === 'DECIDED'">
-          <el-button v-if="canWriteCase && !detail.executionDeadline?.decisionVersionId" type="primary" @click="dlg.deliver = true">登记送达</el-button>
+          <el-button v-if="canWriteCase && !detail.executionDeadline?.decisionVersionId" type="primary" :disabled="deliveringCase" @click="dlg.deliver = true">登记送达</el-button>
           <el-button v-if="canWriteCase && !detail.executionDeadline?.decisionVersionId" @click="dlg.execution = true">登记执行</el-button>
           <el-button v-if="isLeader" @click="onCloseCase">结案</el-button>
         </template>
@@ -798,10 +798,11 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="dlg.notice" :title="c.status==='NOTIFIED' ? '再次行政处罚告知' : '行政处罚告知（第41条）'" width="600px">
+    <el-dialog v-model="dlg.notice" :title="c.status==='NOTIFIED' ? '再次行政处罚告知' : '行政处罚告知（第41条）'" width="600px"
+      :close-on-click-modal="!notifying" :close-on-press-escape="!notifying" :show-close="!notifying">
       <el-alert v-if="detail.notices?.length" title="再次告知保留历次记录；变更后须核对申辩、听证及重新送审。" type="warning" :closable="false" />
       <p v-if="noticeAmountLimit" class="hint">历次最低告知金额为罚款 {{ noticeAmountLimit.fine }} 元、追回 {{ noticeAmountLimit.recoup }} 元、没收 {{ noticeAmountLimit.confiscate }} 元。再次告知和决定均按此预检。</p>
-      <el-form label-width="110px">
+      <el-form label-width="110px" :disabled="notifying">
         <el-form-item label="拟罚款金额"><el-input-number v-model="noticeForm.proposedFine" :min="0" :precision="2" style="width: 200px" /></el-form-item>
         <el-form-item label="拟追回基金"><el-input-number v-model="noticeForm.proposedRecoup" :min="0" :precision="2" style="width: 200px" /></el-form-item>
         <el-form-item label="拟没收违法所得">
@@ -817,20 +818,21 @@
       <p class="hint">拟罚款达到听证标准将自动告知听证权利；当事人享有陈述权、申辩权。</p>
       <p class="hint">保存后请登记本版本实际送达回证，系统据此计算申辩与听证申请截止日。</p>
       <template #footer>
-        <el-button @click="dlg.notice = false">取消</el-button>
+        <el-button :disabled="notifying" @click="dlg.notice = false">取消</el-button>
         <el-button v-if="canWriteCase" type="primary" :loading="notifying" :disabled="notifying" @click="onNotify">保存本次告知</el-button>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="dlg.statement" title="陈述申辩 / 听证" width="600px">
-      <el-form label-width="110px">
+    <el-dialog v-model="dlg.statement" title="陈述申辩 / 听证" width="600px"
+      :close-on-click-modal="!savingStatement" :close-on-press-escape="!savingStatement" :show-close="!savingStatement">
+      <el-form label-width="110px" :disabled="savingStatement">
         <el-form-item label="陈述申辩内容"><el-input v-model="statementForm.statement" type="textarea" :rows="4" /></el-form-item>
         <el-form-item v-if="statementForm.deliveryRequired && statementForm.statement.trim() && statementForm.statement !== statementSnapshot.statement" label="申辩收到日期">
           <el-date-picker v-model="statementForm.statementReceivedAt" type="date" value-format="YYYY-MM-DD" />
         </el-form-item>
         <el-form-item label="复核意见"><el-input v-model="statementForm.statementReview" type="textarea" :rows="3" placeholder="成立的应当采纳；不得因陈述申辩加重处罚" /></el-form-item>
         <el-form-item label="明确放弃">
-          <el-switch v-model="statementForm.statementWaived" :disabled="statementSnapshot.statementWaived" />
+          <el-switch v-model="statementForm.statementWaived" :disabled="savingStatement || statementSnapshot.statementWaived" />
           <div class="hint">当事人明确表示放弃陈述申辩的，勾选后可在期限届满前作出决定（须另有书面/笔录佐证）</div>
         </el-form-item>
         <el-form-item v-if="statementForm.deliveryRequired && statementForm.statementWaived && !statementSnapshot.statementWaived" label="放弃凭据">
@@ -848,8 +850,8 @@
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dlg.statement = false">取消</el-button>
-        <el-button v-if="canWriteCase" type="primary" @click="onStatement">保存</el-button>
+        <el-button :disabled="savingStatement" @click="dlg.statement = false">取消</el-button>
+        <el-button v-if="canWriteCase" type="primary" :loading="savingStatement" :disabled="savingStatement" @click="onStatement">保存</el-button>
       </template>
     </el-dialog>
 
@@ -911,8 +913,9 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="dlg.deliver" title="登记送达（第59条：7个工作日内）" width="480px">
-      <el-form label-width="90px">
+    <el-dialog v-model="dlg.deliver" title="登记送达（第59条：7个工作日内）" width="480px"
+      :close-on-click-modal="!deliveringCase" :close-on-press-escape="!deliveringCase" :show-close="!deliveringCase">
+      <el-form label-width="90px" :disabled="deliveringCase">
         <el-form-item label="送达方式">
           <el-select v-model="deliveryForm.method" style="width: 100%">
             <el-option v-for="(v, k) in DELIVERY_METHOD" :key="k" :label="v" :value="k" />
@@ -929,7 +932,7 @@
         <el-form-item label="备注"><el-input v-model="deliveryForm.note" placeholder="电子送达须经当事人签订确认书" /></el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dlg.deliver = false">取消</el-button>
+        <el-button :disabled="deliveringCase" @click="dlg.deliver = false">取消</el-button>
         <el-button v-if="canWriteCase" type="primary" :loading="deliveringCase" :disabled="deliveringCase" @click="onDeliver">登记</el-button>
       </template>
     </el-dialog>
@@ -1349,6 +1352,7 @@ const noticeAmountLimit = computed(() => {
 })
 const noticeForm = reactive({ content: '', proposedFine: 0, proposedRecoup: 0, proposedConfiscate: 0, changeReason: '', requireDelivery: true, previousNoticeId: null as number | null })
 const notifying=ref(false)
+let noticeDraftGeneration = 0, statementDraftGeneration = 0, caseDeliveryDraftGeneration = 0
 function openNotice() {
   if(!canWriteCase.value || notifying.value || !['REPORTED','NOTIFIED'].includes(c.value.status))return
   const previous = currentNotice.value
@@ -1369,6 +1373,13 @@ function emptyStatementForm() {
 const statementForm = reactive<any>(emptyStatementForm())
 /** 打开弹窗时的回填快照，提交时据此只发改动过的字段 */
 let statementSnapshot: any = { ...statementForm }
+const savingStatement = ref(false)
+watch(() => dlg.notice, () => { noticeDraftGeneration++ }, { flush: 'sync' })
+watch(() => [dlg.statement, statementForm.noticeId], () => { statementDraftGeneration++ }, { flush: 'sync' })
+watch(() => dlg.deliver, () => { caseDeliveryDraftGeneration++ }, { flush: 'sync' })
+watch(() => [auth.token, auth.user?.id, auth.user?.accountCategory], () => {
+  noticeDraftGeneration++; statementDraftGeneration++; caseDeliveryDraftGeneration++
+}, { flush: 'sync' })
 const meetingForm = reactive({ heldAt: todayLocal(), attendees: '', record: '', conclusion: '' })
 const decisionForm = reactive({ decisionType: 'PUNISH', fineAmount: 0, recoupAmount: 0, confiscateAmount: 0, otherMeasures: '', content: '', mitigation: '', discretionReason: '', penaltyBasis: '' })
 const closeForm = reactive({ closeReport: '' })
@@ -2135,19 +2146,21 @@ async function onNotify() {
     ElMessage.warning('再次告知金额须在历次最低告知金额以内')
     return
   }
-  const context=captureMaterialContext(), token=auth.token, request=JSON.parse(JSON.stringify(noticeForm))
+  const context=captureMaterialContext(), token=auth.token, draft=noticeDraftGeneration, request=JSON.parse(JSON.stringify(noticeForm))
   notifying.value=true
   try {
     await client.post(`/bureau/cases/${context.caseId}/notice`, request)
-    if(!materialContextCurrent(context)||auth.token!==token)return
+    if(!materialContextCurrent(context)||auth.token!==token||draft!==noticeDraftGeneration||!dlg.notice)return
     ElMessage.success('本次告知已保存，历次告知保留')
     dlg.notice = false
-    load()
+    await load()
+  } catch {
+    // Keep the entered notice available for correction or an explicit retry.
   } finally {notifying.value=false}
 }
 
 function openStatement() {
-  if (!canWriteCase.value) return
+  if (!canWriteCase.value || savingStatement.value) return
   const n = currentNotice.value
   if (!n || n.deliveryRequired && !currentNoticeReceipt.value) return
   Object.assign(statementForm, emptyStatementForm(), {
@@ -2166,8 +2179,8 @@ function openStatement() {
 }
 
 async function onStatement() {
-  if (!canWriteCase.value) return
-  const caseId = id.value, noticeId = statementForm.noticeId
+  if (!canWriteCase.value || savingStatement.value || !dlg.statement) return
+  const noticeId = statementForm.noticeId
   // 只发真正被改动的字段，未改动的一律发 null（后端语义＝不修改）。
   // 不能简单地"只发真值"：那样取消勾选听证申请就永远提交不上去。
   const body: any = {}
@@ -2188,11 +2201,18 @@ async function onStatement() {
     if (body.hearingRequested === false) body.hearingWithdrawalReference = statementForm.hearingWithdrawalReference
     if (body.statementWaived === true) body.statementWaiverReference = statementForm.statementWaiverReference
   }
-  await client.post(`/bureau/cases/${caseId}/statement`, body)
-  if (caseId !== id.value || noticeId !== statementForm.noticeId) return
-  ElMessage.success('已保存')
-  dlg.statement = false
-  load()
+  const context = captureMaterialContext(), token = auth.token, draft = statementDraftGeneration
+  savingStatement.value = true
+  try {
+    await client.post(`/bureau/cases/${context.caseId}/statement`, body)
+    if (!materialContextCurrent(context) || token !== auth.token || draft !== statementDraftGeneration
+        || !dlg.statement || noticeId !== statementForm.noticeId) return
+    ElMessage.success('已保存')
+    dlg.statement = false
+    await load()
+  } catch {
+    // Keep the entered statement and receipt facts available for an explicit retry.
+  } finally { savingStatement.value = false }
 }
 
 function openDecide() {
@@ -2234,11 +2254,11 @@ async function onDeliver() {
     ElMessage.warning('实际送达或公告日期须在处理决定日与今天之间')
     return
   }
-  const context = captureMaterialContext(), token = auth.token
+  const context = captureMaterialContext(), token = auth.token, draft = caseDeliveryDraftGeneration
   deliveringCase.value = true
   try {
     await client.post(`/bureau/cases/${context.caseId}/deliver`, payload)
-    if (!materialContextCurrent(context) || token !== auth.token) return
+    if (!materialContextCurrent(context) || token !== auth.token || draft !== caseDeliveryDraftGeneration || !dlg.deliver) return
     ElMessage.success('已送达')
     dlg.deliver = false
     await load()

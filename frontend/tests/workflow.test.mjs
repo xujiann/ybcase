@@ -26,7 +26,9 @@ function state(extra={}) {
   return {calls, canUseBureau:{value:true}, canOperate:{value:true}, canManageClue:()=>true, isAdmin:{value:true}, canWriteCase:{value:true}, canEditActive:{value:true}, isLeader:{value:true}, client:{post:async (...args)=>calls.push(args)}, ElMessage:{success(){}, warning(){}, info(){}}, load(){}, id:{value:'9'}, dlg:{}, ...extra}
 }
 test('statement save preserves changed booleans and cannot fabricate hearing date', async () => {
-  const ctx=state({statementForm:{statement:'申辩', statementReview:'', hearingRequested:false, hearingHeldAt:'2026-01-01', statementWaived:false},statementSnapshot:{statement:'', statementReview:'', hearingRequested:true, hearingHeldAt:null, statementWaived:false}})
+  const ctx=state({statementForm:{statement:'申辩', statementReview:'', hearingRequested:false, hearingHeldAt:'2026-01-01', statementWaived:false},statementSnapshot:{statement:'', statementReview:'', hearingRequested:true, hearingHeldAt:null, statementWaived:false},
+    savingStatement:{value:false},dlg:{statement:true},statementDraftGeneration:1,auth:{token:'test'},
+    captureMaterialContext:()=>({caseId:'9',generation:1}),materialContextCurrent:()=>true})
   await handler('case/CaseDetailView.vue','onStatement',ctx)()
   assert.equal(ctx.calls.length,1)
   const body=ctx.calls[0][1]

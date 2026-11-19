@@ -154,6 +154,7 @@ public class AgencyAgreementService {
 
     @Transactional
     public void receive(long id, Integer dispatchCycle, String username) {
+        lockSource(id);
         var actor = materialAccess.lockActor(username, false);
         long deptId = requireAgencyDepartment(actor);
         int changed = jdbc.update("""
@@ -166,6 +167,7 @@ public class AgencyAgreementService {
 
     @Transactional
     public void returnToSender(long id, Integer dispatchCycle, String input, String username) {
+        lockSource(id);
         var actor = materialAccess.lockActor(username, false);
         long deptId = requireAgencyDepartment(actor);
         String reason = requiredText(input, 1000, "退回原因");
@@ -179,6 +181,7 @@ public class AgencyAgreementService {
 
     @Transactional
     public void reply(long id, Reply reply, String username) {
+        lockSource(id);
         var actor = materialAccess.lockActor(username, false);
         long deptId = requireAgencyDepartment(actor);
         int cycle = requireCycle(reply.cycle());
@@ -204,6 +207,10 @@ public class AgencyAgreementService {
         checkChanged(changed);
         recordEvent(id, "COMPLETED", username, null);
         if (reply.interview() != null) interviews.registerLocked(id, cycle, reply.interview(), actor);
+    }
+
+    private void lockSource(long id) {
+        jdbc.queryForList("select id from agreement_action where id=? for update", id);
     }
 
     private static BigDecimal validateResult(String action, Reply reply) {
